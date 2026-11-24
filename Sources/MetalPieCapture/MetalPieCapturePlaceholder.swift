@@ -1,8 +1,7 @@
 import Foundation
 import MetalPieCore
-import MetalPieShaders
 
-/// Placeholder namespace for the ScreenCaptureKit capture & Metal presentation module.
+/// Module metadata for the ScreenCaptureKit capture, overlay window, & Metal render loop module.
 public enum MetalPieCaptureModule {
-    public static let moduleVersion = "0.1.0"
+    public static let moduleVersion = "1.0.0"
 }
