@@ -16,6 +16,10 @@ public final class ShaderLibraryManager: @unchecked Sendable {
         "Interpolation",
         "PixelArt",
         "Anime4K",
+        "Anime4KRestoreML",
+        "Anime4KUpscaleML",
+        "CuNNy",
+        "FXAA",
         "FSRCNNX",
         "SSimDownscaler",
         "OpticalFlowFallback"

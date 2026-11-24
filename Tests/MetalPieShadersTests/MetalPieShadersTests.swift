@@ -163,6 +163,45 @@ private enum TestPatterns {
         }
     }
 
+    /// Anime scene with thick blurry dark lines, deterministic film grain, and synthetic ringing halos
+    /// (exercises Anime4K Restore, Thin, Darken, Bilateral Denoise, ClampHighlights, CuNNy, and RCAS denoise).
+    static func noisyAnimeWithHalos(device: any MTLDevice, width: Int, height: Int) -> any MTLTexture {
+        makeBGRA8Texture(device: device, width: width, height: height, label: "NoisyAnimeWithHalos") { x, y, w, h in
+            let u = Float(x) / Float(max(1, w))
+            let v = Float(y) / Float(max(1, h))
+            let d = sqrt((u - 0.5) * (u - 0.5) + (v - 0.5) * (v - 0.5))
+            let ring = abs(d - 0.26)
+            let hash = Float(((x &* 73856093) ^ (y &* 19349663)) & 255) / 255.0
+            let grain = (hash - 0.5) * 0.14
+            if ring < 0.022 {
+                // Thick slightly-faded ink outline (for Thin + Darken)
+                return (0.14, 0.14, 0.16, 1.0)
+            }
+            if ring >= 0.022 && ring < 0.038 {
+                // Bright ~2px-wide synthetic ringing halo right outside the ink line (for ClampHighlights r=1 vs r=2)
+                return (0.99, 0.99, 0.99, 1.0)
+            }
+            if d < 0.26 {
+                return (min(max(0.76 + grain, 0), 1), min(max(0.58 + grain, 0), 1), min(max(0.48 + grain, 0), 1), 1.0)
+            }
+            return (min(max(0.28 + grain, 0), 1), min(max(0.54 + grain, 0), 1), min(max(0.78 + grain, 0), 1), 1.0)
+        }
+    }
+
+    /// High-contrast aliased stairstep diagonal + geometric lines (for FXAA anti-aliasing verification).
+    static func jaggedAliases(device: any MTLDevice, width: Int, height: Int) -> any MTLTexture {
+        makeBGRA8Texture(device: device, width: width, height: height, label: "JaggedAliases") { x, y, w, h in
+            let line1 = abs(Float(x) * 0.37 - Float(y) + Float(h) * 0.2) < 1.5
+            let line2 = abs(Float(x) * 0.65 + Float(y) - Float(h) * 1.1) < 1.5
+            let rectEdge = (x == w / 3 || y == h / 3)
+            if line1 || line2 || rectEdge {
+                return (0.96, 0.96, 0.98, 1.0)
+            }
+            let bg: Float = (Float(y) < Float(x) * 0.45 + 20) ? 0.10 : 0.32
+            return (bg, bg + 0.05, bg + 0.12, 1.0)
+        }
+    }
+
     /// Deliberately quantized 8-bit sky gradient with visible 16-level banding (for Deband).
     static func bandedGradient(device: any MTLDevice, width: Int, height: Int) -> any MTLTexture {
         makeBGRA8Texture(device: device, width: width, height: height, label: "BandedGradient") { x, y, w, h in
@@ -387,6 +426,20 @@ private func brightCentroidX(_ stats: ImageStats, lumaThreshold: Float = 0.45) -
     return Float(sumX / sumW)
 }
 
+/// Computes mean absolute per-channel RGB difference between two same-sized images.
+private func meanAbsRGBDiff(_ a: ImageStats, _ b: ImageStats) -> Float {
+    precondition(a.width == b.width && a.height == b.height)
+    let count = a.width * a.height
+    var acc: Double = 0
+    for i in 0..<count {
+        let base = i * 4
+        acc += Double(abs(a.pixelsRGBA[base + 0] - b.pixelsRGBA[base + 0]))
+        acc += Double(abs(a.pixelsRGBA[base + 1] - b.pixelsRGBA[base + 1]))
+        acc += Double(abs(a.pixelsRGBA[base + 2] - b.pixelsRGBA[base + 2]))
+    }
+    return count > 0 ? Float(acc / Double(count * 3)) : 0
+}
+
 // MARK: - Comprehensive Real-GPU MetalPieShaders Test Suite
 
 @Suite("MetalPieShaders Real GPU Pipeline", .serialized)
@@ -398,7 +451,7 @@ struct MetalPieShadersGPUValidationTests {
     }
 
     // 1. Runtime MSL Compilation + Binary Archive Disk Caching & Reload
-    @Test("All 10 bundled .metal shaders compile cleanly and persist/reload MTLBinaryArchive")
+    @Test("All 14 bundled .metal shaders compile cleanly and persist/reload MTLBinaryArchive")
     func compileAllShadersAndBinaryArchiveRoundTrip() throws {
         let (device, _) = try Self.requireDeviceAndQueue()
         let tempCacheDir = FileManager.default.temporaryDirectory
@@ -409,6 +462,7 @@ struct MetalPieShadersGPUValidationTests {
         let coldManager = try ShaderLibraryManager(device: device, cacheDirectoryURL: tempCacheDir, useFastMath: true)
         #expect(coldManager.didLoadExistingArchive == false)
         #expect(coldManager.sourceDigest.count == 64)
+        #expect(ShaderLibraryManager.allShaderNames.count == 14)
 
         let libraries = try coldManager.loadAllLibraries()
         #expect(libraries.count == ShaderLibraryManager.allShaderNames.count)
@@ -416,7 +470,7 @@ struct MetalPieShadersGPUValidationTests {
             #expect(libraries[name] != nil, "Missing compiled MTLLibrary for \(name).metal")
         }
 
-        // Build pipelines spanning every .metal file (compute + render) so all are recorded into MTLBinaryArchive.
+        // Build pipelines spanning every one of the 14 .metal files (compute + render) so all are recorded into MTLBinaryArchive.
         let computeFunctions: [(String, String)] = [
             ("Common", "cropBlit"),
             ("Common", "demagnifyNearest"),
@@ -431,6 +485,8 @@ struct MetalPieShadersGPUValidationTests {
             ("CAS", "adaptive_sharpen_pass1"),
             ("CAS", "adaptive_sharpen_pass2"),
             ("SGSR", "sgsr_upscale"),
+            ("FXAA", "fxaa"),
+            ("Interpolation", "jinc"),
             ("Interpolation", "lanczos6_h"),
             ("Interpolation", "lanczos6_v"),
             ("Interpolation", "bicubic"),
@@ -446,9 +502,25 @@ struct MetalPieShadersGPUValidationTests {
             ("PixelArt", "crt_lottes"),
             ("Anime4K", "anime4k_restore_pass1"),
             ("Anime4K", "anime4k_restore_pass4"),
+            ("Anime4K", "a4k_restore_soft_s_p1"),
+            ("Anime4K", "a4k_upscale_s_p4"),
             ("Anime4K", "anime4k_bilateral_mode"),
+            ("Anime4K", "anime4k_bilateral_full"),
+            ("Anime4K", "anime4k_thin_hq_warp"),
+            ("Anime4K", "anime4k_darken_apply"),
+            ("Anime4K", "anime4k_clamp_highlights"),
             ("Anime4K", "anime4k_upscale_pass1"),
             ("Anime4K", "anime4k_upscale_pass4"),
+            ("Anime4KRestoreML", "a4k_restore_m_p7"),
+            ("Anime4KRestoreML", "a4k_restore_l_p5"),
+            ("Anime4KRestoreML", "a4k_restore_vl_p8"),
+            ("Anime4KUpscaleML", "a4k_upscale_m_p7"),
+            ("Anime4KUpscaleML", "a4k_upscale_l_p4"),
+            ("Anime4KUpscaleML", "a4k_upden_l_p4"),
+            ("Anime4KUpscaleML", "a4k_upden_vl_p8"),
+            ("CuNNy", "cunny_fast_p4"),
+            ("CuNNy", "cunny_bal_p4"),
+            ("CuNNy", "cunny_hq_p5"),
             ("FSRCNNX", "fsrcnnx_std_pass1"),
             ("FSRCNNX", "fsrcnnx_std_pass6"),
             ("FSRCNNX", "fsrcnnx_lineart_pass1"),
@@ -537,19 +609,20 @@ struct MetalPieShadersGPUValidationTests {
         #expect(finalStats.pooledCount == formats.count)
     }
 
-    // 3. Every Single One of the 22 EffectIDs Executed & Numerically Verified on Apple Silicon GPU
-    @Test("All 22 EffectIDs execute on real GPU with valid dimensions, contrast, and zero NaN/Inf")
-    func executeAll22EffectsOnRealGPU() throws {
+    // 3. Every Single One of the 30 EffectIDs Executed & Numerically Verified on Apple Silicon GPU
+    @Test("All 30 EffectIDs execute on real GPU with valid dimensions, contrast, and zero NaN/Inf")
+    func executeAll30EffectsOnRealGPU() throws {
         let (device, queue) = try Self.requireDeviceAndQueue()
         let renderer = try EffectChainRenderer(device: device)
 
-        #expect(EffectID.allCases.count == 22)
+        #expect(EffectID.allCases.count == 30)
 
         let diagSrc = TestPatterns.diagonalEdges(device: device, width: 320, height: 180)
         let pixelSrc = TestPatterns.pixelArtSprite(device: device, width: 160, height: 90)
         let animeSrc = TestPatterns.animeLineArt(device: device, width: 320, height: 180)
         let bandSrc = TestPatterns.bandedGradient(device: device, width: 320, height: 180)
         let downSrc = TestPatterns.diagonalEdges(device: device, width: 512, height: 288)
+        let jaggedSrc = TestPatterns.jaggedAliases(device: device, width: 320, height: 180)
 
         var bilinearEnergy: Float = 0
         var rcasEnergy: Float = 0
@@ -568,18 +641,22 @@ struct MetalPieShadersGPUValidationTests {
                 sourceTex = pixelSrc
                 targetSize = PixelSize(width: 320, height: 180)
                 instance = EffectInstance(effectID: effectID, scalingType: .fit)
-            case .anime4kRestore:
+            case .anime4kRestore, .anime4kThin, .anime4kDarken, .anime4kDenoiseBilateral, .anime4kClampHighlights:
                 sourceTex = animeSrc
                 targetSize = PixelSize(width: 320, height: 180)
-                instance = EffectInstance(effectID: .anime4kRestore, scalingType: .normal)
-            case .anime4kUpscaleDenoise:
+                instance = EffectInstance(effectID: effectID, scalingType: .normal)
+            case .anime4kUpscale, .anime4kUpscaleDenoise, .cunny:
                 sourceTex = animeSrc
                 targetSize = PixelSize(width: 640, height: 360)
-                instance = EffectInstance(
-                    effectID: .anime4kUpscaleDenoise,
-                    scalingType: .fit,
-                    parameters: ["denoiseStrength": .float(0.5), "lineThinning": .float(0.15)]
-                )
+                instance = EffectInstance(effectID: effectID, scalingType: .fit)
+            case .fxaa:
+                sourceTex = jaggedSrc
+                targetSize = PixelSize(width: 320, height: 180)
+                instance = EffectInstance(effectID: .fxaa, scalingType: .normal)
+            case .jinc:
+                sourceTex = diagSrc
+                targetSize = PixelSize(width: 640, height: 360)
+                instance = EffectInstance(effectID: .jinc, scalingType: .fit)
             case .fsrcnnx:
                 sourceTex = animeSrc
                 targetSize = PixelSize(width: 640, height: 360)
@@ -731,13 +808,13 @@ struct MetalPieShadersGPUValidationTests {
         #expect(brightStats.meanLuma > neutralStats.meanLuma + 0.12)
     }
 
-    // 4. All 12 Built-In Presets End-to-End Execution + Real PassTimings
-    @Test("All 12 built-in ScalingMode presets prewarm and render cleanly on real GPU")
-    func executeAll12BuiltInPresets() async throws {
+    // 4. All 21 Built-In Presets End-to-End Execution + Real PassTimings
+    @Test("All 21 built-in ScalingMode presets (including all 6 official Anime4K modes) prewarm and render cleanly on real GPU")
+    func executeAll21BuiltInPresets() async throws {
         let (device, queue) = try Self.requireDeviceAndQueue()
         let renderer = try EffectChainRenderer(device: device)
 
-        #expect(ScalingMode.builtInPresets.count == 12)
+        #expect(ScalingMode.builtInPresets.count == 21)
         let srcTex = TestPatterns.diagonalEdges(device: device, width: 320, height: 180)
         let targetSize = PixelSize(width: 640, height: 360)
 
@@ -782,6 +859,313 @@ struct MetalPieShadersGPUValidationTests {
         // Wait briefly for Metal completedHandler to record smoothed GPU pass timings.
         try await Task.sleep(for: .milliseconds(30))
         #expect(!renderer.lastCompletedPassTimings.isEmpty)
+    }
+
+    // 4b. Magpie-Grade Parameter Sensitivity Verification on Real GPU
+    @Test("Anime4K v4.0.1 suite, CuNNy, FXAA, Jinc, FSRCNNX, RCAS, Lanczos6, CRT, and xBRZ parameter changes produce measurable GPU differences")
+    func verifyMagpieParametersProduceMeasurableGPUDifferences() throws {
+        let (device, queue) = try Self.requireDeviceAndQueue()
+        let renderer = try EffectChainRenderer(device: device)
+
+        func runSingle(
+            source: any MTLTexture,
+            targetSize: PixelSize,
+            effectID: EffectID,
+            scalingType: ScalingType,
+            parameters: EffectParameters
+        ) throws -> ImageStats {
+            let mode = ScalingMode(
+                name: "Param_\(effectID.rawValue)",
+                effects: [EffectInstance(effectID: effectID, scalingType: scalingType, parameters: parameters)]
+            )
+            let layout = ScalingLayoutCalculator.calculate(
+                sourcePixelSize: PixelSize(width: source.width, height: source.height),
+                targetPixelSize: targetSize,
+                backingScaleFactor: 1.0,
+                effects: mode.effects
+            )
+            let dst = TestPatterns.makeOutputTexture(device: device, width: targetSize.width, height: targetSize.height)
+            let cb = try #require(queue.makeCommandBuffer())
+            _ = try renderer.encode(
+                scalingMode: mode,
+                context: EffectRenderContext(
+                    device: device,
+                    commandBuffer: cb,
+                    sourceTexture: source,
+                    destinationTexture: dst,
+                    layout: layout,
+                    duplicateFrameMode: .never
+                )
+            )
+            cb.commit()
+            cb.waitUntilCompleted()
+            #expect(cb.status == .completed, "\(effectID.rawValue) failed: \(String(describing: cb.error))")
+            let stats = readbackStats(texture: dst)
+            #expect(stats.nanCount == 0 && stats.infCount == 0, "\(effectID.rawValue) produced NaN/Inf")
+            return stats
+        }
+
+        let animeHalo = TestPatterns.noisyAnimeWithHalos(device: device, width: 256, height: 144)
+        let diag = TestPatterns.diagonalEdges(device: device, width: 256, height: 144)
+        let jagged = TestPatterns.jaggedAliases(device: device, width: 256, height: 144)
+        let pixelArt = TestPatterns.pixelArtSprite(device: device, width: 128, height: 72)
+        let s1x = PixelSize(width: 256, height: 144)
+        let s2x = PixelSize(width: 512, height: 288)
+
+        // 1) Anime4K Restore: all 6 variants (S, M, L, VL, softM, softL) + strength + clampHighlights
+        let restoreVariants = ["S", "M", "L", "VL", "softM", "softL"]
+        var restoreOutputs: [String: ImageStats] = [:]
+        for v in restoreVariants {
+            restoreOutputs[v] = try runSingle(
+                source: animeHalo, targetSize: s1x, effectID: .anime4kRestore, scalingType: .normal,
+                parameters: ["variant": .choice(v), "strength": .float(1.0), "clampHighlights": .bool(true)]
+            )
+        }
+        #expect(meanAbsRGBDiff(restoreOutputs["S"]!, restoreOutputs["VL"]!) > 0.002, "Anime4K Restore S vs VL should differ")
+        #expect(meanAbsRGBDiff(restoreOutputs["M"]!, restoreOutputs["softM"]!) > 0.001, "Anime4K Restore M vs Soft M should differ")
+        #expect(meanAbsRGBDiff(restoreOutputs["L"]!, restoreOutputs["softL"]!) > 0.001, "Anime4K Restore L vs Soft L should differ")
+
+        let restoreZero = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kRestore, scalingType: .normal,
+            parameters: ["variant": .choice("L"), "strength": .float(0.0), "clampHighlights": .bool(false)]
+        )
+        let restoreStrongNoClamp = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kRestore, scalingType: .normal,
+            parameters: ["variant": .choice("L"), "strength": .float(1.8), "clampHighlights": .bool(false)]
+        )
+        let restoreStrongClamp = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kRestore, scalingType: .normal,
+            parameters: ["variant": .choice("L"), "strength": .float(1.8), "clampHighlights": .bool(true)]
+        )
+        #expect(meanAbsRGBDiff(restoreZero, restoreStrongNoClamp) > 0.005, "Anime4K Restore strength should affect pixels")
+        #expect(meanAbsRGBDiff(restoreStrongNoClamp, restoreStrongClamp) > 0.0005, "Anime4K Restore clampHighlights should suppress overshoot")
+
+        // 2) Anime4K Pure 2x Upscale: all 4 variants (S, M, L, VL) + strength
+        var upscaleOutputs: [String: ImageStats] = [:]
+        for v in ["S", "M", "L", "VL"] {
+            upscaleOutputs[v] = try runSingle(
+                source: animeHalo, targetSize: s2x, effectID: .anime4kUpscale, scalingType: .fit,
+                parameters: ["variant": .choice(v), "strength": .float(1.0), "clampHighlights": .bool(true)]
+            )
+        }
+        #expect(meanAbsRGBDiff(upscaleOutputs["S"]!, upscaleOutputs["M"]!) > 0.002, "Anime4K Upscale S vs M should differ")
+        #expect(meanAbsRGBDiff(upscaleOutputs["S"]!, upscaleOutputs["VL"]!) > 0.002, "Anime4K Upscale S vs VL should differ")
+        #expect(meanAbsRGBDiff(upscaleOutputs["L"]!, upscaleOutputs["VL"]!) > 0.001, "Anime4K Upscale L vs VL should differ")
+
+        // 3) Anime4K 2x Upscale+Denoise: all 4 variants + denoiseStrength + lineSharpness
+        var updenOutputs: [String: ImageStats] = [:]
+        for v in ["S", "M", "L", "VL"] {
+            updenOutputs[v] = try runSingle(
+                source: animeHalo, targetSize: s2x, effectID: .anime4kUpscaleDenoise, scalingType: .fit,
+                parameters: ["variant": .choice(v), "denoiseStrength": .float(1.0), "lineSharpness": .float(1.0), "clampHighlights": .bool(true)]
+            )
+        }
+        #expect(meanAbsRGBDiff(updenOutputs["S"]!, updenOutputs["M"]!) > 0.002, "Anime4K Upscale+Denoise S vs M should differ")
+        #expect(meanAbsRGBDiff(updenOutputs["S"]!, updenOutputs["VL"]!) > 0.002, "Anime4K Upscale+Denoise S vs VL should differ")
+        let updenNoDenoise = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .anime4kUpscaleDenoise, scalingType: .fit,
+            parameters: ["variant": .choice("L"), "denoiseStrength": .float(0.0), "lineSharpness": .float(1.0), "clampHighlights": .bool(true)]
+        )
+        let updenHeavyDenoise = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .anime4kUpscaleDenoise, scalingType: .fit,
+            parameters: ["variant": .choice("L"), "denoiseStrength": .float(1.8), "lineSharpness": .float(1.0), "clampHighlights": .bool(true)]
+        )
+        #expect(meanAbsRGBDiff(updenNoDenoise, updenHeavyDenoise) > 0.003, "Anime4K denoiseStrength should visibly denoise")
+        let updenSoftSharp = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .anime4kUpscaleDenoise, scalingType: .fit,
+            parameters: ["variant": .choice("L"), "denoiseStrength": .float(0.0), "lineSharpness": .float(0.2), "clampHighlights": .bool(false)]
+        )
+        let updenHighSharp = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .anime4kUpscaleDenoise, scalingType: .fit,
+            parameters: ["variant": .choice("L"), "denoiseStrength": .float(0.0), "lineSharpness": .float(1.8), "clampHighlights": .bool(false)]
+        )
+        #expect(meanAbsRGBDiff(updenSoftSharp, updenHighSharp) > 0.005, "Anime4K lineSharpness should affect edge residual")
+
+        // 4) Anime4K Thin (HQ vs Fast, strength, iterations)
+        let thinOff = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kThin, scalingType: .normal,
+            parameters: ["quality": .choice("hq"), "strength": .float(0.0), "iterations": .int(1)]
+        )
+        let thinHQ1 = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kThin, scalingType: .normal,
+            parameters: ["quality": .choice("hq"), "strength": .float(1.2), "iterations": .int(1)]
+        )
+        let thinHQ3 = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kThin, scalingType: .normal,
+            parameters: ["quality": .choice("hq"), "strength": .float(1.2), "iterations": .int(3)]
+        )
+        let thinFast = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kThin, scalingType: .normal,
+            parameters: ["quality": .choice("fast"), "strength": .float(1.2), "iterations": .int(1)]
+        )
+        #expect(meanAbsRGBDiff(thinOff, thinHQ1) > 0.004, "Anime4K Thin strength should warp thick lines")
+        #expect(meanAbsRGBDiff(thinHQ1, thinHQ3) > 0.001, "Anime4K Thin iterations 1 vs 3 should differ")
+        #expect(meanAbsRGBDiff(thinHQ1, thinFast) > 0.001, "Anime4K Thin HQ vs Fast should differ")
+
+        // 5) Anime4K Darken (HQ vs Fast, strength actually darkens dark ink lines)
+        let darkenOff = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kDarken, scalingType: .normal,
+            parameters: ["quality": .choice("hq"), "strength": .float(0.0)]
+        )
+        let darkenHQ = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kDarken, scalingType: .normal,
+            parameters: ["quality": .choice("hq"), "strength": .float(1.5)]
+        )
+        let darkenFast = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kDarken, scalingType: .normal,
+            parameters: ["quality": .choice("fast"), "strength": .float(1.5)]
+        )
+        #expect(darkenHQ.meanLuma < darkenOff.meanLuma - 0.001, "Anime4K Darken HQ must darken ink outlines")
+        #expect(darkenFast.meanLuma < darkenOff.meanLuma - 0.001, "Anime4K Darken Fast must darken ink outlines")
+        #expect(meanAbsRGBDiff(darkenHQ, darkenFast) > 0.0005, "Anime4K Darken HQ vs Fast should differ")
+
+        // 6) Anime4K Bilateral Denoise (Mode vs Mean vs Median + intensitySigma)
+        let bilMode = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kDenoiseBilateral, scalingType: .normal,
+            parameters: ["mode": .choice("mode"), "intensitySigma": .float(0.25), "spatialSigma": .float(1.5)]
+        )
+        let bilMean = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kDenoiseBilateral, scalingType: .normal,
+            parameters: ["mode": .choice("mean"), "intensitySigma": .float(0.25), "spatialSigma": .float(1.5)]
+        )
+        let bilMedian = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kDenoiseBilateral, scalingType: .normal,
+            parameters: ["mode": .choice("median"), "intensitySigma": .float(0.25), "spatialSigma": .float(1.5)]
+        )
+        #expect(meanAbsRGBDiff(bilMode, bilMean) > 0.002, "Bilateral Mode vs Mean should differ")
+        #expect(meanAbsRGBDiff(bilMean, bilMedian) > 0.002, "Bilateral Mean vs Median should differ")
+
+        // 7) Anime4K Clamp Highlights (strength + radius suppress white halo overshoot)
+        let clampOff = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kClampHighlights, scalingType: .normal,
+            parameters: ["radius": .int(1), "strength": .float(0.0)]
+        )
+        let clampR1 = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kClampHighlights, scalingType: .normal,
+            parameters: ["radius": .int(1), "strength": .float(1.0)]
+        )
+        let clampR2 = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .anime4kClampHighlights, scalingType: .normal,
+            parameters: ["radius": .int(2), "strength": .float(1.0)]
+        )
+        #expect(clampR1.meanLuma < clampOff.meanLuma, "ClampHighlights should pull down bright overshoot halos")
+        #expect(meanAbsRGBDiff(clampR1, clampR2) > 0.0005, "ClampHighlights radius 1 vs 2 should differ")
+
+        // 8) CuNNy 2x Neural (fast vs balanced vs highQuality + sharpness)
+        let cunnyFast = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .cunny, scalingType: .fit,
+            parameters: ["variant": .choice("fast"), "sharpness": .float(1.0)]
+        )
+        let cunnyBal = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .cunny, scalingType: .fit,
+            parameters: ["variant": .choice("balanced"), "sharpness": .float(1.0)]
+        )
+        let cunnyHQ = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .cunny, scalingType: .fit,
+            parameters: ["variant": .choice("highQuality"), "sharpness": .float(1.0)]
+        )
+        let cunnyLowSharp = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .cunny, scalingType: .fit,
+            parameters: ["variant": .choice("balanced"), "sharpness": .float(0.2)]
+        )
+        let cunnyHighSharp = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .cunny, scalingType: .fit,
+            parameters: ["variant": .choice("balanced"), "sharpness": .float(1.8)]
+        )
+        #expect(meanAbsRGBDiff(cunnyFast, cunnyBal) > 0.001, "CuNNy Fast vs Balanced should differ")
+        #expect(meanAbsRGBDiff(cunnyBal, cunnyHQ) > 0.001, "CuNNy Balanced vs HighQuality should differ")
+        #expect(meanAbsRGBDiff(cunnyLowSharp, cunnyHighSharp) > 0.004, "CuNNy sharpness should alter edge reconstruction")
+
+        // 9) FXAA 3.11 (anti-aliases jagged diagonals + subpixelQuality effect)
+        let rawJagged = readbackStats(texture: jagged)
+        let fxaaLow = try runSingle(
+            source: jagged, targetSize: s1x, effectID: .fxaa, scalingType: .normal,
+            parameters: ["qualityPreset": .choice("low"), "edgeThreshold": .float(0.166), "subpixelQuality": .float(0.0)]
+        )
+        let fxaaUltra = try runSingle(
+            source: jagged, targetSize: s1x, effectID: .fxaa, scalingType: .normal,
+            parameters: ["qualityPreset": .choice("ultra"), "edgeThreshold": .float(0.063), "subpixelQuality": .float(1.0)]
+        )
+        #expect(meanAbsRGBDiff(rawJagged, fxaaUltra) > 0.003, "FXAA must visibly smooth aliased stairstep edges")
+        #expect(meanAbsRGBDiff(fxaaLow, fxaaUltra) > 0.001, "FXAA low vs ultra/subpixel settings should differ")
+
+        // 10) Jinc / EWA Lanczos (windowSinc + antiRinging)
+        let jincSoft = try runSingle(
+            source: diag, targetSize: s2x, effectID: .jinc, scalingType: .fit,
+            parameters: ["windowSinc": .float(0.35), "sinc": .float(0.825), "antiRinging": .float(0.0)]
+        )
+        let jincCrispAR = try runSingle(
+            source: diag, targetSize: s2x, effectID: .jinc, scalingType: .fit,
+            parameters: ["windowSinc": .float(0.85), "sinc": .float(0.95), "antiRinging": .float(1.0)]
+        )
+        #expect(meanAbsRGBDiff(jincSoft, jincCrispAR) > 0.002, "Jinc windowSinc/sinc/antiRinging should alter output")
+
+        // 11) FSRCNNX (standard vs lineArt vs enhancedDetail + sharpness)
+        let fsrcStd = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .fsrcnnx, scalingType: .fit,
+            parameters: ["variant": .choice("standard"), "sharpness": .float(1.0), "antiRinging": .float(0.35)]
+        )
+        let fsrcLine = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .fsrcnnx, scalingType: .fit,
+            parameters: ["variant": .choice("lineArt"), "sharpness": .float(1.0), "antiRinging": .float(0.35)]
+        )
+        let fsrcEnh = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .fsrcnnx, scalingType: .fit,
+            parameters: ["variant": .choice("enhancedDetail"), "sharpness": .float(1.4), "antiRinging": .float(0.1)]
+        )
+        #expect(meanAbsRGBDiff(fsrcStd, fsrcLine) > 0.001, "FSRCNNX Standard vs LineArt should differ")
+        #expect(meanAbsRGBDiff(fsrcLine, fsrcEnh) > 0.002, "FSRCNNX LineArt vs EnhancedDetail should differ")
+
+        // 12) Enriched existing shaders: FSR1 RCAS denoise, Lanczos6 sharpness, CRT-Geom maskType, CRT-Lottes brightBoost, xBRZ tolerance
+        let rcasDenoiseOn = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .fsr1RCAS, scalingType: .normal,
+            parameters: ["sharpness": .float(0.95), "denoise": .bool(true)]
+        )
+        let rcasDenoiseOff = try runSingle(
+            source: animeHalo, targetSize: s1x, effectID: .fsr1RCAS, scalingType: .normal,
+            parameters: ["sharpness": .float(0.95), "denoise": .bool(false)]
+        )
+        #expect(meanAbsRGBDiff(rcasDenoiseOn, rcasDenoiseOff) > 0.001, "FSR1 RCAS denoise toggle should differ on noisy content")
+
+        let lancSoft = try runSingle(
+            source: diag, targetSize: s2x, effectID: .lanczos6, scalingType: .fit,
+            parameters: ["antiRinging": .float(0.5), "sharpness": .float(0.55)]
+        )
+        let lancSharp = try runSingle(
+            source: diag, targetSize: s2x, effectID: .lanczos6, scalingType: .fit,
+            parameters: ["antiRinging": .float(0.5), "sharpness": .float(1.45)]
+        )
+        #expect(meanAbsRGBDiff(lancSoft, lancSharp) > 0.002, "Lanczos6 sharpness should alter reconstruction")
+
+        let crtGrille = try runSingle(
+            source: diag, targetSize: s2x, effectID: .crtGeom, scalingType: .fit,
+            parameters: ["maskType": .choice("apertureGrille"), "dotMask": .float(0.45), "halation": .float(0.0)]
+        )
+        let crtSlotGlow = try runSingle(
+            source: diag, targetSize: s2x, effectID: .crtGeom, scalingType: .fit,
+            parameters: ["maskType": .choice("slotMask"), "dotMask": .float(0.45), "halation": .float(0.45)]
+        )
+        #expect(meanAbsRGBDiff(crtGrille, crtSlotGlow) > 0.01, "CRT-Geom maskType + halation should visibly alter image")
+
+        let lottesDim = try runSingle(
+            source: diag, targetSize: s2x, effectID: .crtLottes, scalingType: .fit,
+            parameters: ["shadowMask": .choice("apertureGrille"), "brightBoost": .float(0.8)]
+        )
+        let lottesBright = try runSingle(
+            source: diag, targetSize: s2x, effectID: .crtLottes, scalingType: .fit,
+            parameters: ["shadowMask": .choice("none"), "brightBoost": .float(1.4)]
+        )
+        #expect(lottesBright.meanLuma > lottesDim.meanLuma + 0.05, "CRT-Lottes brightBoost + mask off should brighten image")
+
+        let xbrzTight = try runSingle(
+            source: pixelArt, targetSize: s1x, effectID: .xbrzFreescale, scalingType: .fit,
+            parameters: ["equalColorTolerance": .float(5.0), "edgeThreshold": .float(1.0), "dominantDirectionThreshold": .float(2.0)]
+        )
+        let xbrzLoose = try runSingle(
+            source: pixelArt, targetSize: s1x, effectID: .xbrzFreescale, scalingType: .fit,
+            parameters: ["equalColorTolerance": .float(80.0), "edgeThreshold": .float(4.5), "dominantDirectionThreshold": .float(5.0)]
+        )
+        #expect(meanAbsRGBDiff(xbrzTight, xbrzLoose) > 0.0001, "xBRZ thresholds should alter corner blending")
     }
 
     // 5. GPU Duplicate Frame Detection (zero CPU IOSurface lock)
@@ -1073,7 +1457,7 @@ struct MetalPieShadersGPUValidationTests {
     }
 
     // 9. Live Preview API + Real Apple M4 Pro GPU Shader Benchmark
-    @Test("Live Preview CGImage rendering and real Apple Silicon GPU Shader Benchmark across all 22 effects")
+    @Test("Live Preview CGImage rendering and real Apple Silicon GPU Shader Benchmark across all 30 effects")
     func verifyPreviewAndM4ProGPUBenchmark() throws {
         let (device, _) = try Self.requireDeviceAndQueue()
         let renderer = try EffectChainRenderer(device: device)

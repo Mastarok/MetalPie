@@ -58,6 +58,73 @@ inline void load3x3Dual(
     }
 }
 
+struct FSRCNNXOutputUniforms {
+    float sharpness;      // default 1.0 (0.0..1.5)
+    float antiRinging;    // default 0.35 (0.0..1.0)
+    uint enhancedDetail;  // 0 = standard/lineArt, 1 = enhanced micro-detail
+    uint _pad0;
+};
+
+inline void fsrcnnxWriteQuad(
+    half4 result,
+    texture2d<half, access::sample> input,
+    texture2d<half, access::write> output,
+    constant FSRCNNXOutputUniforms &u,
+    uint2 gid,
+    uint inW,
+    uint inH
+) {
+    const uint outW = output.get_width();
+    const uint outH = output.get_height();
+    constexpr sampler linearSam(filter::linear, address::clamp_to_edge, coord::normalized);
+    constexpr sampler pointSam(filter::nearest, address::clamp_to_edge, coord::normalized);
+
+    const float2 inputPt = 1.0f / float2(inW, inH);
+    const float2 outputPt = 1.0f / float2(outW, outH);
+    const float2 centerUV = (float2(gid) + 0.5f) * inputPt;
+
+    // Local 3x3 input luminance bounds for anti-ringing clamp.
+    half minY = 1.0h;
+    half maxY = 0.0h;
+    if (u.antiRinging > 0.001f) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                half l = fsrcnnxLuma(input.sample(pointSam, centerUV + float2(dx, dy) * inputPt).rgb);
+                minY = min(minY, l);
+                maxY = max(maxY, l);
+            }
+        }
+    }
+
+    const half sharp = half(clamp(u.sharpness, 0.0f, 1.5f));
+    const half ar = half(clamp(u.antiRinging, 0.0f, 1.0f));
+    const half detailBoost = (u.enhancedDetail != 0u) ? 1.35h : 1.0h;
+    const half quadMeanY = (result.x + result.y + result.z + result.w) * 0.25h;
+    const uint2 base = gid * 2u;
+
+    for (uint i = 0u; i <= 1u; ++i) {
+        for (uint j = 0u; j <= 1u; ++j) {
+            uint2 destPos = base + uint2(i, j);
+            if (destPos.x >= outW || destPos.y >= outH) continue;
+            float2 uv = (float2(destPos) + 0.5f) * outputPt;
+            half3 srcRGB = input.sample(linearSam, uv).rgb;
+            half baseY = fsrcnnxLuma(srcRGB);
+            half2 origUV = fsrcnnxRGB2UV(srcRGB);
+            half rawY = result[i * 2u + j];
+            half residualY = (rawY - baseY) * detailBoost;
+            if (u.enhancedDetail != 0u) {
+                residualY += (rawY - quadMeanY) * 0.22h;
+            }
+            half shapedY = baseY + residualY * sharp;
+            if (ar > 0.001h) {
+                shapedY = mix(shapedY, clamp(shapedY, minY, maxY), ar);
+            }
+            half3 rgbOut = saturate(fsrcnnxYUV2RGB(half3(saturate(shapedY), origUV)));
+            output.write(half4(rgbOut, 1.0h), destPos);
+        }
+    }
+}
+
 // MARK: - FSRCNNX Variant: fsrcnnx_std
 
 kernel void fsrcnnx_std_pass1(
@@ -381,16 +448,13 @@ kernel void fsrcnnx_std_pass6(
     texture2d<half, access::read> in2 [[texture(1)]],
     texture2d<half, access::sample> input [[texture(2)]],
     texture2d<half, access::write> output [[texture(3)]],
+    constant FSRCNNXOutputUniforms &u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     // Dispatched at input resolution (inW x inH); writes 2x2 sub-pixel shuffled quad.
     const uint inW = in1.get_width();
     const uint inH = in1.get_height();
     if (gid.x >= inW || gid.y >= inH) return;
-
-    const uint outW = output.get_width();
-    const uint outH = output.get_height();
-    constexpr sampler linearSam(filter::linear, address::clamp_to_edge, coord::normalized);
 
     const int2 size = int2(inW, inH);
     half4 t1[9], t2[9];
@@ -415,21 +479,7 @@ kernel void fsrcnnx_std_pass6(
     result = mulAdd4x4(t1[8], half4x4(half(0.0012452082009986), half(-0.0026056850329041), half(-0.0096226977184415), half(-0.0037850935477763), half(-0.0190967041999102), half(0.0534373670816422), half(0.1599360853433609), half(0.0834670960903168), half(-0.0070255175232887), half(0.0012873009545729), half(0.0030876772943884), half(-0.0093916896730661), half(-0.0033529615029693), half(0.0043485122732818), half(0.0089034689590335), half(-0.0067489291541278)), result);
     result = mulAdd4x4(t2[8], half4x4(half(0.0004713654634543), half(-0.0034161377698183), half(-0.0026913962792605), half(0.0053522582165897), half(-0.0040974905714393), half(0.0273330621421337), half(-0.0333138220012188), half(-0.0701237097382545), half(0.0082997502759099), half(-0.0183656588196754), half(-0.0122841577976942), half(-0.0052855615504086), half(-0.0023795007728040), half(-0.0438593104481697), half(-0.1101513057947159), half(-0.0182559806853533)), result);
 
-    const float2 outputPt = 1.0f / float2(outW, outH);
-    const uint2 base = gid * 2u;
-
-    for (uint i = 0u; i <= 1u; ++i) {
-        for (uint j = 0u; j <= 1u; ++j) {
-            uint2 destPos = base + uint2(i, j);
-            if (destPos.x >= outW || destPos.y >= outH) continue;
-            float2 uv = (float2(destPos) + 0.5f) * outputPt;
-            half3 srcRGB = input.sample(linearSam, uv).rgb;
-            half2 origUV = fsrcnnxRGB2UV(srcRGB);
-            half yOut = result[i * 2u + j];
-            half3 rgbOut = saturate(fsrcnnxYUV2RGB(half3(yOut, origUV)));
-            output.write(half4(rgbOut, 1.0h), destPos);
-        }
-    }
+    fsrcnnxWriteQuad(result, input, output, u, gid, inW, inH);
 }
 
 // MARK: - FSRCNNX Variant: fsrcnnx_lineart
@@ -755,16 +805,13 @@ kernel void fsrcnnx_lineart_pass6(
     texture2d<half, access::read> in2 [[texture(1)]],
     texture2d<half, access::sample> input [[texture(2)]],
     texture2d<half, access::write> output [[texture(3)]],
+    constant FSRCNNXOutputUniforms &u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     // Dispatched at input resolution (inW x inH); writes 2x2 sub-pixel shuffled quad.
     const uint inW = in1.get_width();
     const uint inH = in1.get_height();
     if (gid.x >= inW || gid.y >= inH) return;
-
-    const uint outW = output.get_width();
-    const uint outH = output.get_height();
-    constexpr sampler linearSam(filter::linear, address::clamp_to_edge, coord::normalized);
 
     const int2 size = int2(inW, inH);
     half4 t1[9], t2[9];
@@ -789,19 +836,5 @@ kernel void fsrcnnx_lineart_pass6(
     result = mulAdd4x4(t1[8], half4x4(half(-0.0002513871586416), half(0.0017334159929305), half(-0.0072467559948564), half(-0.0149013847112656), half(-0.0091025009751320), half(-0.0054195052944124), half(-0.0053499941714108), half(0.0118143679574132), half(-0.0134334927424788), half(0.0106377983465791), half(-0.0072384304367006), half(0.0483081750571728), half(-0.0011459409724921), half(-0.0010465533705428), half(0.0040362793952227), half(-0.0004637696838472)), result);
     result = mulAdd4x4(t2[8], half4x4(half(0.0037248437292874), half(0.0041816406883299), half(-0.0139264371246099), half(0.0035959482192993), half(-0.0390684641897678), half(-0.0257617402821779), half(-0.0298785082995892), half(-0.0066674682311714), half(-0.0151000469923019), half(-0.0176323894411325), half(0.0045121158473194), half(0.0077007445506752), half(0.0051746177487075), half(0.0075236861594021), half(0.0008582049049437), half(0.0010294843232259)), result);
 
-    const float2 outputPt = 1.0f / float2(outW, outH);
-    const uint2 base = gid * 2u;
-
-    for (uint i = 0u; i <= 1u; ++i) {
-        for (uint j = 0u; j <= 1u; ++j) {
-            uint2 destPos = base + uint2(i, j);
-            if (destPos.x >= outW || destPos.y >= outH) continue;
-            float2 uv = (float2(destPos) + 0.5f) * outputPt;
-            half3 srcRGB = input.sample(linearSam, uv).rgb;
-            half2 origUV = fsrcnnxRGB2UV(srcRGB);
-            half yOut = result[i * 2u + j];
-            half3 rgbOut = saturate(fsrcnnxYUV2RGB(half3(yOut, origUV)));
-            output.write(half4(rgbOut, 1.0h), destPos);
-        }
-    }
+    fsrcnnxWriteQuad(result, input, output, u, gid, inW, inH);
 }

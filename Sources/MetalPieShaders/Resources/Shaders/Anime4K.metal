@@ -1,27 +1,49 @@
+// ============================================================================
+// Anime4K v4.0.1 Core Suite (FP16 / RGBA16F):
+// - Restore S / Restore Soft S / Upscale S / Upscale+Denoise S (4-pass CNNs)
+// - Thin HQ (5-pass Gaussian-smoothed Sobel warp) & Thin Fast (2-pass)
+// - Darken HQ (4-pass Gaussian line-extraction darken) & Darken Fast
+// - Bilateral Denoise (Mode / Mean / Median with intensitySigma & spatialSigma)
+// - Clamp Highlights (standalone radius 1/2 anti-ringing pass)
+// ============================================================================
+
 #include <metal_stdlib>
 using namespace metal;
 
-// ============================================================================
-// Anime4K Neural & Restoration Suite (FP16 / RGBA16F CReLU CNNs):
-// - anime4k_restore_pass1..4: 4-pass CReLU CNN line-art restoration + residual
-// - anime4k_bilateral_mode:   Histogram-regularized bilateral mode denoiser
-// - anime4k_thin_sobel / anime4k_thin_warp: Optional line-thinning pre-pass
-// - anime4k_upscale_pass1..4: 4-pass CReLU CNN + 2x depth-to-space upscaler
-// Authentic trained weights from bloc97/Anime4K (S architecture).
-// ============================================================================
-
-inline uint2 clampCoord(int2 p, int2 size) {
+inline uint2 a4kClamp(int2 p, int2 size) {
     return uint2(clamp(p, int2(0), max(size - int2(1), int2(0))));
 }
 
-inline half4 mulAdd3x4(half3 x, half3x4 m, half4 a) {
+inline half a4kLuma(half3 rgb) {
+    return dot(half3(0.299h, 0.587h, 0.114h), rgb);
+}
+
+inline half a4kMaxLuma3x3(texture2d<half, access::sample> tex, sampler pointSam, float2 uv, float2 pt) {
+    half m = 0.0h;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            half l = a4kLuma(tex.sample(pointSam, uv + float2(dx, dy) * pt).rgb);
+            m = max(m, l);
+        }
+    }
+    return m;
+}
+
+inline half3 a4kApplyHighlightClamp(half3 rgb, half maxLuma, uint clampEnabled) {
+    if (clampEnabled == 0u) return saturate(rgb);
+    half curLuma = a4kLuma(rgb);
+    half clampedLuma = min(curLuma, maxLuma);
+    return saturate(rgb - (curLuma - clampedLuma));
+}
+
+inline half4 mulAdd(half3 x, half3x4 m, half4 a) {
     half4 r = fma(half4(x.x), m[0], a);
     r = fma(half4(x.y), m[1], r);
     r = fma(half4(x.z), m[2], r);
     return r;
 }
 
-inline half4 mulAdd4x4(half4 x, half4x4 m, half4 a) {
+inline half4 mulAdd(half4 x, half4x4 m, half4 a) {
     half4 r = fma(half4(x.x), m[0], a);
     r = fma(half4(x.y), m[1], r);
     r = fma(half4(x.z), m[2], r);
@@ -29,7 +51,7 @@ inline half4 mulAdd4x4(half4 x, half4x4 m, half4 a) {
     return r;
 }
 
-inline half3 mulAdd4x3(half4 x, half4x3 m, half3 a) {
+inline half3 mulAdd(half4 x, half4x3 m, half3 a) {
     half3 r = fma(half3(x.x), m[0], a);
     r = fma(half3(x.y), m[1], r);
     r = fma(half3(x.z), m[2], r);
@@ -37,169 +59,727 @@ inline half3 mulAdd4x3(half4 x, half4x3 m, half3 a) {
     return r;
 }
 
-inline void load3x3Half3(texture2d<half, access::read> tex, int2 center, int2 size, thread half3 (&t)[9]) {
-    int idx = 0;
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            t[idx++] = tex.read(clampCoord(center + int2(dx, dy), size)).rgb;
-        }
-    }
-}
-
-inline void load3x3Half4(texture2d<half, access::read> tex, int2 center, int2 size, thread half4 (&t)[9]) {
-    int idx = 0;
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            t[idx++] = tex.read(clampCoord(center + int2(dx, dy), size));
-        }
-    }
-}
-
-// MARK: - Anime4K Restore (1x 4-Pass CReLU CNN)
-
 struct Anime4KRestoreUniforms {
     float strength;
+    uint clampHighlights;
     uint _pad0;
     uint _pad1;
-    uint _pad2;
 };
 
+struct Anime4KUpscaleUniforms {
+    float strength;
+    uint clampHighlights;
+    uint _pad0;
+    uint _pad1;
+};
+
+// MARK: - Anime4K_Restore_S.hlsl (4 passes)
+
 kernel void anime4k_restore_pass1(
-    texture2d<half, access::read> input [[texture(0)]],
-    texture2d<half, access::write> outTex [[texture(1)]],
+    texture2d<half, access::sample> INPUT [[texture(0)]],
+    texture2d<half, access::write> tex1 [[texture(1)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    const uint w = outTex.get_width();
-    const uint h = outTex.get_height();
-    if (gid.x >= w || gid.y >= h) return;
-    half3 t[9];
-    load3x3Half3(input, int2(gid), int2(input.get_width(), input.get_height()), t);
-    half4 acc = half4(half(-0.011108127), half(-0.07481861), half(0.07640154), half(0.4964964));
-    acc = mulAdd3x4(t[0], half3x4(half(-0.19288683), half(-0.21397883), half(0.111997396), half(-0.04791413), half(-0.26682988), half(-0.06144587), half(-0.03601853), half(-0.16693151), half(0.038494494), half(-0.16651472), half(0.147657), half(-0.083003886)), acc);
-    acc = mulAdd3x4(t[1], half3x4(half(-0.14286195), half(0.08746566), half(-0.40107322), half(0.12390977), half(-0.33392772), half(-0.18703035), half(-0.21326795), half(0.04780781), half(-0.15155545), half(-0.0010025925), half(-0.1554875), half(-0.10676251)), acc);
-    acc = mulAdd3x4(t[2], half3x4(half(0.28095165), half(0.022872915), half(-0.21342312), half(-0.29982176), half(0.025937587), half(-0.055012174), half(-0.33779636), half(0.0015666655), half(0.076416336), half(0.06656033), half(-0.1557806), half(0.1078894)), acc);
-    acc = mulAdd3x4(t[3], half3x4(half(-0.31584853), half(0.07527119), half(0.30713862), half(-0.34014285), half(-0.50103146), half(-0.07217874), half(0.512807), half(-0.09597398), half(-0.32097813), half(-0.051580857), half(-0.022466356), half(0.01148551)), acc);
-    acc = mulAdd3x4(t[4], half3x4(half(-0.026032459), half(-0.04193211), half(0.37703893), half(-0.031916667), half(-0.27421117), half(1.0906446), half(-0.049654085), half(-0.19814016), half(0.07819544), half(0.06003738), half(0.1405805), half(-0.0064135445)), acc);
-    acc = mulAdd3x4(t[5], half3x4(half(0.041450135), half(0.11319654), half(-0.23237701), half(0.08443178), half(0.53344345), half(0.30857387), half(-0.057264958), half(-0.1575803), half(0.2325609), half(-0.027797326), half(-0.04544767), half(-0.18720597)), acc);
-    acc = mulAdd3x4(t[6], half3x4(half(0.2531829), half(-0.074966915), half(-0.27800754), half(-0.3146097), half(0.20126024), half(-0.5380133), half(-0.15082566), half(-0.19021043), half(0.29951036), half(0.17123336), half(-0.01681872), half(-0.12574998)), acc);
-    acc = mulAdd3x4(t[7], half3x4(half(0.25203633), half(0.19882993), half(0.14906439), half(0.13593598), half(0.40712556), half(0.084902965), half(0.42969635), half(0.2961132), half(-0.057267334), half(-0.030388135), half(8.8084314e-05), half(0.0210724)), acc);
-    acc = mulAdd3x4(t[8], half3x4(half(-0.13459359), half(-0.12199573), half(0.12591946), half(0.24736497), half(0.2033463), half(-0.09388599), half(-0.094370656), half(0.1071285), half(-0.18479438), half(-0.066625565), half(0.08279283), half(0.20130983)), acc);
-    outTex.write(acc, gid);
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex1.get_width();
+    const uint texH = tex1.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half3 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = INPUT.sample(sam, pos + float2(dx, dy) * inputPt).rgb;
+        }
+    }
+    half4 result = half4( -0.011108127, -0.07481861, 0.07640154, 0.4964964 );
+    result = mulAdd(src[0][0], half3x4(-0.19288683, -0.21397883, 0.111997396, -0.04791413, -0.26682988, -0.06144587, -0.03601853, -0.16693151, 0.038494494, -0.16651472, 0.147657, -0.083003886), result);
+    result = mulAdd(src[0][1], half3x4(-0.14286195, 0.08746566, -0.40107322, 0.12390977, -0.33392772, -0.18703035, -0.21326795, 0.04780781, -0.15155545, -0.0010025925, -0.1554875, -0.10676251), result);
+    result = mulAdd(src[0][2], half3x4(0.28095165, 0.022872915, -0.21342312, -0.29982176, 0.025937587, -0.055012174, -0.33779636, 0.0015666655, 0.076416336, 0.06656033, -0.1557806, 0.1078894), result);
+    result = mulAdd(src[1][0], half3x4(-0.31584853, 0.07527119, 0.30713862, -0.34014285, -0.50103146, -0.07217874, 0.512807, -0.09597398, -0.32097813, -0.051580857, -0.022466356, 0.01148551), result);
+    result = mulAdd(src[1][1], half3x4(-0.026032459, -0.04193211, 0.37703893, -0.031916667, -0.27421117, 1.0906446, -0.049654085, -0.19814016, 0.07819544, 0.06003738, 0.1405805, -0.0064135445), result);
+    result = mulAdd(src[1][2], half3x4(0.041450135, 0.11319654, -0.23237701, 0.08443178, 0.53344345, 0.30857387, -0.057264958, -0.1575803, 0.2325609, -0.027797326, -0.04544767, -0.18720597), result);
+    result = mulAdd(src[2][0], half3x4(0.2531829, -0.074966915, -0.27800754, -0.3146097, 0.20126024, -0.5380133, -0.15082566, -0.19021043, 0.29951036, 0.17123336, -0.01681872, -0.12574998), result);
+    result = mulAdd(src[2][1], half3x4(0.25203633, 0.19882993, 0.14906439, 0.13593598, 0.40712556, 0.084902965, 0.42969635, 0.2961132, -0.057267334, -0.030388135, 8.8084314e-05, 0.0210724), result);
+    result = mulAdd(src[2][2], half3x4(-0.13459359, -0.12199573, 0.12591946, 0.24736497, 0.2033463, -0.09388599, -0.094370656, 0.1071285, -0.18479438, -0.066625565, 0.08279283, 0.20130983), result);
+    tex1.write(result, gid);
 }
+
 
 kernel void anime4k_restore_pass2(
-    texture2d<half, access::read> featIn [[texture(0)]],
-    texture2d<half, access::write> featOut [[texture(1)]],
+    texture2d<half, access::sample> tex1 [[texture(0)]],
+    texture2d<half, access::write> tex2 [[texture(1)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    const uint w = featOut.get_width();
-    const uint h = featOut.get_height();
-    if (gid.x >= w || gid.y >= h) return;
-    half4 t[9];
-    load3x3Half4(featIn, int2(gid), int2(featIn.get_width(), featIn.get_height()), t);
-    half4 acc = half4(half(-0.16371979), half(-0.024620198), half(-0.035754893), half(0.04176776));
-    acc = mulAdd4x4(max(t[0], half4(0.0h)), half4x4(half(-0.056432575), half(0.0028165397), half(-0.026325442), half(-0.14802271), half(0.16885762), half(-0.062179096), half(-0.2332292), half(0.17513658), half(-0.08011296), half(0.02947316), half(0.014771492), half(-0.17946689), half(0.026012989), half(-0.09823925), half(0.036625937), half(-0.06924322)), acc);
-    acc = mulAdd4x4(max(t[1], half4(0.0h)), half4x4(half(-0.13571467), half(0.09831142), half(0.12911566), half(0.06305893), half(-0.07188695), half(-0.20161287), half(0.3858435), half(-0.21069056), half(-0.12294444), half(-0.1404628), half(-0.022659872), half(0.23008968), half(0.10969853), half(0.17640765), half(0.39796907), half(0.20413099)), acc);
-    acc = mulAdd4x4(max(t[2], half4(0.0h)), half4x4(half(-0.0061665224), half(0.055102807), half(-0.0059629944), half(-0.021429887), half(0.061626043), half(0.16898955), half(-0.21215646), half(0.16510476), half(0.2238265), half(0.19429931), half(0.09874656), half(0.06828208), half(-0.122404456), half(-0.00026717107), half(-0.28203064), half(-0.29979932)), acc);
-    acc = mulAdd4x4(max(t[3], half4(0.0h)), half4x4(half(-0.22735378), half(0.14538136), half(0.11549746), half(0.194148), half(-0.09841722), half(-0.0661309), half(0.348576), half(-0.017375294), half(-0.044078812), half(0.1298332), half(0.04793373), half(-0.30687734), half(0.08353025), half(0.083519086), half(0.10766399), half(0.31796935)), acc);
-    acc = mulAdd4x4(max(t[4], half4(0.0h)), half4x4(half(0.048365135), half(-0.17566709), half(-0.33212858), half(-0.052667376), half(-0.26443407), half(-0.010216014), half(0.1573303), half(0.05725314), half(0.08140953), half(-0.09664591), half(0.076109104), half(-0.026773714), half(0.07732627), half(0.10188082), half(-0.28266954), half(-0.16230233)), acc);
-    acc = mulAdd4x4(max(t[5], half4(0.0h)), half4x4(half(0.29931107), half(0.117944), half(-0.10414009), half(0.12795551), half(0.12576093), half(0.17082554), half(-0.15803693), half(0.13430743), half(-0.025801308), half(-0.10797019), half(0.0721032), half(0.2825884), half(-0.11025257), half(0.12798019), half(0.081827976), half(-0.050441865)), acc);
-    acc = mulAdd4x4(max(t[6], half4(0.0h)), half4x4(half(-0.11827391), half(0.08306765), half(-0.3430314), half(0.07898041), half(-0.023839617), half(-0.019507334), half(0.23176382), half(-0.40992323), half(0.09411734), half(0.38415068), half(-0.25845516), half(-0.29984522), half(0.1470966), half(-0.0684779), half(-0.07071314), half(-0.026773235)), acc);
-    acc = mulAdd4x4(max(t[7], half4(0.0h)), half4x4(half(0.19091596), half(0.082110435), half(-0.5266589), half(-0.1744098), half(-0.015838385), half(-0.046316292), half(0.023171103), half(-0.03731331), half(0.2642396), half(0.31824252), half(-0.041754793), half(-0.09525519), half(-0.14696182), half(0.052168854), half(0.039857205), half(-0.027555354)), acc);
-    acc = mulAdd4x4(max(t[8], half4(0.0h)), half4x4(half(0.15207373), half(0.09845733), half(0.0142631065), half(0.096375965), half(0.06089903), half(0.17902578), half(-0.42391995), half(0.22475442), half(0.016356342), half(-0.06277531), half(-0.12173141), half(-0.18635495), half(-0.0013459618), half(0.15725887), half(0.019310836), half(0.20293565)), acc);
-    acc = mulAdd4x4(max(-t[0], half4(0.0h)), half4x4(half(-0.18395247), half(0.30672902), half(0.09034339), half(0.1821889), half(-0.0419004), half(-0.2169228), half(-0.14052129), half(0.11006559), half(0.1709272), half(0.51062274), half(0.13758625), half(-0.2242552), half(-0.030382963), half(0.3357568), half(-0.26491287), half(0.02501938)), acc);
-    acc = mulAdd4x4(max(-t[1], half4(0.0h)), half4x4(half(0.040511727), half(0.12523083), half(-0.27318433), half(0.08388512), half(0.25354835), half(0.3404216), half(-0.2632471), half(-0.17784123), half(0.2732347), half(0.4468553), half(0.084667034), half(-0.1856242), half(0.034099877), half(-0.00954992), half(-0.32751867), half(-0.062207516)), acc);
-    acc = mulAdd4x4(max(-t[2], half4(0.0h)), half4x4(half(0.17564747), half(0.11645554), half(-0.16362113), half(0.105654195), half(-0.2762563), half(-0.1413764), half(0.23264363), half(-0.14000498), half(0.095402054), half(0.0715738), half(-0.19346157), half(-0.028285999), half(0.009799127), half(0.04059529), half(0.19688335), half(0.1282381)), acc);
-    acc = mulAdd4x4(max(-t[3], half4(0.0h)), half4x4(half(0.23575781), half(-0.11446148), half(-0.20504695), half(0.035568226), half(0.36890212), half(-0.85968876), half(-0.18545328), half(0.33796397), half(-0.30916876), half(-0.10445518), half(-0.3046253), half(0.33271998), half(-0.06263589), half(-0.2160114), half(-0.16383372), half(-0.31173357)), acc);
-    acc = mulAdd4x4(max(-t[4], half4(0.0h)), half4x4(half(0.20469664), half(0.4039374), half(-0.070057206), half(0.030353077), half(0.39843914), half(-0.15490077), half(-0.24476516), half(0.38238233), half(-0.21809858), half(0.23496576), half(-0.051794037), half(0.033664484), half(-0.14411364), half(-0.2515329), half(0.124655396), half(-0.05818785)), acc);
-    acc = mulAdd4x4(max(-t[5], half4(0.0h)), half4x4(half(-0.09065731), half(-0.16787091), half(0.013269188), half(0.23687351), half(-0.41504318), half(-0.048163068), half(0.31760025), half(-0.33648986), half(0.29752317), half(0.2926866), half(0.14408836), half(-0.33382463), half(-0.15873958), half(-0.121961035), half(0.11797893), half(0.09000567)), acc);
-    acc = mulAdd4x4(max(-t[6], half4(0.0h)), half4x4(half(0.13356976), half(0.013763947), half(0.012169505), half(-0.109594524), half(0.03417223), half(0.7031121), half(0.65146804), half(0.5250268), half(-0.50132495), half(-0.419648), half(0.2940041), half(0.83051753), half(-0.17595838), half(0.1633008), half(-0.018587278), half(0.079596795)), acc);
-    acc = mulAdd4x4(max(-t[7], half4(0.0h)), half4x4(half(0.07570128), half(-0.1581438), half(0.03904949), half(0.14890033), half(-0.054611947), half(0.17469402), half(-0.44252598), half(0.036181703), half(-0.4981031), half(-0.37507218), half(-0.18466389), half(0.2645845), half(0.25189674), half(-0.025896115), half(0.034307647), half(-0.020462232)), acc);
-    acc = mulAdd4x4(max(-t[8], half4(0.0h)), half4x4(half(-0.11645865), half(0.02296537), half(0.040909223), half(0.015069485), half(0.062284566), half(-0.22526766), half(0.09241534), half(-0.32623053), half(0.18208642), half(0.3954284), half(0.2884468), half(-0.25137675), half(-0.037232924), half(-0.10185309), half(-0.17956531), half(0.018966453)), acc);
-    featOut.write(acc, gid);
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex2.get_width();
+    const uint texH = tex2.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half4 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = tex1.sample(sam, pos + float2(dx, dy) * inputPt);
+        }
+    }
+    half4 result = half4( -0.16371979, -0.024620198, -0.035754893, 0.04176776 );
+    result = mulAdd(max(src[0][0], half4(0.0h)), half4x4(-0.056432575, 0.0028165397, -0.026325442, -0.14802271, 0.16885762, -0.062179096, -0.2332292, 0.17513658, -0.08011296, 0.02947316, 0.014771492, -0.17946689, 0.026012989, -0.09823925, 0.036625937, -0.06924322), result);
+    result = mulAdd(max(src[0][1], half4(0.0h)), half4x4(-0.13571467, 0.09831142, 0.12911566, 0.06305893, -0.07188695, -0.20161287, 0.3858435, -0.21069056, -0.12294444, -0.1404628, -0.022659872, 0.23008968, 0.10969853, 0.17640765, 0.39796907, 0.20413099), result);
+    result = mulAdd(max(src[0][2], half4(0.0h)), half4x4(-0.0061665224, 0.055102807, -0.0059629944, -0.021429887, 0.061626043, 0.16898955, -0.21215646, 0.16510476, 0.2238265, 0.19429931, 0.09874656, 0.06828208, -0.122404456, -0.00026717107, -0.28203064, -0.29979932), result);
+    result = mulAdd(max(src[1][0], half4(0.0h)), half4x4(-0.22735378, 0.14538136, 0.11549746, 0.194148, -0.09841722, -0.0661309, 0.348576, -0.017375294, -0.044078812, 0.1298332, 0.04793373, -0.30687734, 0.08353025, 0.083519086, 0.10766399, 0.31796935), result);
+    result = mulAdd(max(src[1][1], half4(0.0h)), half4x4(0.048365135, -0.17566709, -0.33212858, -0.052667376, -0.26443407, -0.010216014, 0.1573303, 0.05725314, 0.08140953, -0.09664591, 0.076109104, -0.026773714, 0.07732627, 0.10188082, -0.28266954, -0.16230233), result);
+    result = mulAdd(max(src[1][2], half4(0.0h)), half4x4(0.29931107, 0.117944, -0.10414009, 0.12795551, 0.12576093, 0.17082554, -0.15803693, 0.13430743, -0.025801308, -0.10797019, 0.0721032, 0.2825884, -0.11025257, 0.12798019, 0.081827976, -0.050441865), result);
+    result = mulAdd(max(src[2][0], half4(0.0h)), half4x4(-0.11827391, 0.08306765, -0.3430314, 0.07898041, -0.023839617, -0.019507334, 0.23176382, -0.40992323, 0.09411734, 0.38415068, -0.25845516, -0.29984522, 0.1470966, -0.0684779, -0.07071314, -0.026773235), result);
+    result = mulAdd(max(src[2][1], half4(0.0h)), half4x4(0.19091596, 0.082110435, -0.5266589, -0.1744098, -0.015838385, -0.046316292, 0.023171103, -0.03731331, 0.2642396, 0.31824252, -0.041754793, -0.09525519, -0.14696182, 0.052168854, 0.039857205, -0.027555354), result);
+    result = mulAdd(max(src[2][2], half4(0.0h)), half4x4(0.15207373, 0.09845733, 0.0142631065, 0.096375965, 0.06089903, 0.17902578, -0.42391995, 0.22475442, 0.016356342, -0.06277531, -0.12173141, -0.18635495, -0.0013459618, 0.15725887, 0.019310836, 0.20293565), result);
+    result = mulAdd(max(-src[0][0], half4(0.0h)), half4x4(-0.18395247, 0.30672902, 0.09034339, 0.1821889, -0.0419004, -0.2169228, -0.14052129, 0.11006559, 0.1709272, 0.51062274, 0.13758625, -0.2242552, -0.030382963, 0.3357568, -0.26491287, 0.02501938), result);
+    result = mulAdd(max(-src[0][1], half4(0.0h)), half4x4(0.040511727, 0.12523083, -0.27318433, 0.08388512, 0.25354835, 0.3404216, -0.2632471, -0.17784123, 0.2732347, 0.4468553, 0.084667034, -0.1856242, 0.034099877, -0.00954992, -0.32751867, -0.062207516), result);
+    result = mulAdd(max(-src[0][2], half4(0.0h)), half4x4(0.17564747, 0.11645554, -0.16362113, 0.105654195, -0.2762563, -0.1413764, 0.23264363, -0.14000498, 0.095402054, 0.0715738, -0.19346157, -0.028285999, 0.009799127, 0.04059529, 0.19688335, 0.1282381), result);
+    result = mulAdd(max(-src[1][0], half4(0.0h)), half4x4(0.23575781, -0.11446148, -0.20504695, 0.035568226, 0.36890212, -0.85968876, -0.18545328, 0.33796397, -0.30916876, -0.10445518, -0.3046253, 0.33271998, -0.06263589, -0.2160114, -0.16383372, -0.31173357), result);
+    result = mulAdd(max(-src[1][1], half4(0.0h)), half4x4(0.20469664, 0.4039374, -0.070057206, 0.030353077, 0.39843914, -0.15490077, -0.24476516, 0.38238233, -0.21809858, 0.23496576, -0.051794037, 0.033664484, -0.14411364, -0.2515329, 0.124655396, -0.05818785), result);
+    result = mulAdd(max(-src[1][2], half4(0.0h)), half4x4(-0.09065731, -0.16787091, 0.013269188, 0.23687351, -0.41504318, -0.048163068, 0.31760025, -0.33648986, 0.29752317, 0.2926866, 0.14408836, -0.33382463, -0.15873958, -0.121961035, 0.11797893, 0.09000567), result);
+    result = mulAdd(max(-src[2][0], half4(0.0h)), half4x4(0.13356976, 0.013763947, 0.012169505, -0.109594524, 0.03417223, 0.7031121, 0.65146804, 0.5250268, -0.50132495, -0.419648, 0.2940041, 0.83051753, -0.17595838, 0.1633008, -0.018587278, 0.079596795), result);
+    result = mulAdd(max(-src[2][1], half4(0.0h)), half4x4(0.07570128, -0.1581438, 0.03904949, 0.14890033, -0.054611947, 0.17469402, -0.44252598, 0.036181703, -0.4981031, -0.37507218, -0.18466389, 0.2645845, 0.25189674, -0.025896115, 0.034307647, -0.020462232), result);
+    result = mulAdd(max(-src[2][2], half4(0.0h)), half4x4(-0.11645865, 0.02296537, 0.040909223, 0.015069485, 0.062284566, -0.22526766, 0.09241534, -0.32623053, 0.18208642, 0.3954284, 0.2884468, -0.25137675, -0.037232924, -0.10185309, -0.17956531, 0.018966453), result);
+    tex2.write(result, gid);
 }
+
 
 kernel void anime4k_restore_pass3(
-    texture2d<half, access::read> featIn [[texture(0)]],
-    texture2d<half, access::write> featOut [[texture(1)]],
+    texture2d<half, access::sample> tex2 [[texture(0)]],
+    texture2d<half, access::write> tex1 [[texture(1)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    const uint w = featOut.get_width();
-    const uint h = featOut.get_height();
-    if (gid.x >= w || gid.y >= h) return;
-    half4 t[9];
-    load3x3Half4(featIn, int2(gid), int2(featIn.get_width(), featIn.get_height()), t);
-    half4 acc = half4(half(-0.0036821906), half(-0.050239526), half(-0.01355402), half(0.00048220603));
-    acc = mulAdd4x4(max(t[0], half4(0.0h)), half4x4(half(0.01921286), half(-0.26684764), half(-0.12663573), half(0.31641877), half(-0.25313398), half(0.12264074), half(0.58750325), half(-0.14084283), half(0.5837018), half(-0.042300556), half(-0.20435576), half(-0.009954825), half(0.060783498), half(0.05540401), half(0.2205112), half(-0.06578902)), acc);
-    acc = mulAdd4x4(max(t[1], half4(0.0h)), half4x4(half(-0.21930243), half(-0.03774968), half(0.22615197), half(0.18338196), half(0.011201461), half(-0.271034), half(0.00573116), half(-0.12248194), half(0.47990513), half(0.2982416), half(-0.1087603), half(-0.050099242), half(-0.07620939), half(-0.07148229), half(0.03691984), half(-0.16796488)), acc);
-    acc = mulAdd4x4(max(t[2], half4(0.0h)), half4x4(half(-0.14962853), half(-0.053769328), half(0.02387081), half(0.22002189), half(0.052237745), half(-0.26160842), half(-0.08603077), half(0.012542448), half(0.08119985), half(0.075785555), half(-0.33437458), half(-0.43373227), half(-0.13206963), half(-0.08759176), half(-0.03288923), half(-0.09799959)), acc);
-    acc = mulAdd4x4(max(t[3], half4(0.0h)), half4x4(half(-0.1305593), half(-0.5974288), half(0.06058367), half(0.08406488), half(0.013692483), half(0.06646377), half(0.16469325), half(0.08990975), half(0.42217395), half(-0.11289523), half(-0.06165009), half(0.48556912), half(-0.15702641), half(-0.19922857), half(-0.0035429662), half(-0.0022089656)), acc);
-    acc = mulAdd4x4(max(t[4], half4(0.0h)), half4x4(half(-0.1964807), half(0.038099788), half(0.21587034), half(0.039734077), half(-0.07063389), half(0.11604167), half(-0.24558097), half(-0.08900199), half(-0.7684516), half(-0.1037487), half(-0.09380674), half(0.33144563), half(-0.16653742), half(0.0028585843), half(-0.33774406), half(-0.0528696)), acc);
-    acc = mulAdd4x4(max(t[5], half4(0.0h)), half4x4(half(-0.27298656), half(-0.05665099), half(0.09661685), half(0.19780266), half(0.1025106), half(-0.22055034), half(-0.21218458), half(-0.040628925), half(0.0095010325), half(0.13118382), half(-0.42582452), half(-0.22197723), half(0.21006055), half(-0.06189587), half(-0.15285942), half(-0.09526762)), acc);
-    acc = mulAdd4x4(max(t[6], half4(0.0h)), half4x4(half(-0.14494462), half(-0.046788953), half(0.065877035), half(0.09911713), half(0.35096622), half(0.16682479), half(0.028363144), half(0.36037162), half(0.29413632), half(0.28212717), half(-0.025364442), half(-0.3406269), half(0.047262143), half(-0.11892685), half(-0.008032766), half(0.29743317)), acc);
-    acc = mulAdd4x4(max(t[7], half4(0.0h)), half4x4(half(-0.15191558), half(-0.36980554), half(0.14555687), half(0.0043930537), half(-0.012661432), half(0.15737776), half(-0.115250416), half(0.10324491), half(0.24491951), half(-0.15575431), half(-0.27802598), half(0.21959937), half(0.18063772), half(0.4455559), half(-0.09693302), half(0.33382267)), acc);
-    acc = mulAdd4x4(max(t[8], half4(0.0h)), half4x4(half(0.2717801), half(0.13452889), half(0.14105384), half(0.16324317), half(-0.40111846), half(0.1154301), half(-0.0076733204), half(-0.09697362), half(0.44306824), half(-0.02831414), half(-0.2153124), half(-0.12075326), half(0.060776163), half(0.30347148), half(-0.0036976219), half(-0.12070682)), acc);
-    acc = mulAdd4x4(max(-t[0], half4(0.0h)), half4x4(half(-0.39780128), half(-0.29875937), half(-0.12952097), half(0.080333896), half(0.07520163), half(0.021689568), half(-0.23121156), half(-0.038140096), half(-0.1593877), half(0.017156163), half(-0.06038025), half(0.009244022), half(-0.13917233), half(0.30957314), half(0.243109), half(-0.104947075)), acc);
-    acc = mulAdd4x4(max(-t[1], half4(0.0h)), half4x4(half(-0.07965157), half(0.06776501), half(-0.13288979), half(0.005851189), half(-0.08768168), half(-0.03689969), half(0.12034646), half(0.22441491), half(0.14453568), half(-0.17648841), half(-0.3378289), half(-0.018329712), half(0.11722939), half(-0.34161824), half(0.08424494), half(-0.01400687)), acc);
-    acc = mulAdd4x4(max(-t[2], half4(0.0h)), half4x4(half(0.08153887), half(0.07222914), half(-0.14663404), half(-0.038526025), half(-0.07385973), half(0.18440577), half(0.35890242), half(0.17084727), half(0.26345527), half(0.15280858), half(-0.007446105), half(-0.024403179), half(-0.30336383), half(-0.22978698), half(0.11612946), half(-0.23614909)), acc);
-    acc = mulAdd4x4(max(-t[3], half4(0.0h)), half4x4(half(-0.07447396), half(0.09023449), half(-0.13798), half(-0.086943336), half(-0.30787337), half(0.15087669), half(0.14418626), half(-0.03371195), half(0.048989657), half(-0.13075387), half(-0.13458036), half(-0.059836224), half(0.06495196), half(0.269715), half(0.3674355), half(0.38956037)), acc);
-    acc = mulAdd4x4(max(-t[4], half4(0.0h)), half4x4(half(0.34981915), half(-0.048779126), half(0.31717536), half(0.38080826), half(-0.20149232), half(-0.82969636), half(-0.10167862), half(0.6382858), half(0.25976858), half(0.4370118), half(-0.04724865), half(-0.10014156), half(0.19380626), half(-0.080370255), half(0.09578106), half(-0.035166856)), acc);
-    acc = mulAdd4x4(max(-t[5], half4(0.0h)), half4x4(half(-0.026443917), half(0.4132611), half(0.01822534), half(0.12742202), half(-0.26652107), half(-0.2996705), half(0.30905882), half(0.07989903), half(0.38249823), half(0.21486135), half(0.025314959), half(-0.14717339), half(-0.13344015), half(-0.32088286), half(-0.2833883), half(-0.30973712)), acc);
-    acc = mulAdd4x4(max(-t[6], half4(0.0h)), half4x4(half(0.021517841), half(0.006556378), half(0.2025686), half(-0.12044382), half(-0.38583103), half(-0.0027515136), half(-0.06556736), half(-0.097090125), half(0.04676486), half(-0.11954886), half(-0.051612873), half(0.07831412), half(-0.18823163), half(-0.16542958), half(0.04245155), half(0.6437998)), acc);
-    acc = mulAdd4x4(max(-t[7], half4(0.0h)), half4x4(half(-0.39475346), half(-0.2936861), half(0.26768062), half(-0.28151843), half(0.21935691), half(0.2101108), half(-0.15455097), half(0.19548604), half(0.09188909), half(-0.020147726), half(0.103328265), half(-0.12574542), half(-0.34167948), half(0.07523185), half(-0.17669058), half(0.62446547)), acc);
-    acc = mulAdd4x4(max(-t[8], half4(0.0h)), half4x4(half(-0.37661025), half(-0.29630858), half(0.05451026), half(0.1611643), half(0.14079669), half(-0.2170294), half(-0.038716137), half(0.13514164), half(-0.21235192), half(-0.07860726), half(-0.005749412), half(0.025625167), half(-0.13297133), half(0.33012658), half(-0.27434957), half(-0.18416783)), acc);
-    featOut.write(acc, gid);
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex1.get_width();
+    const uint texH = tex1.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half4 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = tex2.sample(sam, pos + float2(dx, dy) * inputPt);
+        }
+    }
+    half4 result = half4( -0.0036821906, -0.050239526, -0.01355402, 0.00048220603 );
+    result = mulAdd(max(src[0][0], half4(0.0h)), half4x4(0.01921286, -0.26684764, -0.12663573, 0.31641877, -0.25313398, 0.12264074, 0.58750325, -0.14084283, 0.5837018, -0.042300556, -0.20435576, -0.009954825, 0.060783498, 0.05540401, 0.2205112, -0.06578902), result);
+    result = mulAdd(max(src[0][1], half4(0.0h)), half4x4(-0.21930243, -0.03774968, 0.22615197, 0.18338196, 0.011201461, -0.271034, 0.00573116, -0.12248194, 0.47990513, 0.2982416, -0.1087603, -0.050099242, -0.07620939, -0.07148229, 0.03691984, -0.16796488), result);
+    result = mulAdd(max(src[0][2], half4(0.0h)), half4x4(-0.14962853, -0.053769328, 0.02387081, 0.22002189, 0.052237745, -0.26160842, -0.08603077, 0.012542448, 0.08119985, 0.075785555, -0.33437458, -0.43373227, -0.13206963, -0.08759176, -0.03288923, -0.09799959), result);
+    result = mulAdd(max(src[1][0], half4(0.0h)), half4x4(-0.1305593, -0.5974288, 0.06058367, 0.08406488, 0.013692483, 0.06646377, 0.16469325, 0.08990975, 0.42217395, -0.11289523, -0.06165009, 0.48556912, -0.15702641, -0.19922857, -0.0035429662, -0.0022089656), result);
+    result = mulAdd(max(src[1][1], half4(0.0h)), half4x4(-0.1964807, 0.038099788, 0.21587034, 0.039734077, -0.07063389, 0.11604167, -0.24558097, -0.08900199, -0.7684516, -0.1037487, -0.09380674, 0.33144563, -0.16653742, 0.0028585843, -0.33774406, -0.0528696), result);
+    result = mulAdd(max(src[1][2], half4(0.0h)), half4x4(-0.27298656, -0.05665099, 0.09661685, 0.19780266, 0.1025106, -0.22055034, -0.21218458, -0.040628925, 0.0095010325, 0.13118382, -0.42582452, -0.22197723, 0.21006055, -0.06189587, -0.15285942, -0.09526762), result);
+    result = mulAdd(max(src[2][0], half4(0.0h)), half4x4(-0.14494462, -0.046788953, 0.065877035, 0.09911713, 0.35096622, 0.16682479, 0.028363144, 0.36037162, 0.29413632, 0.28212717, -0.025364442, -0.3406269, 0.047262143, -0.11892685, -0.008032766, 0.29743317), result);
+    result = mulAdd(max(src[2][1], half4(0.0h)), half4x4(-0.15191558, -0.36980554, 0.14555687, 0.0043930537, -0.012661432, 0.15737776, -0.115250416, 0.10324491, 0.24491951, -0.15575431, -0.27802598, 0.21959937, 0.18063772, 0.4455559, -0.09693302, 0.33382267), result);
+    result = mulAdd(max(src[2][2], half4(0.0h)), half4x4(0.2717801, 0.13452889, 0.14105384, 0.16324317, -0.40111846, 0.1154301, -0.0076733204, -0.09697362, 0.44306824, -0.02831414, -0.2153124, -0.12075326, 0.060776163, 0.30347148, -0.0036976219, -0.12070682), result);
+    result = mulAdd(max(-src[0][0], half4(0.0h)), half4x4(-0.39780128, -0.29875937, -0.12952097, 0.080333896, 0.07520163, 0.021689568, -0.23121156, -0.038140096, -0.1593877, 0.017156163, -0.06038025, 0.009244022, -0.13917233, 0.30957314, 0.243109, -0.104947075), result);
+    result = mulAdd(max(-src[0][1], half4(0.0h)), half4x4(-0.07965157, 0.06776501, -0.13288979, 0.005851189, -0.08768168, -0.03689969, 0.12034646, 0.22441491, 0.14453568, -0.17648841, -0.3378289, -0.018329712, 0.11722939, -0.34161824, 0.08424494, -0.01400687), result);
+    result = mulAdd(max(-src[0][2], half4(0.0h)), half4x4(0.08153887, 0.07222914, -0.14663404, -0.038526025, -0.07385973, 0.18440577, 0.35890242, 0.17084727, 0.26345527, 0.15280858, -0.007446105, -0.024403179, -0.30336383, -0.22978698, 0.11612946, -0.23614909), result);
+    result = mulAdd(max(-src[1][0], half4(0.0h)), half4x4(-0.07447396, 0.09023449, -0.13798, -0.086943336, -0.30787337, 0.15087669, 0.14418626, -0.03371195, 0.048989657, -0.13075387, -0.13458036, -0.059836224, 0.06495196, 0.269715, 0.3674355, 0.38956037), result);
+    result = mulAdd(max(-src[1][1], half4(0.0h)), half4x4(0.34981915, -0.048779126, 0.31717536, 0.38080826, -0.20149232, -0.82969636, -0.10167862, 0.6382858, 0.25976858, 0.4370118, -0.04724865, -0.10014156, 0.19380626, -0.080370255, 0.09578106, -0.035166856), result);
+    result = mulAdd(max(-src[1][2], half4(0.0h)), half4x4(-0.026443917, 0.4132611, 0.01822534, 0.12742202, -0.26652107, -0.2996705, 0.30905882, 0.07989903, 0.38249823, 0.21486135, 0.025314959, -0.14717339, -0.13344015, -0.32088286, -0.2833883, -0.30973712), result);
+    result = mulAdd(max(-src[2][0], half4(0.0h)), half4x4(0.021517841, 0.006556378, 0.2025686, -0.12044382, -0.38583103, -0.0027515136, -0.06556736, -0.097090125, 0.04676486, -0.11954886, -0.051612873, 0.07831412, -0.18823163, -0.16542958, 0.04245155, 0.6437998), result);
+    result = mulAdd(max(-src[2][1], half4(0.0h)), half4x4(-0.39475346, -0.2936861, 0.26768062, -0.28151843, 0.21935691, 0.2101108, -0.15455097, 0.19548604, 0.09188909, -0.020147726, 0.103328265, -0.12574542, -0.34167948, 0.07523185, -0.17669058, 0.62446547), result);
+    result = mulAdd(max(-src[2][2], half4(0.0h)), half4x4(-0.37661025, -0.29630858, 0.05451026, 0.1611643, 0.14079669, -0.2170294, -0.038716137, 0.13514164, -0.21235192, -0.07860726, -0.005749412, 0.025625167, -0.13297133, 0.33012658, -0.27434957, -0.18416783), result);
+    tex1.write(result, gid);
 }
 
+
 kernel void anime4k_restore_pass4(
-    texture2d<half, access::read> input [[texture(0)]],
-    texture2d<half, access::read> featIn [[texture(1)]],
-    texture2d<half, access::write> output [[texture(2)]],
+    texture2d<half, access::sample> INPUT [[texture(0)]],
+    texture2d<half, access::sample> tex1 [[texture(1)]],
+    texture2d<half, access::write> OUTPUT [[texture(2)]],
     constant Anime4KRestoreUniforms &u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    const uint w = output.get_width();
-    const uint h = output.get_height();
-    if (gid.x >= w || gid.y >= h) return;
-    half4 t[9];
-    load3x3Half4(featIn, int2(gid), int2(featIn.get_width(), featIn.get_height()), t);
-    half3 acc = half3(half(-0.0052927984), half(-0.0060193934), half(-0.0048643993));
-    acc = mulAdd4x3(max(t[0], half4(0.0h)), half4x3(half(0.15873), half(0.17989138), half(0.14648493), half(-0.017379675), half(-0.017363746), half(-0.019855022), half(0.009670625), half(0.0070157526), half(0.0075994316), half(0.025388412), half(0.027231036), half(0.024052646)), acc);
-    acc = mulAdd4x3(max(t[1], half4(0.0h)), half4x3(half(0.048195973), half(0.041760173), half(0.037366055), half(-0.115950756), half(-0.12887983), half(-0.12535639), half(0.032125086), half(0.03397254), half(0.032950625), half(0.01223746), half(0.020822672), half(0.0161561)), acc);
-    acc = mulAdd4x3(max(t[2], half4(0.0h)), half4x3(half(0.0890567), half(0.094453335), half(0.09014035), half(0.016081346), half(0.017434116), half(0.020783134), half(-0.011775135), half(-0.010094134), half(-0.018522855), half(0.072103254), half(0.07940666), half(0.065876864)), acc);
-    acc = mulAdd4x3(max(t[3], half4(0.0h)), half4x3(half(-0.04841196), half(-0.06963968), half(-0.056574684), half(0.10912542), half(0.11813441), half(0.10643838), half(-0.013013885), half(-0.01562045), half(-0.013802797), half(0.037505716), half(0.04352026), half(0.04645123)), acc);
-    acc = mulAdd4x3(max(t[4], half4(0.0h)), half4x3(half(-0.3472869), half(-0.36243078), half(-0.33530185), half(0.23654196), half(0.2305048), half(0.22150646), half(-0.045226905), half(-0.041799217), half(-0.042511635), half(-0.10267792), half(-0.1123385), half(-0.10845448)), acc);
-    acc = mulAdd4x3(max(t[5], half4(0.0h)), half4x3(half(0.011987401), half(0.012285043), half(0.007813165), half(-0.15911353), half(-0.17523928), half(-0.1535267), half(0.15675929), half(0.16531634), half(0.15948962), half(-0.09240023), half(-0.09513292), half(-0.084187366)), acc);
-    acc = mulAdd4x3(max(t[6], half4(0.0h)), half4x3(half(0.069052905), half(0.07278333), half(0.0756627), half(-0.012180326), half(-0.018794727), half(-0.031050753), half(-0.044663202), half(-0.04362803), half(-0.038904265), half(-0.008540197), half(-0.011201734), half(-0.01556625)), acc);
-    acc = mulAdd4x3(max(t[7], half4(0.0h)), half4x3(half(-0.08261173), half(-0.09042543), half(-0.07589266), half(0.043515377), half(0.045066774), half(0.04037769), half(-0.06262993), half(-0.07469342), half(-0.058593787), half(0.026696987), half(0.028740842), half(0.037405368)), acc);
-    acc = mulAdd4x3(max(t[8], half4(0.0h)), half4x3(half(0.07975598), half(0.09597654), half(0.08997132), half(-0.07844719), half(-0.07880916), half(-0.06835411), half(0.05668995), half(0.050163813), half(0.053357534), half(-0.020040333), half(-0.019867316), half(-0.01907621)), acc);
-    acc = mulAdd4x3(max(-t[0], half4(0.0h)), half4x3(half(-0.017078733), half(-0.017393313), half(-0.008266595), half(-0.0033478448), half(-0.0027439648), half(-0.0042334674), half(-0.06354017), half(-0.062058125), half(-0.04652064), half(-0.010787706), half(-0.0062706997), half(-0.007573461)), acc);
-    acc = mulAdd4x3(max(-t[1], half4(0.0h)), half4x3(half(-0.019895451), half(-0.016341688), half(-0.008712399), half(0.026231976), half(0.023955572), half(0.0216376), half(-0.061950512), half(-0.05481285), half(-0.05261985), half(-0.018804235), half(-0.016235247), half(-0.0131616965)), acc);
-    acc = mulAdd4x3(max(-t[2], half4(0.0h)), half4x3(half(-0.055628926), half(-0.063315354), half(-0.057192408), half(-0.0256364), half(-0.028660972), half(-0.02937357), half(-0.017604912), half(-0.020851422), half(-0.016070362), half(-0.0870202), half(-0.0832279), half(-0.07525406)), acc);
-    acc = mulAdd4x3(max(-t[3], half4(0.0h)), half4x3(half(0.062738225), half(0.07106593), half(0.061644047), half(-0.06068257), half(-0.06983662), half(-0.066070385), half(0.024919355), half(0.03227179), half(0.028569462), half(-0.07866227), half(-0.098967604), half(-0.092128105)), acc);
-    acc = mulAdd4x3(max(-t[4], half4(0.0h)), half4x3(half(0.040397774), half(0.047241107), half(0.03962998), half(-0.09112752), half(-0.10057507), half(-0.09301817), half(0.10833967), half(0.101835825), half(0.10027467), half(0.27189335), half(0.27433604), half(0.26781923)), acc);
-    acc = mulAdd4x3(max(-t[5], half4(0.0h)), half4x3(half(-0.044211388), half(-0.042373534), half(-0.03658007), half(0.113148406), half(0.12423258), half(0.107804194), half(-0.17081551), half(-0.18562958), half(-0.17475435), half(0.09636739), half(0.10763415), half(0.093332425)), acc);
-    acc = mulAdd4x3(max(-t[6], half4(0.0h)), half4x3(half(-0.03798545), half(-0.047811143), half(-0.050768293), half(0.018775463), half(0.026812987), half(0.03452908), half(0.0055677597), half(0.0039081173), half(-0.0017878668), half(-0.10728597), half(-0.12618187), half(-0.109045394)), acc);
-    acc = mulAdd4x3(max(-t[7], half4(0.0h)), half4x3(half(0.06359783), half(0.064184755), half(0.04934199), half(-0.009819327), half(-0.006616115), half(-0.007431496), half(0.025055679), half(0.024787048), half(0.017360551), half(-0.047140837), half(-0.061695747), half(-0.06440822)), acc);
-    acc = mulAdd4x3(max(-t[8], half4(0.0h)), half4x3(half(0.060199022), half(0.06482763), half(0.059514645), half(0.026998974), half(0.028776823), half(0.024897143), half(0.17968474), half(0.19337215), half(0.16760105), half(0.0075838566), half(0.010503482), half(0.011993149)), acc);
-    half3 base = input.read(clampCoord(int2(gid), int2(input.get_width(), input.get_height()))).rgb;
-    half3 restored = saturate(base + acc * half(clamp(u.strength, 0.0f, 2.0f)));
-    output.write(half4(restored, 1.0h), gid);
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = OUTPUT.get_width();
+    const uint texH = OUTPUT.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    // [ a, d, g ]
+    // [ b, e, h ]
+    // [ c, f, i ]
+    half4 a = tex1.sample(sam, pos + float2(-inputPt.x, -inputPt.y));
+    half4 b = tex1.sample(sam, pos + float2(-inputPt.x, 0));
+    half4 c = tex1.sample(sam, pos + float2(-inputPt.x, inputPt.y));
+    half4 d = tex1.sample(sam, pos + float2(0, -inputPt.y));
+    half4 e = tex1.sample(sam, pos);
+    half4 f = tex1.sample(sam, pos + float2(0, inputPt.y));
+    half4 g = tex1.sample(sam, pos + float2(inputPt.x, -inputPt.y));
+    half4 h = tex1.sample(sam, pos + float2(inputPt.x, 0));
+    half4 i = tex1.sample(sam, pos + float2(inputPt.x, inputPt.y));
+    half3 result = half3( -0.0052927984, -0.0060193934, -0.0048643993 );
+    result = mulAdd(max(a, half4(0.0h)), half4x3(0.15873, 0.17989138, 0.14648493, -0.017379675, -0.017363746, -0.019855022, 0.009670625, 0.0070157526, 0.0075994316, 0.025388412, 0.027231036, 0.024052646), result);
+    result = mulAdd(max(b, half4(0.0h)), half4x3(0.048195973, 0.041760173, 0.037366055, -0.115950756, -0.12887983, -0.12535639, 0.032125086, 0.03397254, 0.032950625, 0.01223746, 0.020822672, 0.0161561), result);
+    result = mulAdd(max(c, half4(0.0h)), half4x3(0.0890567, 0.094453335, 0.09014035, 0.016081346, 0.017434116, 0.020783134, -0.011775135, -0.010094134, -0.018522855, 0.072103254, 0.07940666, 0.065876864), result);
+    result = mulAdd(max(d, half4(0.0h)), half4x3(-0.04841196, -0.06963968, -0.056574684, 0.10912542, 0.11813441, 0.10643838, -0.013013885, -0.01562045, -0.013802797, 0.037505716, 0.04352026, 0.04645123), result);
+    result = mulAdd(max(e, half4(0.0h)), half4x3(-0.3472869, -0.36243078, -0.33530185, 0.23654196, 0.2305048, 0.22150646, -0.045226905, -0.041799217, -0.042511635, -0.10267792, -0.1123385, -0.10845448), result);
+    result = mulAdd(max(f, half4(0.0h)), half4x3(0.011987401, 0.012285043, 0.007813165, -0.15911353, -0.17523928, -0.1535267, 0.15675929, 0.16531634, 0.15948962, -0.09240023, -0.09513292, -0.084187366), result);
+    result = mulAdd(max(g, half4(0.0h)), half4x3(0.069052905, 0.07278333, 0.0756627, -0.012180326, -0.018794727, -0.031050753, -0.044663202, -0.04362803, -0.038904265, -0.008540197, -0.011201734, -0.01556625), result);
+    result = mulAdd(max(h, half4(0.0h)), half4x3(-0.08261173, -0.09042543, -0.07589266, 0.043515377, 0.045066774, 0.04037769, -0.06262993, -0.07469342, -0.058593787, 0.026696987, 0.028740842, 0.037405368), result);
+    result = mulAdd(max(i, half4(0.0h)), half4x3(0.07975598, 0.09597654, 0.08997132, -0.07844719, -0.07880916, -0.06835411, 0.05668995, 0.050163813, 0.053357534, -0.020040333, -0.019867316, -0.01907621), result);
+    result = mulAdd(max(-a, half4(0.0h)), half4x3(-0.017078733, -0.017393313, -0.008266595, -0.0033478448, -0.0027439648, -0.0042334674, -0.06354017, -0.062058125, -0.04652064, -0.010787706, -0.0062706997, -0.007573461), result);
+    result = mulAdd(max(-b, half4(0.0h)), half4x3(-0.019895451, -0.016341688, -0.008712399, 0.026231976, 0.023955572, 0.0216376, -0.061950512, -0.05481285, -0.05261985, -0.018804235, -0.016235247, -0.0131616965), result);
+    result = mulAdd(max(-c, half4(0.0h)), half4x3(-0.055628926, -0.063315354, -0.057192408, -0.0256364, -0.028660972, -0.02937357, -0.017604912, -0.020851422, -0.016070362, -0.0870202, -0.0832279, -0.07525406), result);
+    result = mulAdd(max(-d, half4(0.0h)), half4x3(0.062738225, 0.07106593, 0.061644047, -0.06068257, -0.06983662, -0.066070385, 0.024919355, 0.03227179, 0.028569462, -0.07866227, -0.098967604, -0.092128105), result);
+    result = mulAdd(max(-e, half4(0.0h)), half4x3(0.040397774, 0.047241107, 0.03962998, -0.09112752, -0.10057507, -0.09301817, 0.10833967, 0.101835825, 0.10027467, 0.27189335, 0.27433604, 0.26781923), result);
+    result = mulAdd(max(-f, half4(0.0h)), half4x3(-0.044211388, -0.042373534, -0.03658007, 0.113148406, 0.12423258, 0.107804194, -0.17081551, -0.18562958, -0.17475435, 0.09636739, 0.10763415, 0.093332425), result);
+    result = mulAdd(max(-g, half4(0.0h)), half4x3(-0.03798545, -0.047811143, -0.050768293, 0.018775463, 0.026812987, 0.03452908, 0.0055677597, 0.0039081173, -0.0017878668, -0.10728597, -0.12618187, -0.109045394), result);
+    result = mulAdd(max(-h, half4(0.0h)), half4x3(0.06359783, 0.064184755, 0.04934199, -0.009819327, -0.006616115, -0.007431496, 0.025055679, 0.024787048, 0.017360551, -0.047140837, -0.061695747, -0.06440822), result);
+    result = mulAdd(max(-i, half4(0.0h)), half4x3(0.060199022, 0.06482763, 0.059514645, 0.026998974, 0.028776823, 0.024897143, 0.17968474, 0.19337215, 0.16760105, 0.0075838566, 0.010503482, 0.011993149), result);
+    half3 outRGB = INPUT.sample(sam, pos).rgb + result * half(clamp(u.strength, 0.0f, 2.0f));
+    half maxL = (u.clampHighlights != 0u) ? a4kMaxLuma3x3(INPUT, sam, pos, inputPt) : 1.0h;
+    OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), gid);
 }
 
-// MARK: - Anime4K Bilateral Mode Denoise
 
-struct Anime4KDenoiseUniforms {
-    float denoiseStrength;
+// MARK: - Anime4K_Restore_Soft_S.hlsl (4 passes)
+
+kernel void a4k_restore_soft_s_p1(
+    texture2d<half, access::sample> INPUT [[texture(0)]],
+    texture2d<half, access::write> tex1 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex1.get_width();
+    const uint texH = tex1.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half3 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = INPUT.sample(sam, pos + float2(dx, dy) * inputPt).rgb;
+        }
+    }
+    half4 result = half4( 0.0113532655, -0.06449327, 0.035503868, 0.5683031 );
+    result = mulAdd(src[0][0], half3x4(0.10922428, -0.16249932, 0.15452726, -0.15669551, 0.053448875, -0.16528402, 0.01697721, -0.049275912, 0.20947173, -0.10576949, 0.19738325, -0.025417482), result);
+    result = mulAdd(src[0][1], half3x4(-0.3285196, 0.15909512, -0.5273671, 0.23778777, -0.40508887, -0.0609677, -0.4188177, 0.11137456, -0.24131267, 0.10453423, -0.36216277, 0.053446792), result);
+    result = mulAdd(src[0][2], half3x4(0.23072472, -0.082083695, -0.0041477727, -0.09136237, 0.11958912, -0.312698, -0.15842685, -0.013882424, 0.10933724, 0.017880991, -0.022167003, 0.014662608), result);
+    result = mulAdd(src[1][0], half3x4(-0.2789985, 0.054727737, 0.22577816, -0.49625716, -0.48472273, -0.011525487, 0.5354349, -0.08814955, -0.27021924, -0.044563178, 0.008232271, -0.13480483), result);
+    result = mulAdd(src[1][1], half3x4(-0.18203105, 0.09277001, 0.27071548, -0.17773713, -0.4335171, 1.2275106, -0.07663438, -0.29020032, 0.011992759, 0.060106967, 0.11002492, -0.046098012), result);
+    result = mulAdd(src[1][2], half3x4(0.08363418, 0.063420765, -0.10278259, 0.09357691, 0.38670546, 0.13577081, 0.048631024, -0.024960777, 0.0846784, -0.057097007, 0.06049236, 0.042082917), result);
+    result = mulAdd(src[2][0], half3x4(0.12315548, -0.056513585, -0.09826642, -0.17079762, 0.06479095, -0.36984903, -0.12512982, 0.042867575, 0.08360464, 0.12835538, -0.005067881, 0.02542005), result);
+    result = mulAdd(src[2][1], half3x4(0.18997705, 0.086363226, -0.0007131526, 0.19858918, 0.39745626, -0.0090341605, 0.27864447, 0.20052041, 0.010576528, -0.089242525, -0.025109483, -0.030768145), result);
+    result = mulAdd(src[2][2], half3x4(0.05427315, -0.060894873, 0.06548642, 0.095537595, 0.29116166, -0.16159569, -0.13293959, -0.112566955, 0.0059667625, 0.016041303, 0.03831561, 0.09869594), result);
+    tex1.write(result, gid);
+}
+
+
+kernel void a4k_restore_soft_s_p2(
+    texture2d<half, access::sample> tex1 [[texture(0)]],
+    texture2d<half, access::write> tex2 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex2.get_width();
+    const uint texH = tex2.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half4 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = tex1.sample(sam, pos + float2(dx, dy) * inputPt);
+        }
+    }
+    half4 result = half4( -0.106538564, -0.065693766, -0.03790106, 0.04776706 );
+    result = mulAdd(max(src[0][0], half4(0.0h)), half4x4(-0.027102098, 0.2640691, 0.1169015, 0.030902913, 0.15404584, 0.1361459, -0.38066056, 0.096569136, -0.111836195, -0.0051853824, -0.0996669, -0.23538585, -0.07060754, -0.18889332, -0.10793357, -0.15154232), result);
+    result = mulAdd(max(src[0][1], half4(0.0h)), half4x4(0.1378689, 0.21024452, 0.010976513, 0.0179521, -0.05993059, -0.28364083, 0.24486947, 0.21347582, -0.12522404, -0.16091396, 0.15499291, 0.08353191, -0.03342411, -0.08964405, 0.25111282, -0.07550899), result);
+    result = mulAdd(max(src[0][2], half4(0.0h)), half4x4(-0.06398718, 0.05763278, 0.021394925, 0.14780094, -0.033050716, 0.03346528, -0.0846797, 0.0125302235, 0.18018652, 0.24586707, 0.050538495, 0.09879243, -0.100035876, 0.043505374, 0.042692907, -0.08768257), result);
+    result = mulAdd(max(src[1][0], half4(0.0h)), half4x4(-0.11572878, 0.0545887, 0.16437739, 0.2775331, 0.10323911, -0.18938646, -0.17097469, -0.188723, 0.085762165, 0.14605838, -0.15568069, -0.16947642, 0.09042493, -0.087587915, -0.041969277, 0.27252352), result);
+    result = mulAdd(max(src[1][1], half4(0.0h)), half4x4(0.21475963, -0.018211678, -0.5711054, -0.09235345, -0.20367791, -0.23041399, 0.16346097, 0.007901888, 0.12542121, 0.16807431, 0.09862575, 0.16968751, 0.28490388, 0.40945014, -0.22364445, 0.14460565), result);
+    result = mulAdd(max(src[1][2], half4(0.0h)), half4x4(0.27512726, 0.14046481, -0.17684339, 0.102218024, -0.10503195, 0.3080809, 0.03681373, 0.2668656, -0.093752496, -0.07476867, 0.19900662, 0.06028286, -0.19815882, -0.0584525, 0.027984729, -0.02143819), result);
+    result = mulAdd(max(src[2][0], half4(0.0h)), half4x4(-0.16829525, -0.06818115, 0.0006509334, 0.01163159, 0.18918815, -0.10731989, -0.008126929, -0.47991323, -0.11022971, 0.19150843, 0.05272113, -0.34417602, 0.022882428, 0.1774031, 0.062597334, -0.09915319), result);
+    result = mulAdd(max(src[2][1], half4(0.0h)), half4x4(0.32131585, 0.05668815, -0.34203658, 0.05542482, -0.008077225, 0.009148517, 0.10953332, -0.050969962, 0.09904077, 0.46938205, -0.5148919, -0.22275375, -0.10536104, -0.23662373, 0.002147416, -0.14256701), result);
+    result = mulAdd(max(src[2][2], half4(0.0h)), half4x4(-0.19335353, -0.103732094, 0.17156832, 0.0059756916, -0.118641876, 0.14529023, -0.18662338, 0.0447326, 0.026719248, 0.042491894, 0.026437795, 0.05601309, 0.08645617, 0.08365193, -0.039582565, 0.16612953), result);
+    result = mulAdd(max(-src[0][0], half4(0.0h)), half4x4(-0.014315469, 0.012588422, 0.037587024, 0.08707526, -0.08064868, -0.28149533, 0.27326405, 0.21468583, -0.04278333, 0.29369017, 0.18653142, 0.035729136, 0.079363555, 0.30725953, 0.0147137, 0.08527481), result);
+    result = mulAdd(max(-src[0][1], half4(0.0h)), half4x4(0.06659263, 0.03452449, -0.33752796, 0.0066543026, 0.48697233, 0.019602561, -0.32033685, -0.20538871, 0.3089118, 0.4315903, -0.13524854, -0.10791581, 0.3315688, 0.13135147, -0.26904663, 0.142365), result);
+    result = mulAdd(max(-src[0][2], half4(0.0h)), half4x4(0.13619833, 0.045271892, -0.029841429, 0.010704955, -0.29257727, -0.10563375, 0.35345638, -0.06734038, -0.043791633, -0.0056891907, -0.078411415, 0.075443126, -0.05746597, -0.19959894, -0.12797245, 0.18837726), result);
+    result = mulAdd(max(-src[1][0], half4(0.0h)), half4x4(0.25673476, 0.120482095, -0.23827696, -0.13557845, 0.300447, -0.3008584, -0.13834439, 0.5459493, -0.26155484, 0.06905137, 0.16247983, 0.039960653, -0.023218757, 0.07977591, -0.11354706, -0.25831422), result);
+    result = mulAdd(max(-src[1][1], half4(0.0h)), half4x4(0.0842605, 0.282916, 0.14062001, 0.06356874, 0.55912817, 0.1743876, -0.30324093, 0.052068707, -0.20756413, 0.27321506, -0.26560605, -0.27695876, -0.3927334, -0.5439608, 0.39293098, -0.001130203), result);
+    result = mulAdd(max(-src[1][2], half4(0.0h)), half4x4(-0.021890296, -0.12703396, 0.06660714, -0.03164527, 0.0018722567, -0.26552317, 0.06978973, -0.24030049, 0.46008193, 0.5595346, 0.081981994, -0.038414747, -0.010446991, -0.56102365, -0.079274766, -0.01851302), result);
+    result = mulAdd(max(-src[2][0], half4(0.0h)), half4x4(0.052988984, 0.030581746, -0.06868741, 0.21545182, -0.5706256, -0.0034910638, 0.48361364, 0.9020033, -0.02242781, -0.13256042, 0.08997955, 0.21001706, -0.059571438, -0.040119104, -0.05029196, -0.127414), result);
+    result = mulAdd(max(-src[2][1], half4(0.0h)), half4x4(-0.08275339, -0.05999088, 0.11068767, 0.014646892, -0.041986465, 0.1028236, -0.17218924, 0.026559748, -0.17412743, -0.38364175, 0.17410514, 0.13038695, 0.23155633, 0.2655843, 0.045085523, 0.13005458), result);
+    result = mulAdd(max(-src[2][2], half4(0.0h)), half4x4(-0.013383197, -0.064526096, 0.049046878, 0.015992291, 0.123987064, 0.0104690585, 0.07065378, -0.009824511, -0.036109775, 0.13384768, 0.29676288, -0.39475223, -0.009368096, -0.05666906, -0.09132696, -0.082638375), result);
+    tex2.write(result, gid);
+}
+
+
+kernel void a4k_restore_soft_s_p3(
+    texture2d<half, access::sample> tex2 [[texture(0)]],
+    texture2d<half, access::write> tex1 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex1.get_width();
+    const uint texH = tex1.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half4 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = tex2.sample(sam, pos + float2(dx, dy) * inputPt);
+        }
+    }
+    half4 result = half4( -0.0063428865, 0.0057986965, -0.12526293, -0.059240736 );
+    result = mulAdd(max(src[0][0], half4(0.0h)), half4x4(0.024004154, -0.26474997, -0.5256586, 0.051624652, -0.16621786, 0.2964122, 0.6044247, -0.14335106, 0.17002718, -0.2679876, -0.30162668, 0.1273794, -0.17601459, -0.1782376, 0.104725115, -0.16351137), result);
+    result = mulAdd(max(src[0][1], half4(0.0h)), half4x4(-0.121676154, 0.047741555, -0.06738679, -0.056402843, 0.004424971, -0.35099635, -0.073440626, 0.039784692, 0.15204315, -0.1165704, 0.11231046, -0.27369732, 0.33737272, -0.11880767, 0.09637475, -0.14709689), result);
+    result = mulAdd(max(src[0][2], half4(0.0h)), half4x4(-0.017987821, -0.08798823, -0.062515825, -0.046803873, -0.05871703, 0.27013004, 0.19397618, -0.052147817, 0.003271283, -0.0029015478, -0.07390092, -0.09348337, -0.1574738, 0.06750957, -0.07661155, 0.054327156), result);
+    result = mulAdd(max(src[1][0], half4(0.0h)), half4x4(-0.15215784, -0.72508365, -0.3202069, 0.20295432, -0.19125701, 0.021401431, -0.051837035, -0.025939213, 0.25565025, -0.12872623, 0.13169816, 0.27377388, -0.008718429, -0.05864064, 0.028844763, 0.1144993), result);
+    result = mulAdd(max(src[1][1], half4(0.0h)), half4x4(-0.30012092, -0.1322455, -0.11868545, 0.09857058, 0.082795605, -0.075334676, -0.3752773, -0.02918163, -0.67764, -0.38598236, -0.21023573, 0.38274166, -0.07398165, -0.07213789, -0.28427607, 0.1266569), result);
+    result = mulAdd(max(src[1][2], half4(0.0h)), half4x4(-0.37507388, 0.18809201, -0.21982779, 0.27208912, 0.022066567, -0.27627763, 0.12345216, -0.30041683, 0.017002959, -0.091398515, -0.25207692, -0.29253414, -0.08231422, -0.14665812, -0.07868529, -0.24562219), result);
+    result = mulAdd(max(src[2][0], half4(0.0h)), half4x4(0.08686712, 0.080837384, 0.20736577, 0.008233064, 0.14957365, 0.21801959, -0.04870689, 0.42149112, 0.27255878, 0.33320278, -0.08467146, 0.10381615, 0.055278245, 0.085710146, 0.009097151, 0.29092705), result);
+    result = mulAdd(max(src[2][1], half4(0.0h)), half4x4(0.0012207404, -0.023874281, -0.027035477, 0.005157451, 0.19330226, 0.33711615, -0.16495204, 0.549021, 0.44879642, 0.1978837, -0.20492741, 0.28099406, 0.2631811, 0.40786585, -0.055340275, 0.2575511), result);
+    result = mulAdd(max(src[2][2], half4(0.0h)), half4x4(0.29127392, -0.06287165, 0.12715077, 0.14784902, -0.3183704, 0.42057636, -0.11483724, -0.3019506, 0.010730576, 0.29091576, -0.046116166, -0.23528357, -0.0037143505, 0.1191774, -0.06084074, 0.011641706), result);
+    result = mulAdd(max(-src[0][0], half4(0.0h)), half4x4(-0.2579205, 0.036545023, 0.11691888, 0.04996418, 0.21318026, 0.21370813, -0.14114271, 0.031217605, -0.06979331, -0.0690704, 0.04618086, 0.025164584, -0.10994228, 0.109930746, 0.103678934, 0.12193115), result);
+    result = mulAdd(max(-src[0][1], half4(0.0h)), half4x4(-0.19843774, -0.11237926, 0.007291354, 0.16480611, -0.15669724, 0.46283355, 0.077065215, 0.112273656, 0.17143534, -0.19934891, -0.25481275, 0.034591813, -0.27032652, -0.2702769, 0.04816228, -0.031614583), result);
+    result = mulAdd(max(-src[0][2], half4(0.0h)), half4x4(-0.16307239, -0.11295217, 0.05861256, 0.14225823, -0.015648091, 0.11741865, 0.113366075, 0.023935538, 0.19560932, -0.10553561, -0.042583376, -0.048160724, -0.3116519, 0.13957061, -0.0044852323, -0.015472912), result);
+    result = mulAdd(max(-src[1][0], half4(0.0h)), half4x4(-0.15629178, 0.06463271, -0.13176678, 0.025518289, -0.021733627, 0.22236359, 0.019508492, -0.11629477, 0.10801276, -0.021957984, -0.11272639, -0.03615053, -0.121420704, 0.2520835, 0.043395765, 0.1699031), result);
+    result = mulAdd(max(-src[1][1], half4(0.0h)), half4x4(0.2886654, 0.21755892, 0.21757497, 0.08442575, -0.109903164, -0.67295986, 0.22886126, -0.027185453, 0.3761606, 0.23199768, 0.05908783, -0.1496158, 0.10832971, -0.3530352, 0.20234483, -0.07615918), result);
+    result = mulAdd(max(-src[1][2], half4(0.0h)), half4x4(0.11043024, 0.18943349, 0.42394367, 0.029350199, -0.15085667, 0.020204183, -0.081609115, 0.07907012, 0.33805525, 0.0066280114, 0.0018284445, 0.022983696, 0.004984607, 0.0429299, -0.14568979, -0.29143327), result);
+    result = mulAdd(max(-src[2][0], half4(0.0h)), half4x4(-0.16376027, -0.20387048, 0.06522074, 0.17484841, -0.13885716, -0.04380927, -0.03535832, -0.16978237, -0.004799155, -0.25407305, -0.039976966, -0.011992087, -0.22535577, -0.09583549, 0.0334331, 0.016292758), result);
+    result = mulAdd(max(-src[2][1], half4(0.0h)), half4x4(-0.38688713, -0.20232083, 0.23887886, -0.10438324, -0.24170811, -0.074868314, 0.03977399, -0.22810821, -0.08257971, -0.11902456, 0.106009185, -0.078289054, -0.11932821, 0.024207884, 0.10070917, 0.79348284), result);
+    result = mulAdd(max(-src[2][2], half4(0.0h)), half4x4(-0.4018743, 0.050456528, 0.035341598, -0.03788609, 0.12964934, -0.44461823, 0.029031694, 0.29604837, -0.102386944, -0.13805065, 0.0055692918, 0.14659804, -0.22499937, 0.14680648, -0.3443954, -0.06994176), result);
+    tex1.write(result, gid);
+}
+
+
+kernel void a4k_restore_soft_s_p4(
+    texture2d<half, access::sample> INPUT [[texture(0)]],
+    texture2d<half, access::sample> tex1 [[texture(1)]],
+    texture2d<half, access::write> OUTPUT [[texture(2)]],
+    constant Anime4KRestoreUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = OUTPUT.get_width();
+    const uint texH = OUTPUT.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    // [ a, d, g ]
+    // [ b, e, h ]
+    // [ c, f, i ]
+    half4 a = tex1.sample(sam, pos + float2(-inputPt.x, -inputPt.y));
+    half4 b = tex1.sample(sam, pos + float2(-inputPt.x, 0));
+    half4 c = tex1.sample(sam, pos + float2(-inputPt.x, inputPt.y));
+    half4 d = tex1.sample(sam, pos + float2(0, -inputPt.y));
+    half4 e = tex1.sample(sam, pos);
+    half4 f = tex1.sample(sam, pos + float2(0, inputPt.y));
+    half4 g = tex1.sample(sam, pos + float2(inputPt.x, -inputPt.y));
+    half4 h = tex1.sample(sam, pos + float2(inputPt.x, 0));
+    half4 i = tex1.sample(sam, pos + float2(inputPt.x, inputPt.y));
+    half3 result = half3( -0.008303841, -0.008251826, -0.0069884053 );
+    result = mulAdd(max(a, half4(0.0h)), half4x3(0.08631539, 0.09499331, 0.065609254, -0.023760278, -0.027293118, -0.022839671, -0.012447854, -0.008565141, -0.012041815, -0.033292875, -0.031266093, -0.02874347), result);
+    result = mulAdd(max(b, half4(0.0h)), half4x3(0.08709062, 0.09760889, 0.08988583, -0.09099671, -0.102120616, -0.098076016, 0.057814583, 0.06999608, 0.05961344, 0.12246188, 0.1319784, 0.12254915), result);
+    result = mulAdd(max(c, half4(0.0h)), half4x3(0.07694916, 0.0822054, 0.07549296, -0.046808865, -0.051509347, -0.035890795, 0.01599848, 0.014677793, 0.0086143715, 0.033142705, 0.0426565, 0.035911378), result);
+    result = mulAdd(max(d, half4(0.0h)), half4x3(-0.0008269902, 0.0009082343, 0.014101725, 0.0006387551, 0.005079344, -0.013034868, 0.013909732, 0.011026747, 0.012485332, 0.027028518, 0.022164145, 0.03183532), result);
+    result = mulAdd(max(e, half4(0.0h)), half4x3(-0.33575395, -0.36700967, -0.34140685, 0.35850254, 0.37535715, 0.34613726, -0.12680013, -0.1256115, -0.112494245, -0.061541136, -0.059120018, -0.06552594), result);
+    result = mulAdd(max(f, half4(0.0h)), half4x3(-0.047570463, -0.050335366, -0.04665491, -0.110970475, -0.12363716, -0.11072252, 0.041563414, 0.059771337, 0.045290247, -0.17999935, -0.19700716, -0.17459513), result);
+    result = mulAdd(max(g, half4(0.0h)), half4x3(0.078488424, 0.07483357, 0.08347933, -0.0063715233, 0.00035415235, -0.010886946, 0.031237155, 0.02512343, 0.034399323, -0.023146842, -0.026732154, -0.027644241), result);
+    result = mulAdd(max(h, half4(0.0h)), half4x3(-0.05906883, -0.06784104, -0.04506148, -0.003939601, -0.0011749315, -0.006256036, -0.1662408, -0.16871658, -0.16598499, 0.051277652, 0.04837499, 0.05120855), result);
+    result = mulAdd(max(i, half4(0.0h)), half4x3(0.08158806, 0.08674548, 0.07437206, -0.05765347, -0.06196418, -0.057311118, 0.26747537, 0.2668808, 0.2389857, -0.010376844, -0.01690028, -0.008414153), result);
+    result = mulAdd(max(-a, half4(0.0h)), half4x3(0.030539425, 0.02415435, 0.039969034, 0.006491679, 0.014436586, 0.005435709, -0.0058292216, -0.013982021, -0.011243379, 0.025942149, 0.015361476, 0.019134998), result);
+    result = mulAdd(max(-b, half4(0.0h)), half4x3(-0.06322247, -0.07146787, -0.06673042, 0.028702464, 0.039047733, 0.039646607, -0.072553575, -0.08046175, -0.07027197, -0.1447189, -0.1539398, -0.1466465), result);
+    result = mulAdd(max(-c, half4(0.0h)), half4x3(-0.046430312, -0.054549117, -0.048076343, 0.032971155, 0.02980819, 0.029172963, -0.017612953, -0.015100736, -0.01202649, -0.026717246, -0.028401854, -0.034548033), result);
+    result = mulAdd(max(-d, half4(0.0h)), half4x3(-0.0020459262, -0.0008748501, -0.012601956, 0.0054226154, 0.008867029, 0.018921215, -0.0021330053, -0.0036601655, -0.0022091097, -0.08636891, -0.10203159, -0.09741449), result);
+    result = mulAdd(max(-e, half4(0.0h)), half4x3(0.07306159, 0.08245483, 0.06548199, -0.1933229, -0.20326294, -0.19189309, 0.107496604, 0.11584994, 0.10907522, 0.30877885, 0.31297725, 0.30890995), result);
+    result = mulAdd(max(-f, half4(0.0h)), half4x3(0.03192904, 0.035112645, 0.033732817, 0.074100636, 0.08349646, 0.06659352, -0.1136165, -0.12470947, -0.11192198, 0.14465587, 0.16328491, 0.13984151), result);
+    result = mulAdd(max(-g, half4(0.0h)), half4x3(-0.05098033, -0.053096622, -0.05533725, 0.0045651463, -0.007682458, 0.0026934785, -0.021199327, -0.016210148, -0.030939564, -0.031621892, -0.046702545, -0.02647333), result);
+    result = mulAdd(max(-h, half4(0.0h)), half4x3(0.055801813, 0.06430485, 0.05052402, 0.0241233, 0.013879883, 0.017344628, 0.08707151, 0.10031039, 0.095042154, -0.109053336, -0.11414017, -0.111838564), result);
+    result = mulAdd(max(-i, half4(0.0h)), half4x3(0.030582374, 0.03604719, 0.040417343, 0.038665913, 0.036998056, 0.030004544, 0.09209076, 0.10010001, 0.08389406, -0.014655714, -0.0074866647, -0.012227013), result);
+    half3 outRGB = INPUT.sample(sam, pos).rgb + result * half(clamp(u.strength, 0.0f, 2.0f));
+    half maxL = (u.clampHighlights != 0u) ? a4kMaxLuma3x3(INPUT, sam, pos, inputPt) : 1.0h;
+    OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), gid);
+}
+
+
+// MARK: - Anime4K_Upscale_S.hlsl (4 passes)
+
+kernel void a4k_upscale_s_p1(
+    texture2d<half, access::sample> INPUT [[texture(0)]],
+    texture2d<half, access::write> tex1 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex1.get_width();
+    const uint texH = tex1.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half3 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = INPUT.sample(sam, pos + float2(dx, dy) * inputPt).rgb;
+        }
+    }
+    half4 result = half4( -0.01050964, -0.00939481, 0.17684458, 0.027366742 );
+    result = mulAdd(src[0][0], half3x4(-0.0057322932, 0.12928207, -0.056848746, 0.18680117, -0.0306273, 0.25602463, 0.053723164, 0.20419341, 0.0018709862, 0.022848232, -0.04105527, 0.101690340), result);
+    result = mulAdd(src[0][1], half3x4(0.009471417, -0.12957802, 0.096014425, 0.21836184, 0.00021601951, -0.22997683, 0.23666254, 0.41192335, 0.021762101, 0.0047863554, 0.008233427, 0.108514786), result);
+    result = mulAdd(src[0][2], half3x4(-0.01156376, -0.18988979, 0.04614705, -0.044767227, 0.01050636, -0.26426336, 0.23741047, 0.0027636609, -0.027718676, -0.14202335, -0.016650287, -0.06637125), result);
+    result = mulAdd(src[1][0], half3x4(0.057809234, -0.11033858, 0.056533534, -0.06292466, 0.13880666, -0.18710336, 0.2441031, -0.25326246, 0.0032683122, -0.026437074, 0.0023248852, 7.640766e-05), result);
+    result = mulAdd(src[1][1], half3x4(-0.49110603, 0.4429004, -0.44015464, -0.41174838, -0.87738293, 0.7808468, -1.0929365, -0.59699076, -0.18409836, 0.185138, -0.11773224, -0.17097276), result);
+    result = mulAdd(src[1][2], half3x4(0.10580959, -0.055947904, -0.03431237, -0.080236495, 0.14862584, -0.15393938, -0.18872876, -0.3170681, 0.03559387, -0.003990826, 0.021298569, 0.012844483), result);
+    result = mulAdd(src[2][0], half3x4(-0.040715586, -0.25781113, 0.08896714, -0.1225879, -0.15790503, -0.54010904, 0.29588607, 0.10401059, 0.003413123, -0.108357325, 0.0112870345, -0.11888622), result);
+    result = mulAdd(src[2][1], half3x4(0.0049315444, 0.02376202, -0.08224771, 0.121118225, -0.041512914, -0.027994309, -0.585988, -0.069672115, -0.017247835, 0.0056576864, 0.04319012, 0.055003505), result);
+    result = mulAdd(src[2][2], half3x4(0.37521392, 0.15916082, 0.059708964, 0.19046007, 0.8120325, 0.38343868, 0.3436578, 0.5287958, 0.16570656, 0.06957687, 0.014022592, 0.074799836), result);
+    tex1.write(result, gid);
+}
+
+
+kernel void a4k_upscale_s_p2(
+    texture2d<half, access::sample> tex1 [[texture(0)]],
+    texture2d<half, access::write> tex2 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex2.get_width();
+    const uint texH = tex2.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half4 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = tex1.sample(sam, pos + float2(dx, dy) * inputPt);
+        }
+    }
+    // [ a, d, g ]
+    // [ b, e, h ]
+    // [ c, f, i ]
+    half4 result = half4( 0.012077211, 0.013045883, 0.0380778, -0.02908858 );
+    result = mulAdd(max(src[0][0], half4(0.0h)), half4x4(-0.011029496, 0.05866063, -0.09460646, -0.017664742, -0.022488879, 0.18384217, -0.00397663, -0.064733066, 0.08466802, 0.10667488, 8.0212536e-05, 0.0908869, 0.13580276, 0.00097438256, 0.12176522, -0.08218466), result);
+    result = mulAdd(max(src[0][1], half4(0.0h)), half4x4(0.16062798, -0.10190268, 0.03280682, 0.05621916, -0.009684231, -0.08464307, 0.17058301, -0.096469186, 0.1967505, -0.1450099, 0.093607284, -0.28240147, -0.21377413, 0.10079291, -0.1741522, 0.17330575), result);
+    result = mulAdd(max(src[0][2], half4(0.0h)), half4x4(-0.060160473, 0.06316997, 0.0046929033, -0.049405966, 0.13851729, 0.06830702, -0.0586872, -0.040827133, 0.007052838, -0.03576886, -0.111261636, 0.039155316, -0.07380389, -0.09369825, 0.04471156, 0.09678487), result);
+    result = mulAdd(max(src[1][0], half4(0.0h)), half4x4(-0.36683616, -0.035950605, -0.24414362, -0.009159744, 0.19335322, -0.099253505, 0.075083904, -0.00076695543, 0.65291303, -0.25599423, 0.19827642, 0.065899536, -0.07423247, -0.068967685, 0.0050554527, -0.060272824), result);
+    result = mulAdd(max(src[1][1], half4(0.0h)), half4x4(-0.020688485, -0.83178276, 0.11104878, 0.26454413, 0.13655476, 0.37675047, -0.22219229, -0.01751935, 0.44552696, 0.92510307, 0.16063261, -0.62011045, 0.19366647, -0.06996067, -0.2504841, 0.00803723), result);
+    result = mulAdd(max(src[1][2], half4(0.0h)), half4x4(0.0051537007, -0.057168536, -0.16110587, 0.25232598, -0.04447099, 0.11997351, 0.14808103, -0.34443566, -0.26212573, -0.21970181, 0.2724405, 0.21050811, -0.07949061, -0.064808235, -0.21208277, -0.0042361654), result);
+    result = mulAdd(max(src[2][0], half4(0.0h)), half4x4(-0.0888952, -0.20169449, 0.19144905, -0.016882861, -0.013283103, 0.07552998, -0.24686803, 0.012453213, -0.065454446, -0.016123284, -0.47316182, 0.070926026, 0.09219782, 0.13118166, 0.074736096, 0.0077910526), result);
+    result = mulAdd(max(src[2][1], half4(0.0h)), half4x4(0.5832154, 0.1138069, -0.039765622, 0.3182784, -0.25497997, 0.0013993139, 0.39285088, -0.48511526, -0.39891505, -0.19094779, -0.082146175, -0.20826934, 0.020590555, -0.0012490178, -0.4398621, 0.14377014), result);
+    result = mulAdd(max(src[2][2], half4(0.0h)), half4x4(0.21917395, 3.4314657e-05, 0.25734863, -0.3433305, 0.015720673, 0.2676127, -0.06807297, 0.15040149, -0.23638041, -0.0050233034, -0.13666134, 0.4542111, -0.033572577, -0.08450588, -0.23341487, 0.053490847), result);
+    result = mulAdd(max(-src[0][0], half4(0.0h)), half4x4(-0.17482175, 0.057647135, 0.33135444, 0.0850751, -0.1718849, -0.0854123, 0.036795795, -0.13874969, -0.10903869, -0.19007301, -0.06064334, -0.03786032, -0.036696054, 0.07844446, 0.012523185, -0.01562906), result);
+    result = mulAdd(max(-src[0][1], half4(0.0h)), half4x4(-0.04411997, -0.10331819, 0.10050193, 0.12406485, 0.07431592, 0.30109692, -0.17511666, -0.13263564, -0.10192587, 0.07821255, -0.22415096, 0.25552443, 0.17881326, -0.13914281, 0.109979235, -0.0016463579), result);
+    result = mulAdd(max(-src[0][2], half4(0.0h)), half4x4(-0.01911644, -0.15412527, 0.028903123, 0.20831817, 0.00375175, 0.08110953, 0.074919395, -0.17581624, -0.015677985, 0.06504228, 0.08817818, -0.12518327, -0.09537373, 0.028905088, -0.051288474, 0.054334078), result);
+    result = mulAdd(max(-src[1][0], half4(0.0h)), half4x4(0.2852779, -0.28924024, 0.36805123, 0.21079305, -0.28336474, 0.1679663, -0.08641141, -0.10699407, -0.16090055, 0.1287612, -0.15910125, 0.05734755, 0.15883245, 0.0053026294, 0.080674745, 0.0505137), result);
+    result = mulAdd(max(-src[1][1], half4(0.0h)), half4x4(0.17639062, 0.3790122, -0.19588692, -0.020314282, 0.26197383, 0.09014768, 0.19696823, -0.41025418, -0.08308115, -0.33279485, -0.22528782, 0.06172439, -0.1365661, -0.13094363, -0.005086559, 0.089024484), result);
+    result = mulAdd(max(-src[1][2], half4(0.0h)), half4x4(0.05262993, 0.0006296959, 0.1657725, -0.32591924, 0.12126701, 0.061543245, -0.10526848, 0.041583937, 0.094976954, 0.09416157, -0.22019257, -0.058390073, -0.2073888, 0.057273377, 0.19558284, 0.004208022), result);
+    result = mulAdd(max(-src[2][0], half4(0.0h)), half4x4(0.30005738, 0.18478931, -0.23342943, 0.22455733, -0.016488122, 0.099634305, 0.31620836, -0.15731157, 0.09595808, 0.0013774688, 0.48273298, -0.07027936, -0.18764344, -0.26194447, -0.11794225, -0.012173601), result);
+    result = mulAdd(max(-src[2][1], half4(0.0h)), half4x4(0.117986746, -0.13846518, -0.019614812, -0.3011192, 0.5501164, 0.3408611, -0.40090847, 0.15706886, 0.13050972, 0.051776595, 0.20792943, 0.23389706, -0.22965533, -0.053367328, 0.3911586, -0.032988597), result);
+    result = mulAdd(max(-src[2][2], half4(0.0h)), half4x4(0.054753624, -0.008485731, -0.2451672, 0.17528129, 0.13657846, 0.010480436, 0.07651423, -0.43316832, 0.12736236, 0.13804524, 0.12529011, -0.30946237, -0.14423579, 0.08403089, 0.24335162, 0.057288036), result);
+    tex2.write(result, gid);
+}
+
+
+kernel void a4k_upscale_s_p3(
+    texture2d<half, access::sample> tex2 [[texture(0)]],
+    texture2d<half, access::write> tex1 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex1.get_width();
+    const uint texH = tex1.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half4 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = tex2.sample(sam, pos + float2(dx, dy) * inputPt);
+        }
+    }
+    // [ a, d, g ]
+    // [ b, e, h ]
+    // [ c, f, i ]
+    half4 result = half4( 0.018736731, -0.0026039074, 0.050130025, -0.055364225 );
+    result = mulAdd(max(src[0][0], half4(0.0h)), half4x4(-0.036115196, -0.06971895, -0.07508942, 0.016036168, 0.12120111, 0.24536026, 0.044755507, -0.20663576, 0.029635755, -0.15427187, 0.027148994, -0.20795093, 0.10170582, 0.077919215, 0.66063017, -0.4632968), result);
+    result = mulAdd(max(src[0][1], half4(0.0h)), half4x4(-0.0052889925, -0.019060908, -0.08660142, -0.022095207, -0.08097976, -0.015142803, -0.18552722, -0.078493506, -0.16293915, -0.20099808, -0.08370822, 0.3701389, 0.09094984, 0.2487225, 0.24338846, 0.044003833), result);
+    result = mulAdd(max(src[0][2], half4(0.0h)), half4x4(-0.061406493, -0.017232792, -0.10917424, 0.11203319, 0.040699825, -0.019294346, 0.084953666, -0.018133596, 0.07209552, 0.016069936, 0.17805555, -0.089537814, 0.15809004, 0.1027023, 0.15044671, -0.15530108), result);
+    result = mulAdd(max(src[1][0], half4(0.0h)), half4x4(0.0948676, -0.040305693, -0.005591629, -0.048048403, -0.07547777, 0.056606572, 0.021390207, 0.32600567, -0.20805131, -0.099587254, 0.029613169, 0.0092129605, -0.29429698, -0.09898621, 0.44470885, -0.89487344), result);
+    result = mulAdd(max(src[1][1], half4(0.0h)), half4x4(-0.122259885, 0.11445877, 0.06666907, 0.1869428, -0.1553992, -0.1658741, 0.2988138, -0.57746625, -0.34609964, 0.11169158, -0.41877756, 0.38075635, 0.21293911, 0.09640372, -0.12754214, -0.08026104), result);
+    result = mulAdd(max(src[1][2], half4(0.0h)), half4x4(0.15128808, 0.050087795, 0.09219755, -0.18080945, 0.0044571217, -0.046019405, -0.1289922, 0.20305426, 0.19601224, 0.04667917, 0.17465587, 0.027672665, 0.18441725, 0.06845396, 0.11288585, -0.23283863), result);
+    result = mulAdd(max(src[2][0], half4(0.0h)), half4x4(-0.072962, -0.06639447, 0.049347494, -0.1386401, 0.10396071, 0.08187777, -0.04280746, 0.07390891, 0.06628344, 0.037797406, 0.021885803, -0.013147403, 0.22376558, 0.36243078, 0.12874891, -0.0023783944), result);
+    result = mulAdd(max(src[2][1], half4(0.0h)), half4x4(0.074945286, 0.16045591, -0.11798349, 0.12910712, 0.054760084, -0.095626175, -0.047832094, 0.03493912, 0.11817307, 0.037452437, -0.14301221, -0.027356789, -0.052390423, 0.11373512, 0.07686775, 0.010008694), result);
+    result = mulAdd(max(src[2][2], half4(0.0h)), half4x4(-0.023999173, -0.091900624, 0.02388157, 0.03173873, 0.0065633506, -0.033716757, -0.1198324, 0.12057766, 0.026465805, -0.07517131, -0.07760598, 0.060463097, 0.07345541, 0.046037503, 0.21101558, -0.26785463), result);
+    result = mulAdd(max(-src[0][0], half4(0.0h)), half4x4(0.15544604, -0.03902825, 0.04630384, -0.25173616, -0.0691359, 0.07476507, 0.009071253, 0.089964196, -0.26539803, -0.3958477, -0.22155671, 0.20735882, -0.105860494, -0.003996804, -0.044815883, 0.39544627), result);
+    result = mulAdd(max(-src[0][1], half4(0.0h)), half4x4(0.6169709, 0.23717614, -0.37884676, -0.7484867, 0.020169826, -0.30718836, 1.0965588, -0.20711036, -0.39149985, -0.06843563, -0.06522909, 0.103805855, 0.03265825, -0.15137726, 0.12837899, -0.01294922), result);
+    result = mulAdd(max(-src[0][2], half4(0.0h)), half4x4(-0.23638196, -0.4560866, -0.11948684, -0.1464144, 0.10690008, 0.007835961, 0.11864342, -0.13101323, -0.16509797, 0.075027354, 0.08122998, 0.13451207, 0.0011890623, 0.052157886, 0.08372405, -0.07085038), result);
+    result = mulAdd(max(-src[1][0], half4(0.0h)), half4x4(-0.21997726, -0.16488647, -0.0291317, 0.17997476, 0.1493211, 0.027494298, 0.0034613227, -0.3207727, 0.18699001, 0.14728633, -0.042895135, -0.07612043, 0.125076, -0.14714554, -0.03480009, -0.22753975), result);
+    result = mulAdd(max(-src[1][1], half4(0.0h)), half4x4(-0.5342686, -0.7426105, -0.38294584, 0.42549992, 0.46053204, 0.7867879, 0.106234804, -0.041163098, 0.5198579, -0.5219404, 0.14809476, -0.41802374, 0.06810794, -0.15122683, -0.047409, 0.13178343), result);
+    result = mulAdd(max(-src[1][2], half4(0.0h)), half4x4(-0.50428164, 0.18220626, 0.35510704, -0.081787474, 0.03155813, 0.019284263, 0.0032388573, -0.20513348, -0.05385551, 0.17803182, -0.26206362, 0.2870375, 0.008557827, 0.08401449, -0.027598893, -0.010791235), result);
+    result = mulAdd(max(-src[2][0], half4(0.0h)), half4x4(0.16657415, 0.067647465, 0.093076974, -0.14438486, -0.10017002, 0.0022367141, 0.03250936, -0.052794546, -0.009178676, -0.019673595, -0.0016697067, -0.15424626, -0.112123474, -0.11079971, 0.011987111, -0.11747758), result);
+    result = mulAdd(max(-src[2][1], half4(0.0h)), half4x4(-0.023021797, -0.058703423, -0.037978355, -0.062433913, -0.13130441, 0.048656322, 0.056839373, 0.109036915, -0.07823158, 0.14785293, 0.058555078, -0.11679035, -0.14002073, 0.07395252, 0.098268874, -0.06710464), result);
+    result = mulAdd(max(-src[2][2], half4(0.0h)), half4x4(0.14906375, 0.030001195, -0.10338215, 0.0662968, -0.161953, -0.13682815, 0.09563142, 0.009514228, -0.009491218, 0.06737101, -0.1393389, 0.15231515, -0.073147796, 0.00767062, 0.028675212, 0.014213088), result);
+    tex1.write(result, gid);
+}
+
+
+kernel void a4k_upscale_s_p4(
+    texture2d<half, access::sample> INPUT [[texture(0)]],
+    texture2d<half, access::sample> tex1 [[texture(1)]],
+    texture2d<half, access::write> OUTPUT [[texture(2)]],
+    constant Anime4KUpscaleUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    constexpr sampler sam1(filter::linear, address::clamp_to_edge, coord::normalized);
+    const uint inW = tex1.get_width();
+    const uint inH = tex1.get_height();
+    if (gid.x >= inW || gid.y >= inH) return;
+    const uint outW = OUTPUT.get_width();
+    const uint outH = OUTPUT.get_height();
+    const float2 inputPt = 1.0f / float2(inW, inH);
+    const float2 outputPt = 1.0f / float2(outW, outH);
+    float2 pos = (float2(gid) + 0.5f) * inputPt;
+    // [ a, d, g ]
+    // [ b, e, h ]
+    // [ c, f, i ]
+    half4 a = tex1.sample(sam, pos - inputPt);
+    half4 b = tex1.sample(sam, pos + float2(-inputPt.x, 0));
+    half4 c = tex1.sample(sam, pos + float2(-inputPt.x, inputPt.y));
+    half4 d = tex1.sample(sam, pos + float2(0, -inputPt.y));
+    half4 e = tex1.sample(sam, pos);
+    half4 f = tex1.sample(sam, pos + float2(0, inputPt.y));
+    half4 g = tex1.sample(sam, pos + float2(inputPt.x, -inputPt.y));
+    half4 h = tex1.sample(sam, pos + float2(inputPt.x, 0));
+    half4 i = tex1.sample(sam, pos + float2(inputPt.x, inputPt.y));
+    half4 result = half4( -0.00346731, -0.0046263863, -0.004627155, -0.0057769152 );
+    result = mulAdd(max(a, half4(0.0h)), half4x4(0.019100675, -0.014241565, 0.004667036, -0.03865062, 0.106731094, 0.026099661, 0.014594411, -0.011881356, 0.0040967264, -0.004626336, 0.006469508, 0.010875305, -0.033909045, -0.085905954, 0.07861378, 0.019452631), result);
+    result = mulAdd(max(b, half4(0.0h)), half4x4(0.20777655, -0.060354974, 0.0023840065, -0.064121604, -0.17397617, 0.019293457, -0.09707183, 0.080641985, 0.01025124, -0.017382381, 0.008661793, -0.010995665, 0.21943407, -0.115574986, 0.14471593, -0.068836235), result);
+    result = mulAdd(max(c, half4(0.0h)), half4x4(0.057942886, -0.06311754, 0.2253396, -0.04159292, -0.020731755, 0.007877151, 0.041525815, 0.025278691, 0.03041967, -0.025137542, 0.024364179, -0.024543528, 0.029438615, -0.015506873, 0.081686, -0.07812221), result);
+    result = mulAdd(max(d, half4(0.0h)), half4x4(0.054237515, 0.0676094, -0.0047708177, 0.0043467237, -0.10032304, -0.020498628, 0.04240586, 0.07272254, 0.0784221, 0.017945962, -0.022310399, -0.013134622, 0.015638694, -0.10001543, 0.1043031, 0.05898838), result);
+    result = mulAdd(max(e, half4(0.0h)), half4x4(-0.021652509, 0.35796642, 0.059497777, 0.23948468, 0.15454951, -0.10017235, -0.19072174, -0.44812536, -0.03974552, 0.04529369, 0.22207436, 0.026222564, -0.09705454, 0.5623026, -0.3354105, -0.017278556), result);
+    result = mulAdd(max(f, half4(0.0h)), half4x4(-0.053682446, -0.03411237, -0.09399936, 0.15128824, -0.07463, -0.042020727, 0.0031783928, 0.13481957, -0.07731454, 0.044114403, -0.23085599, 0.060444202, -0.15015422, 0.0018040676, -0.18684982, 0.2812511), result);
+    result = mulAdd(max(g, half4(0.0h)), half4x4(0.0029329916, 0.001596018, 0.0007512241, 0.016544111, -0.04876942, -0.05272409, 0.037884697, 0.049948208, 0.015518177, 0.11368592, -0.03815777, -0.013149978, -0.027638039, 0.107719295, -0.04115787, 0.02745414), result);
+    result = mulAdd(max(h, half4(0.0h)), half4x4(0.016691081, 0.010204119, 0.04078854, 0.01613337, 0.03325829, 0.0114824055, -0.017286912, -0.07284126, -0.110984206, -0.21041764, 0.0089543555, 0.18986733, 0.01537506, -0.2059135, 0.029074017, 0.013117443), result);
+    result = mulAdd(max(i, half4(0.0h)), half4x4(0.013965926, 0.029871881, 0.0034499036, -0.011343668, 0.022120327, -0.0068748263, 0.009324342, -0.039081004, 0.08032371, 0.050809264, 0.035050742, -0.2032847, 0.06305391, -0.021958945, 0.038569167, -0.22465245), result);
+    result = mulAdd(max(-a, half4(0.0h)), half4x4(0.046307724, -0.012419472, 0.007673863, -0.042344846, 0.011042414, 0.016994251, -0.018166406, -0.016955731, -0.13240299, 0.01768431, -0.027607648, 0.0699927, -0.02840628, 0.004414203, 0.0049618417, 0.011084679), result);
+    result = mulAdd(max(-b, half4(0.0h)), half4x4(-0.119954154, -0.007455482, -0.031108133, -0.009946449, 0.0077065965, 0.01660345, 0.032943666, 0.016376585, 0.10273124, 0.1556573, -0.24643841, 0.107307844, -0.068235755, 0.0561896, -0.0104672015, 0.042693343), result);
+    result = mulAdd(max(-c, half4(0.0h)), half4x4(-0.01634601, 0.04195375, -0.10401894, 0.047641944, -0.034602515, -0.0034419263, -0.010457858, 0.015194475, -0.03962551, -0.030031368, 0.16036317, 0.019283568, -0.05877721, 0.016504882, -0.15523468, 0.018161612), result);
+    result = mulAdd(max(-d, half4(0.0h)), half4x4(-0.08083991, 0.0024665035, -0.049373373, 0.030371357, 0.0113322195, -0.014676956, 0.011646689, -0.01142667, 0.124930486, 0.06625774, -0.045840867, -0.009693036, -0.012649251, -0.07388084, 0.008790075, 0.0013844534), result);
+    result = mulAdd(max(-e, half4(0.0h)), half4x4(-0.33941835, -0.2763476, -0.118311435, -0.063535266, 0.20936015, 0.13731301, 0.13443594, 0.07464433, 0.059650812, -0.36973104, 0.16444235, -0.37082872, 0.06432777, -0.18283032, -0.044489607, -0.13895285), result);
+    result = mulAdd(max(-f, half4(0.0h)), half4x4(0.13533665, 0.08268915, -0.03675727, -0.14348659, 0.0186255, -0.05051692, 0.056702953, 0.0061717895, 0.047663026, -0.088188455, 0.23254345, -0.014015464, 0.08400204, -0.0073777726, 0.2202068, -0.12366078), result);
+    result = mulAdd(max(-g, half4(0.0h)), half4x4(0.04361004, 0.046543695, 0.0064863074, -0.03358146, -0.022602187, 0.018138997, -0.011071864, 0.010244091, -0.019814799, -0.17250171, 0.040823266, -0.040131986, 0.010125854, 0.020660749, 0.0020435036, -0.010819304), result);
+    result = mulAdd(max(-h, half4(0.0h)), half4x4(-0.004810193, -0.11286074, 0.051985834, 0.04788631, -0.023950428, 0.036145125, -0.038203828, 0.052401308, 0.022986965, 0.26420745, -0.06076917, -0.09252999, 0.03164547, 0.15652153, -0.037934, -0.0035418556), result);
+    result = mulAdd(max(-i, half4(0.0h)), half4x4(0.03358366, -0.005219482, 0.007060882, -0.06569114, -0.02941682, 0.00966056, -0.0153679885, 0.019905418, -0.107232265, -0.03405676, -0.044340115, 0.26892832, -0.04723829, -0.02589829, 0.004563232, 0.19318114), result);
+    const half str = half(clamp(u.strength, 0.0f, 2.0f));
+    const half maxL = (u.clampHighlights != 0u) ? a4kMaxLuma3x3(INPUT, sam, pos, inputPt) : 1.0h;
+    const uint2 base = gid * 2u;
+    { uint2 dp = base + uint2(0u, 0u); if (dp.x < outW && dp.y < outH) { float2 uv = (float2(dp) + 0.5f) * outputPt; half3 outRGB = INPUT.sample(sam1, uv).rgb + (half3(result.x)) * str; OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), dp); } }
+    { uint2 dp = base + uint2(1u, 0u); if (dp.x < outW && dp.y < outH) { float2 uv = (float2(dp) + 0.5f) * outputPt; half3 outRGB = INPUT.sample(sam1, uv).rgb + (half3(result.y)) * str; OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), dp); } }
+    { uint2 dp = base + uint2(0u, 1u); if (dp.x < outW && dp.y < outH) { float2 uv = (float2(dp) + 0.5f) * outputPt; half3 outRGB = INPUT.sample(sam1, uv).rgb + (half3(result.z)) * str; OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), dp); } }
+    { uint2 dp = base + uint2(1u, 1u); if (dp.x < outW && dp.y < outH) { float2 uv = (float2(dp) + 0.5f) * outputPt; half3 outRGB = INPUT.sample(sam1, uv).rgb + (half3(result.w)) * str; OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), dp); } }
+}
+
+
+// MARK: - Anime4K_Upscale_Denoise_S.hlsl (4 passes)
+
+kernel void anime4k_upscale_pass1(
+    texture2d<half, access::sample> INPUT [[texture(0)]],
+    texture2d<half, access::write> tex1 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex1.get_width();
+    const uint texH = tex1.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half3 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = INPUT.sample(sam, pos + float2(dx, dy) * inputPt).rgb;
+        }
+    }
+    half4 result = half4( -0.004601904, -0.0030944077, 0.14569537, -0.016794242 );
+    result = mulAdd(src[0][0], half3x4(6.5515305e-05, 0.09565814, -0.0022499533, 0.14627136, -0.0065872427, 0.1441769, 0.17772098, 0.16298898, 0.03727593, 0.02010636, 0.013131043, 0.07891907), result);
+    result = mulAdd(src[0][1], half3x4(0.029612074, -0.01204274, 0.07698074, 0.3855172, 0.0045466167, -0.0859741, 0.26930287, 0.67549795, -0.036623597, 0.051749162, -0.04714053, 0.16092339), result);
+    result = mulAdd(src[0][2], half3x4(-0.030328937, -0.15884648, 0.0082092965, -0.05052196, 0.041409027, -0.23017453, 0.31568366, 0.05136558, -0.0106390705, -0.12503141, -0.07030922, -0.08512375), result);
+    result = mulAdd(src[1][0], half3x4(0.059616547, -0.12322959, 0.058520414, -0.039292034, 0.08059592, -0.22441447, 0.15380386, -0.17675085, -0.009270574, 0.034731936, -0.048767723, 0.025933916), result);
+    result = mulAdd(src[1][1], half3x4(-0.4495482, 0.37551787, -0.4227873, -0.4890034, -0.9007091, 0.7524192, -1.271679, -0.68366605, -0.07302573, 0.09378561, 0.010367829, -0.24593607), result);
+    result = mulAdd(src[1][2], half3x4(0.12684742, -0.11042779, 0.01793761, 0.06982078, 0.12901784, -0.10123104, -0.2129385, -0.15062876, 0.019824497, -0.015181707, 0.070795976, 0.13549626), result);
+    result = mulAdd(src[2][0], half3x4(-0.036070887, -0.2733308, 0.05836442, -0.06817092, -0.08980838, -0.514616, 0.2965783, 0.103823625, -0.015213521, -0.16376303, 0.0017071419, -0.0922202), result);
+    result = mulAdd(src[2][1], half3x4(-0.053406045, 0.011273207, -0.05544644, 0.09432561, -0.04143601, -0.0783786, -0.39899537, 0.040322974, -0.046442945, 0.052499074, 0.03397099, 0.05516481), result);
+    result = mulAdd(src[2][2], half3x4(0.35976252, 0.197882, 0.031213427, -0.02211337, 0.7940331, 0.327452, 0.30120966, 0.03181121, 0.13782893, 0.060073618, -0.00940469, -0.0358819), result);
+    tex1.write(result, gid);
+}
+
+
+kernel void anime4k_upscale_pass2(
+    texture2d<half, access::sample> tex1 [[texture(0)]],
+    texture2d<half, access::write> tex2 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex2.get_width();
+    const uint texH = tex2.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half4 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = tex1.sample(sam, pos + float2(dx, dy) * inputPt);
+        }
+    }
+    // [ a, d, g ]
+    // [ b, e, h ]
+    // [ c, f, i ]
+    half4 result = half4( 0.022899346, 0.033619333, 0.030674957, -0.017047008 );
+    result = mulAdd(max(src[0][0], half4(0.0h)), half4x4(-0.103708945, -0.050891697, -0.2067834, -0.033582103, -0.08676132, 0.15528207, -0.10070597, -0.13641205, 0.030959459, 0.12798834, -0.058627255, -0.008511715, 0.023304658, -0.027084433, 0.120355256, -0.023104342), result);
+    result = mulAdd(max(src[0][1], half4(0.0h)), half4x4(0.0550643, -0.26851672, 0.11073926, 0.21989855, 0.012853378, 0.028077757, 0.073306665, -0.04551125, 0.16005373, -0.018154016, -0.12347146, -0.07590073, -0.10193998, 0.084696375, 0.04041413, -0.030883553), result);
+    result = mulAdd(max(src[0][2], half4(0.0h)), half4x4(-0.04816972, 0.0804637, 0.0071406, -0.08482986, 0.11176785, 0.060121994, -0.047804814, -0.036170192, 0.01989302, -0.12537469, -0.16283676, 0.19132937, -0.052577138, -0.005143432, 0.045614418, 0.04198543), result);
+    result = mulAdd(max(src[1][0], half4(0.0h)), half4x4(-0.33660156, 0.036350835, -0.4623589, -0.04140598, 0.2436438, -0.044735093, 0.20876355, -0.004252532, 0.81046224, -0.18550895, 0.32743093, 0.109012894, -0.34675312, -0.03464997, -0.09489919, -0.07961427), result);
+    result = mulAdd(max(src[1][1], half4(0.0h)), half4x4(-0.08862038, -0.8168393, 0.03584266, 0.32159033, 0.06634099, 0.2985745, -0.18204363, -0.016070427, 0.35503992, 1.1388919, 0.16171643, -0.63834023, -0.0037699202, -0.27919513, -0.20949292, 0.03270466), result);
+    result = mulAdd(max(src[1][2], half4(0.0h)), half4x4(0.021701936, -0.04537874, -0.05514495, 0.23225744, 0.024968185, 0.1816845, 0.03485249, -0.28249854, -0.37759346, -0.3225813, 0.021595621, 0.17104608, -0.0044055753, 0.01621266, -0.015169225, 0.08956203), result);
+    result = mulAdd(max(src[2][0], half4(0.0h)), half4x4(-0.033255238, -0.110517226, 0.10664505, 0.019566126, -0.0695305, 0.059743922, -0.19161415, -0.024217626, -0.08578889, -0.16358584, -0.23050265, -0.004697784, -0.060790297, 0.1174991, 0.08205285, -0.011846926), result);
+    result = mulAdd(max(src[2][1], half4(0.0h)), half4x4(0.6119327, 0.0791928, -0.118774265, 0.42233524, -0.16248553, -0.017692063, 0.13530938, -0.3207985, -0.147722, -0.24525681, 0.05243329, -0.38583818, 0.5147888, -0.072632834, -0.6014986, 0.26713687), result);
+    result = mulAdd(max(src[2][2], half4(0.0h)), half4x4(0.23735437, -0.032110002, 0.17445332, -0.3272264, 0.020623574, 0.26734766, -0.16806662, 0.0796467, -0.34921628, 0.016648084, -0.14200358, 0.59190625, 0.13177821, 0.11139572, -0.14972521, -0.16784541), result);
+    result = mulAdd(max(-src[0][0], half4(0.0h)), half4x4(-0.047283772, -0.003196778, 0.44890094, 0.14619343, -0.17113213, -0.068454474, 0.07681565, -0.04306807, -0.0022641511, -0.20954822, 0.0344229, 0.014815744, -0.010632933, 0.13355999, -0.0860752, -0.069001146), result);
+    result = mulAdd(max(-src[0][1], half4(0.0h)), half4x4(0.11664345, 0.099102855, 0.1642523, 0.047408774, 0.038490184, 0.16064398, -0.08694127, -0.2149453, -0.1413128, -0.06531084, -0.10105762, 0.19743964, 0.10458527, -0.04133969, 0.1425028, -0.01328308), result);
+    result = mulAdd(max(-src[0][2], half4(0.0h)), half4x4(0.0138432095, -0.20053013, 0.079355195, 0.273772, 0.05484276, 0.13891658, 0.16240036, -0.25245088, 0.011192391, 0.104164094, 0.08112111, -0.250435, -0.0559613, -0.031029798, -0.015725998, 0.09240792), result);
+    result = mulAdd(max(-src[1][0], half4(0.0h)), half4x4(0.18754779, -0.33171803, 0.34917468, 0.29074225, -0.37954012, 0.20898043, -0.24973525, -0.13707505, -0.31585664, 0.13607393, -0.29118514, 0.015055187, 0.18549949, -0.06351915, 0.2823401, -0.00019733967), result);
+    result = mulAdd(max(-src[1][1], half4(0.0h)), half4x4(0.10060476, 0.2883022, -0.15810104, -0.041112892, 0.31050095, 0.18517002, 0.020033397, -0.35919502, -0.17903808, -0.43506318, -0.14783014, 0.20092726, -0.002020754, 0.13320895, 0.040995706, 0.052643474), result);
+    result = mulAdd(max(-src[1][2], half4(0.0h)), half4x4(-0.014892139, 0.005828587, 0.044784732, -0.27272886, 0.21069369, 0.044396695, -0.03411123, 0.031441864, 0.17224072, 0.1708587, -0.00729118, -0.13070418, -0.19128975, -0.09342688, -0.051133234, -0.089075714), result);
+    result = mulAdd(max(-src[2][0], half4(0.0h)), half4x4(0.08799108, 0.04157696, -0.15010124, 0.26832178, -0.0040120087, 0.040308744, 0.17632529, -0.09464763, 0.07786305, 0.038288828, 0.40799135, 0.037377868, -0.049877923, -0.25080636, 0.00068664295, 0.0013101585), result);
+    result = mulAdd(max(-src[2][1], half4(0.0h)), half4x4(0.0353459, -0.21445732, 0.112647906, -0.3513759, 0.16887255, 0.3224789, -0.17073384, 0.10875396, 0.18919177, 0.14288992, 0.07364533, 0.20205943, -0.34363645, -0.3520186, 0.6763608, -0.19051236), result);
+    result = mulAdd(max(-src[2][2], half4(0.0h)), half4x4(-0.032245517, 0.039594565, -0.11825768, 0.16509856, 0.11749939, -0.005166539, 0.10740687, -0.3794017, 0.12722437, 0.14066173, 0.08025407, -0.34773758, -0.027300838, -0.08963159, 0.29774833, 0.053532287), result);
+    tex2.write(result, gid);
+}
+
+
+kernel void anime4k_upscale_pass3(
+    texture2d<half, access::sample> tex2 [[texture(0)]],
+    texture2d<half, access::write> tex1 [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    const uint texW = tex1.get_width();
+    const uint texH = tex1.get_height();
+    if (gid.x >= texW || gid.y >= texH) return;
+    const float2 inputPt = 1.0f / float2(texW, texH);
+    const float2 pos = (float2(gid) + 0.5f) * inputPt;
+    half4 src[3][3];
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            src[dx + 1][dy + 1] = tex2.sample(sam, pos + float2(dx, dy) * inputPt);
+        }
+    }
+    // [ a, d, g ]
+    // [ b, e, h ]
+    // [ c, f, i ]
+    half4 result = half4( 0.04921464, -0.0011432811, 0.062071066, -0.06594219 );
+    result = mulAdd(max(src[0][0], half4(0.0h)), half4x4(-0.0714004, -0.0545495, -0.050848898, 0.04724593, 0.2214181, 0.26353878, 0.07314053, -0.18771721, 0.06282607, -0.03720548, 0.020577375, -0.08951135, 0.40820515, 0.012179098, 0.52947706, -0.48448065), result);
+    result = mulAdd(max(src[0][1], half4(0.0h)), half4x4(0.10311368, -0.10970221, 0.07008208, -0.07143153, 0.073753305, 0.03786335, -0.4312538, -0.17680745, -0.15527713, -0.06711554, -0.21828765, 0.27252844, -0.0025433605, 0.31595528, -0.06065309, 0.059542265), result);
+    result = mulAdd(max(src[0][2], half4(0.0h)), half4x4(-0.036736265, 0.08704119, -0.06530063, 0.04546563, 0.010335546, -0.040761005, -0.021500558, 0.104531065, 0.094652064, -0.05088704, 0.14768088, -0.08585825, 0.057680476, 0.09885713, 0.18074304, -0.14277679), result);
+    result = mulAdd(max(src[1][0], half4(0.0h)), half4x4(-0.04810641, -0.01735864, -0.06405213, 0.04889552, -0.011552542, -0.04617259, 0.023976233, 0.27587202, -0.117965676, -0.07052052, -0.030583147, -0.036600694, -0.08542387, -0.053850796, 0.27242282, -0.73792183), result);
+    result = mulAdd(max(src[1][1], half4(0.0h)), half4x4(-0.1340838, 0.1256252, -0.040528856, 0.13554344, -0.13733707, -0.14641404, 0.42666963, -0.4933124, -0.34908, 0.054332364, -0.2768947, 0.44689894, 0.42182985, -0.027279109, -0.17136064, -0.009496184), result);
+    result = mulAdd(max(src[1][2], half4(0.0h)), half4x4(0.075086355, -0.025501372, 0.02172236, -0.052761186, -0.055753034, -0.028023237, -0.08829973, 0.14333946, 0.062496934, 0.034493748, 0.17640088, -0.084869936, 0.21283653, 0.1184779, 0.0016387368, -0.1498814), result);
+    result = mulAdd(max(src[2][0], half4(0.0h)), half4x4(0.054841094, 0.040639404, -0.025044259, -0.071105786, -0.07473824, -0.04719771, 0.016553668, -0.10028357, 0.009365985, -0.0133521445, 0.022320358, -0.09318326, 0.17342545, 0.19281831, 0.16737404, -0.09583887), result);
+    result = mulAdd(max(src[2][1], half4(0.0h)), half4x4(-0.03950585, 0.091417804, -0.021395942, 0.08735149, -0.029363452, -0.04763804, -0.1430701, 0.15344201, -0.006604305, 0.05897304, -0.13595524, 0.083323576, 0.008187976, 0.12946083, 0.14983748, -0.08178542), result);
+    result = mulAdd(max(src[2][2], half4(0.0h)), half4x4(-0.00046765045, -0.07914878, 0.03529457, -0.007752294, -0.10084779, -0.1531338, -0.1408283, 0.20638838, 0.01466853, -0.059309185, -0.11161097, 0.08481583, 0.090416916, 0.081118226, 0.08677104, -0.20095336), result);
+    result = mulAdd(max(-src[0][0], half4(0.0h)), half4x4(0.3200496, -0.049090706, 0.11554867, -0.11949655, -0.18064958, 0.0012254696, -0.032284267, 0.00076361356, -0.13239916, -0.13838826, -0.20345089, 0.00692921, -0.2271236, -0.07132879, -0.097703665, 0.29881954), result);
+    result = mulAdd(max(-src[0][1], half4(0.0h)), half4x4(0.4095371, 0.3008338, -0.43109173, -0.495734, 0.15016843, -0.3890023, 1.0669806, -0.20876339, -0.32241493, -0.10387533, -0.018227777, 0.1349976, -0.0019588785, -0.19263229, 0.38952798, 0.08135965), result);
+    result = mulAdd(max(-src[0][2], half4(0.0h)), half4x4(0.01517036, -0.51562387, -0.13939962, -0.23287989, 0.09597558, 0.017624658, 0.16989397, -0.09395267, -0.29612765, 0.11843327, -0.07493133, 0.14523852, 0.040488124, 0.016568637, 0.10204776, -0.13137013), result);
+    result = mulAdd(max(-src[1][0], half4(0.0h)), half4x4(-0.1512155, -0.12732185, 0.08002965, 0.024762904, 0.05106389, 0.011125884, -0.043196492, -0.17617282, 0.09791206, 0.120643355, 0.075500526, 0.10948051, 0.04969893, -0.20776172, -0.06905779, -0.20245977), result);
+    result = mulAdd(max(-src[1][1], half4(0.0h)), half4x4(-0.41836104, -0.82896453, -0.20962712, 0.7804863, 0.17322528, 0.53994787, -0.18730208, -0.021233026, 0.7417944, -0.4544313, 0.23165174, -0.63969344, 0.09383021, -0.046137553, -0.07796646, 0.11413524), result);
+    result = mulAdd(max(-src[1][2], half4(0.0h)), half4x4(-0.32532063, 0.09456587, 0.43708017, -0.40595353, 0.061229162, 0.006663704, -0.19821976, 0.07661682, -0.21427135, 0.17748164, -0.31958643, 0.3883502, 0.068938896, 0.022886515, 0.022923468, -0.04269318), result);
+    result = mulAdd(max(-src[2][0], half4(0.0h)), half4x4(0.23775512, 0.04026384, 0.12276414, -0.2545085, 0.0894177, 0.115443565, 0.029124375, 0.08887401, -0.0057824687, 0.017655179, -0.025270017, -0.06643964, 0.01316084, 0.024039604, 0.034566984, -0.12682836), result);
+    result = mulAdd(max(-src[2][1], half4(0.0h)), half4x4(0.036596492, 0.22772355, -0.05508538, -0.18005793, -0.06432669, -0.037058707, 0.2718052, -0.10313161, 0.016055575, 0.051271006, -0.038919963, -0.036601298, -0.019457681, 0.03805731, 0.03252896, -0.07179724), result);
+    result = mulAdd(max(-src[2][2], half4(0.0h)), half4x4(0.15046261, 0.13090402, -0.023847125, -0.039356075, 0.045424663, -0.20594294, 0.2154043, -0.18429665, -0.07969159, 0.08719893, -0.057626463, 0.08344988, -0.018651528, 0.047302175, 0.060727824, -0.035960387), result);
+    tex1.write(result, gid);
+}
+
+
+kernel void anime4k_upscale_pass4(
+    texture2d<half, access::sample> INPUT [[texture(0)]],
+    texture2d<half, access::sample> tex1 [[texture(1)]],
+    texture2d<half, access::write> OUTPUT [[texture(2)]],
+    constant Anime4KUpscaleUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    constexpr sampler sam(filter::nearest, address::clamp_to_edge, coord::normalized);
+    constexpr sampler sam1(filter::linear, address::clamp_to_edge, coord::normalized);
+    const uint inW = tex1.get_width();
+    const uint inH = tex1.get_height();
+    if (gid.x >= inW || gid.y >= inH) return;
+    const uint outW = OUTPUT.get_width();
+    const uint outH = OUTPUT.get_height();
+    const float2 inputPt = 1.0f / float2(inW, inH);
+    const float2 outputPt = 1.0f / float2(outW, outH);
+    float2 pos = (float2(gid) + 0.5f) * inputPt;
+    // [ a, d, g ]
+    // [ b, e, h ]
+    // [ c, f, i ]
+    half4 a = tex1.sample(sam, pos - inputPt);
+    half4 b = tex1.sample(sam, pos + float2(-inputPt.x, 0));
+    half4 c = tex1.sample(sam, pos + float2(-inputPt.x, inputPt.y));
+    half4 d = tex1.sample(sam, pos + float2(0, -inputPt.y));
+    half4 e = tex1.sample(sam, pos);
+    half4 f = tex1.sample(sam, pos + float2(0, inputPt.y));
+    half4 g = tex1.sample(sam, pos + float2(inputPt.x, -inputPt.y));
+    half4 h = tex1.sample(sam, pos + float2(inputPt.x, 0));
+    half4 i = tex1.sample(sam, pos + float2(inputPt.x, inputPt.y));
+    half4 result = half4( -0.0031417734, -0.002754766, -0.004053268, -0.003937834 );
+    result = mulAdd(max(a, half4(0.0h)), half4x4(-0.04508749, 0.00222134, 0.013338363, -0.0067310617, 0.099346675, 0.05804196, 0.018694466, -0.008126048, 0.007771997, -0.0072556734, -0.008293339, 0.001518462, -0.06296499, -0.064195156, 0.0727399, 0.044078834), result);
+    result = mulAdd(max(b, half4(0.0h)), half4x4(0.20800652, -0.016071903, -0.08095607, -0.03472411, -0.20690396, 0.061331827, -0.10627648, 0.12838624, 0.036534917, -0.006113497, 0.029266752, -0.002263159, 0.2937966, -0.05544609, 0.14546311, -0.01290958), result);
+    result = mulAdd(max(c, half4(0.0h)), half4x4(0.07792222, -7.288649e-05, 0.2800036, 0.019709835, -0.010950291, 0.021879988, 0.037608813, 0.055267945, 0.018646395, -0.016691998, 0.03787624, -0.006547077, 0.03214097, -0.018541625, 0.12142825, -0.070806496), result);
+    result = mulAdd(max(d, half4(0.0h)), half4x4(-0.009798109, -0.06606263, 0.0010101331, 0.009924258, -0.10272075, -0.07983353, 0.028398676, 0.04967719, 0.12467993, 0.06775066, 0.017111637, 0.012814711, 0.0031143876, -0.0902014, 0.11242646, 0.076476306), result);
+    result = mulAdd(max(e, half4(0.0h)), half4x4(0.07650971, 0.35096344, 0.0612814, 0.06036218, 0.253547, -0.0460987, -0.11145313, -0.48844674, -0.050644107, 0.038706005, 0.19390784, 0.035322774, -0.010191005, 0.58071, -0.2856661, -0.009533105), result);
+    result = mulAdd(max(f, half4(0.0h)), half4x4(-0.071486905, -0.036179904, -0.07303894, 0.19301178, -0.11499898, -0.024847068, -0.0027055284, 0.20373714, -0.09671404, -0.020897992, -0.25572056, -0.008931707, -0.13582602, -0.006546881, -0.16154496, 0.26454738), result);
+    result = mulAdd(max(g, half4(0.0h)), half4x4(0.005463064, 0.006769753, 0.0039625713, 0.014121269, -0.068200685, -0.057850275, 0.008622973, 0.061149873, 0.017436448, 0.11660872, -0.02994459, 0.008590145, -0.03223439, 0.052557915, -0.011846354, 0.03523357), result);
+    result = mulAdd(max(h, half4(0.0h)), half4x4(-0.00015264735, 0.0012872831, 0.021878848, 0.022240406, 0.01822283, -0.008284247, -0.018443186, -0.04997753, -0.111760505, -0.20911667, 0.006166832, 0.14597091, 0.02305932, -0.16312876, 0.023375351, -0.028755601), result);
+    result = mulAdd(max(i, half4(0.0h)), half4x4(0.013701143, 0.010794129, 0.0024321147, -0.018976321, 0.0365032, -0.006783485, 0.01046472, -0.08473902, 0.057523903, 0.029831914, 0.0040916028, -0.2046352, 0.03542, -0.034598, 0.0031058635, -0.20746285), result);
+    result = mulAdd(max(-a, half4(0.0h)), half4x4(0.09283864, -0.0035849356, 0.013190911, -0.035437535, 0.035798516, 0.022954805, -0.0029692063, -0.006633743, -0.13456796, -0.011448714, 0.011536131, 0.046695728, -0.0359048, -0.01144856, -0.0027279712, 0.0065755467), result);
+    result = mulAdd(max(-b, half4(0.0h)), half4x4(-0.14295974, -0.0034393691, 0.0051469817, -0.021334402, -0.05882422, -0.003004241, 0.011182507, 0.0015169785, 0.08474255, 0.1255887, -0.23984577, 0.07119401, -0.12547183, 0.038449038, 0.007738907, 0.031506266), result);
+    result = mulAdd(max(-c, half4(0.0h)), half4x4(-0.028237654, 0.010254326, -0.11843009, 0.03034298, -0.038323015, 0.0026470951, -0.060652684, 0.0022312272, -0.022539174, -0.01008126, 0.14868541, 0.02881852, -0.05327277, -0.012296453, -0.21280704, -0.021286633), result);
+    result = mulAdd(max(-d, half4(0.0h)), half4x4(-0.034825645, 0.0877418, -0.009103147, 0.041650586, 0.0135769, -0.005229229, 0.00082947424, -0.0020421906, 0.12402267, 0.007698874, -0.056337915, -0.006580138, -0.018867968, -0.08487179, -0.020938644, -0.029210499), result);
+    result = mulAdd(max(-e, half4(0.0h)), half4x4(-0.37082648, -0.30321857, -0.22912364, -0.07368761, 0.15169628, 0.0013253551, 0.09232649, 0.011408914, 0.06347244, -0.377988, 0.13980117, -0.41065913, -0.00040237256, -0.23220152, -0.03643865, -0.10101427), result);
+    result = mulAdd(max(-f, half4(0.0h)), half4x4(0.10692653, 0.049867555, -0.011915118, -0.10688069, 0.042109665, -0.017163716, 0.10852331, -0.0088934945, 0.06780516, -0.017808875, 0.26564032, 0.0523693, 0.099033475, 0.042864073, 0.18299587, -0.13503626), result);
+    result = mulAdd(max(-g, half4(0.0h)), half4x4(0.07014404, 0.08841395, 0.01895322, 0.0036451078, -0.00933168, 0.044764042, -0.0034986525, 0.010701783, -0.043601245, -0.1375109, 0.0039965697, -0.054331, 0.018830067, 0.040386382, 0.007759782, -0.012478715), result);
+    result = mulAdd(max(-h, half4(0.0h)), half4x4(0.024152381, -0.11462646, 0.07005155, 0.0424638, -0.0048070764, 0.06089261, -0.036675487, 0.057459857, 0.02478629, 0.2926517, -0.08248396, -0.053960845, 0.013205341, 0.09851673, -0.04310949, -0.001428641), result);
+    result = mulAdd(max(-i, half4(0.0h)), half4x4(0.016168298, 0.009701502, 0.0064305146, -0.068672284, -0.044653386, -0.016051823, -0.015055443, 0.032019246, -0.0829852, -0.011304939, 0.0023902296, 0.30322486, -0.023831543, -0.0046928846, 0.026961725, 0.16314326), result);
+    const half str = half(clamp(u.strength, 0.0f, 2.0f));
+    const half maxL = (u.clampHighlights != 0u) ? a4kMaxLuma3x3(INPUT, sam, pos, inputPt) : 1.0h;
+    const uint2 base = gid * 2u;
+    { uint2 dp = base + uint2(0u, 0u); if (dp.x < outW && dp.y < outH) { float2 uv = (float2(dp) + 0.5f) * outputPt; half3 outRGB = INPUT.sample(sam1, uv).rgb + (half3(result.x)) * str; OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), dp); } }
+    { uint2 dp = base + uint2(1u, 0u); if (dp.x < outW && dp.y < outH) { float2 uv = (float2(dp) + 0.5f) * outputPt; half3 outRGB = INPUT.sample(sam1, uv).rgb + (half3(result.y)) * str; OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), dp); } }
+    { uint2 dp = base + uint2(0u, 1u); if (dp.x < outW && dp.y < outH) { float2 uv = (float2(dp) + 0.5f) * outputPt; half3 outRGB = INPUT.sample(sam1, uv).rgb + (half3(result.z)) * str; OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), dp); } }
+    { uint2 dp = base + uint2(1u, 1u); if (dp.x < outW && dp.y < outH) { float2 uv = (float2(dp) + 0.5f) * outputPt; half3 outRGB = INPUT.sample(sam1, uv).rgb + (half3(result.w)) * str; OUTPUT.write(half4(a4kApplyHighlightClamp(outRGB, maxL, u.clampHighlights), 1.0h), dp); } }
+}
+
+
+
+// MARK: - Anime4K Bilateral Denoise (Mode / Mean / Median)
+
+struct Anime4KBilateralUniforms {
+    float intensitySigma;
+    float spatialSigma;
+    uint mode; // 0 = Mode, 1 = Mean, 2 = Median
     uint _pad0;
-    uint _pad1;
-    uint _pad2;
 };
 
 inline float a4kGaussian(float x, float s, float m) {
     float scaled = (x - m) / max(s, 1e-4f);
     return exp(-0.5f * scaled * scaled);
 }
+
+inline float3 a4kGaussianVec(float3 x, float3 s, float3 m) {
+    float3 scaled = (x - m) / max(s, float3(1e-4f));
+    return exp(-0.5f * scaled * scaled);
+}
+
+// Backwards-compatible entry point (also used for bilateral mode with default spatialSigma=1.0)
+struct Anime4KDenoiseUniforms {
+    float denoiseStrength;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
 
 kernel void anime4k_bilateral_mode(
     texture2d<float, access::read> input [[texture(0)]],
@@ -213,14 +793,14 @@ kernel void anime4k_bilateral_mode(
 
     const int2 size = int2(input.get_width(), input.get_height());
     const int2 p = int2(gid);
-    float3 centerRGB = input.read(clampCoord(p, size)).rgb;
-    float strength = clamp(u.denoiseStrength, 0.0f, 1.0f);
+    float3 centerRGB = input.read(a4kClamp(p, size)).rgb;
+    float strength = clamp(u.denoiseStrength, 0.0f, 2.0f);
     if (strength <= 0.001f) {
         output.write(float4(centerRGB, 1.0f), gid);
         return;
     }
 
-    const float intensitySigma = 0.05f + strength * 0.25f;
+    const float intensitySigma = 0.05f + min(strength, 2.0f) * 0.22f;
     const float spatialSigma = 1.0f;
     const float histReg = 0.2f;
     const float3 kLuma = float3(0.299f, 0.587f, 0.114f);
@@ -236,7 +816,7 @@ kernel void anime4k_bilateral_mode(
     int k = 0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            float3 rgb = input.read(clampCoord(p + int2(dx, dy), size)).rgb;
+            float3 rgb = input.read(a4kClamp(p + int2(dx, dy), size)).rgb;
             float l = dot(rgb, kLuma);
             histV[k] = rgb;
             histL[k] = l;
@@ -264,17 +844,125 @@ kernel void anime4k_bilateral_mode(
         }
     }
 
-    float3 blended = mix(centerRGB, modeRGB, strength);
+    float3 blended = mix(centerRGB, modeRGB, saturate(strength));
     output.write(float4(saturate(blended), 1.0f), gid);
 }
 
-// MARK: - Optional Line-Thinning Pre-Pass (Anime4K Thin)
+// Full Magpie Anime4K_Denoise_Bilateral supporting Mode / Mean / Median + intensitySigma & spatialSigma
+kernel void anime4k_bilateral_full(
+    texture2d<float, access::read> input [[texture(0)]],
+    texture2d<float, access::write> output [[texture(1)]],
+    constant Anime4KBilateralUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = output.get_width();
+    const uint h = output.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    const int2 size = int2(input.get_width(), input.get_height());
+    const int2 p = int2(gid);
+    const float3 centerRGB = input.read(a4kClamp(p, size)).rgb;
+    const float intensitySigma = clamp(u.intensitySigma, 0.01f, 2.0f);
+    const float spatialSigma = clamp(u.spatialSigma, 0.5f, 3.0f);
+    const float3 kLuma = float3(0.299f, 0.587f, 0.114f);
+
+    if (u.mode == 1u) {
+        // Authentic Anime4K_Denoise_Bilateral_Mean (radius adapts to spatialSigma up to 2 -> 5x5)
+        const int radius = clamp(int(ceil(spatialSigma)), 1, 2);
+        float3 isVec = max((centerRGB + 0.0001f) * intensitySigma, float3(1e-4f));
+        float3 sum = float3(0.0f);
+        float3 n = float3(0.0f);
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                float3 v = input.read(a4kClamp(p + int2(dx, dy), size)).rgb;
+                float3 d = a4kGaussianVec(v, isVec, centerRGB) * a4kGaussian(length(float2(dx, dy)), spatialSigma, 0.0f);
+                sum += d * v;
+                n += d;
+            }
+        }
+        float3 result = sum / max(n, float3(1e-6f));
+        output.write(float4(saturate(result), 1.0f), gid);
+        return;
+    }
+
+    // Mode (0) and Median (2): 3x3 (spatialSigma <= 1.5) or 5x5 (spatialSigma > 1.5)
+    const int radius = (spatialSigma > 1.5f) ? 2 : 1;
+    const int count = (radius == 2) ? 25 : 9;
+    float3 histV[25];
+    float histL[25];
+    float histW[25];
+    float totalW = 0.0f;
+
+    float vc = dot(centerRGB, kLuma);
+    float is = max((vc + 0.0001f) * intensitySigma, 1e-4f);
+
+    int k = 0;
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            float3 rgb = input.read(a4kClamp(p + int2(dx, dy), size)).rgb;
+            float l = dot(rgb, kLuma);
+            float wgt = a4kGaussian(l, is, vc) * a4kGaussian(length(float2(dx, dy)), spatialSigma, 0.0f);
+            histV[k] = rgb;
+            histL[k] = l;
+            histW[k] = wgt;
+            totalW += wgt;
+            ++k;
+        }
+    }
+
+    if (u.mode == 2u) {
+        // Authentic Anime4K_Denoise_Bilateral_Median (weighted luma median)
+        float3 med = centerRGB;
+        float safeN = max(totalW, 1e-6f);
+        for (int i = 0; i < count; ++i) {
+            float wAbove = 0.0f;
+            float wBelow = 0.0f;
+            for (int j = 0; j < count; ++j) {
+                if (histL[j] > histL[i]) {
+                    wAbove += histW[j];
+                } else if (histL[j] < histL[i]) {
+                    wBelow += histW[j];
+                }
+            }
+            if ((safeN - wAbove) / safeN >= 0.5f && wBelow / safeN <= 0.5f) {
+                med = histV[i];
+                break;
+            }
+        }
+        output.write(float4(saturate(med), 1.0f), gid);
+        return;
+    }
+
+    // Authentic Anime4K_Denoise_Bilateral_Mode (histogram-regularized mode)
+    const float histReg = 0.2f;
+    float histWN[25];
+    for (int i = 0; i < count; ++i) histWN[i] = 0.0f;
+    for (int a = 0; a < count; ++a) {
+        histWN[a] += histW[a];
+        for (int b = a + 1; b < count; ++b) {
+            float d = a4kGaussian(histL[b], histReg, histL[a]);
+            histWN[b] += d * histW[a];
+            histWN[a] += d * histW[b];
+        }
+    }
+    float3 bestRGB = centerRGB;
+    float bestW = -1.0f;
+    for (int a = 0; a < count; ++a) {
+        if (histWN[a] >= bestW) {
+            bestW = histWN[a];
+            bestRGB = histV[a];
+        }
+    }
+    output.write(float4(saturate(bestRGB), 1.0f), gid);
+}
+
+// MARK: - Anime4K Thin HQ (5-Pass Magpie Sobel -> GaussX -> GaussY -> Kernel -> Iterative Warp) & Thin Fast
 
 struct Anime4KThinUniforms {
-    float lineThinning;
+    float strength;
+    uint iterations;
     uint _pad0;
     uint _pad1;
-    uint _pad2;
 };
 
 kernel void anime4k_thin_sobel(
@@ -294,7 +982,7 @@ kernel void anime4k_thin_sobel(
     int idx = 0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            l[idx++] = dot(input.read(clampCoord(p + int2(dx, dy), size)).rgb, kLuma);
+            l[idx++] = dot(input.read(a4kClamp(p + int2(dx, dy), size)).rgb, kLuma);
         }
     }
 
@@ -304,6 +992,104 @@ kernel void anime4k_thin_sobel(
     gradOut.write(half4(half(mag), 0.0h, 0.0h, 1.0h), gid);
 }
 
+kernel void anime4k_thin_gauss_x(
+    texture2d<half, access::read> input [[texture(0)]],
+    texture2d<half, access::write> output [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = output.get_width();
+    const uint h = output.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    const int2 size = int2(input.get_width(), input.get_height());
+    const float sigma = max(2.0f * float(h) / 1080.0f, 0.5f);
+    const int halfK = clamp(int(ceil(sigma * 2.0f)), 1, 6);
+
+    float g = 0.0f;
+    float gn = 0.0f;
+    for (int di = -halfK; di <= halfK; ++di) {
+        float gf = a4kGaussian(float(di), sigma, 0.0f);
+        g += float(input.read(a4kClamp(int2(int(gid.x) + di, int(gid.y)), size)).r) * gf;
+        gn += gf;
+    }
+    output.write(half4(half(g / max(gn, 1e-6f)), 0.0h, 0.0h, 1.0h), gid);
+}
+
+kernel void anime4k_thin_gauss_y(
+    texture2d<half, access::read> input [[texture(0)]],
+    texture2d<half, access::write> output [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = output.get_width();
+    const uint h = output.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    const int2 size = int2(input.get_width(), input.get_height());
+    const float sigma = max(2.0f * float(h) / 1080.0f, 0.5f);
+    const int halfK = clamp(int(ceil(sigma * 2.0f)), 1, 6);
+
+    float g = 0.0f;
+    float gn = 0.0f;
+    for (int di = -halfK; di <= halfK; ++di) {
+        float gf = a4kGaussian(float(di), sigma, 0.0f);
+        g += float(input.read(a4kClamp(int2(int(gid.x), int(gid.y) + di), size)).r) * gf;
+        gn += gf;
+    }
+    output.write(half4(half(g / max(gn, 1e-6f)), 0.0h, 0.0h, 1.0h), gid);
+}
+
+kernel void anime4k_thin_kernel(
+    texture2d<half, access::read> gradMag [[texture(0)]],
+    texture2d<half, access::write> gradVec [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = gradVec.get_width();
+    const uint h = gradVec.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    const int2 size = int2(gradMag.get_width(), gradMag.get_height());
+    const int2 p = int2(gid);
+    float g[9];
+    int idx = 0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            g[idx++] = float(gradMag.read(a4kClamp(p + int2(dx, dy), size)).r);
+        }
+    }
+    float gx = (-g[0] + g[2] - 2.0f * g[3] + 2.0f * g[5] - g[6] + g[8]) * 0.125f;
+    float gy = (-g[0] - 2.0f * g[1] - g[2] + g[6] + 2.0f * g[7] + g[8]) * 0.125f;
+    gradVec.write(half4(half(gx), half(gy), 0.0h, 1.0h), gid);
+}
+
+kernel void anime4k_thin_hq_warp(
+    texture2d<float, access::sample> input [[texture(0)]],
+    texture2d<half, access::sample> gradVec [[texture(1)]],
+    texture2d<float, access::write> output [[texture(2)]],
+    constant Anime4KThinUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = output.get_width();
+    const uint h = output.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    constexpr sampler linearSam(filter::linear, address::clamp_to_edge, coord::normalized);
+    const float2 inputPt = 1.0f / float2(w, h);
+    // Use effective min scale factor so small preview resolutions still exhibit responsive line thinning
+    const float relStr = max(float(h) / 1080.0f, 0.35f) * clamp(u.strength, 0.0f, 2.0f);
+    const uint iters = clamp(u.iterations, 1u, 3u);
+
+    float2 pos = (float2(gid) + 0.5f) * inputPt;
+    for (uint it = 0u; it < iters; ++it) {
+        float2 dn = float2(gradVec.sample(linearSam, pos).rg);
+        float2 dd = (dn / (length(dn) + 0.01f)) * inputPt * relStr;
+        pos -= dd;
+    }
+
+    float3 col = input.sample(linearSam, pos).rgb;
+    output.write(float4(saturate(col), 1.0f), gid);
+}
+
+// Fast 2-pass warp (also kept for backwards compatibility with legacy `anime4k_thin_warp`)
 kernel void anime4k_thin_warp(
     texture2d<float, access::sample> input [[texture(0)]],
     texture2d<half, access::read> gradMag [[texture(1)]],
@@ -323,7 +1109,7 @@ kernel void anime4k_thin_warp(
     int idx = 0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
-            g[idx++] = float(gradMag.read(clampCoord(p + int2(dx, dy), size)).r);
+            g[idx++] = float(gradMag.read(a4kClamp(p + int2(dx, dy), size)).r);
         }
     }
     float2 dn = float2(
@@ -331,159 +1117,176 @@ kernel void anime4k_thin_warp(
         (-g[0] - 2.0f * g[1] - g[2] + g[6] + 2.0f * g[7] + g[8]) * 0.125f
     );
     float2 inputPt = 1.0f / float2(w, h);
-    float relStr = (float(h) / 1080.0f) * clamp(u.lineThinning, 0.0f, 1.0f) * 0.6f;
+    float relStr = max(float(h) / 1080.0f, 0.35f) * clamp(u.strength, 0.0f, 2.0f) * float(max(u.iterations, 1u));
     float2 dd = (dn / (length(dn) + 0.01f)) * inputPt * relStr;
     float2 uv = (float2(gid) + 0.5f) * inputPt - dd;
     float3 col = input.sample(linearSam, uv).rgb;
     output.write(float4(saturate(col), 1.0f), gid);
 }
 
-// MARK: - Anime4K Upscale & Denoise 2x (4-Pass CReLU CNN + Depth-to-Space)
+// MARK: - Anime4K Darken HQ & Darken Fast (Authentic bloc97 Difference-of-Gaussian Line Darkening)
 
-kernel void anime4k_upscale_pass1(
-    texture2d<half, access::read> input [[texture(0)]],
+struct Anime4KDarkenUniforms {
+    float strength;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+kernel void anime4k_darken_luma(
+    texture2d<float, access::read> input [[texture(0)]],
+    texture2d<half, access::write> lumaOut [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = lumaOut.get_width();
+    const uint h = lumaOut.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    float3 rgb = input.read(a4kClamp(int2(gid), int2(input.get_width(), input.get_height()))).rgb;
+    float y = dot(rgb, float3(0.299f, 0.587f, 0.114f));
+    lumaOut.write(half4(half(y), 0.0h, 0.0h, 1.0h), gid);
+}
+
+kernel void anime4k_darken_diff_x(
+    texture2d<half, access::read> lumaIn [[texture(0)]],
     texture2d<half, access::write> outTex [[texture(1)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
     const uint w = outTex.get_width();
     const uint h = outTex.get_height();
     if (gid.x >= w || gid.y >= h) return;
-    half3 t[9];
-    load3x3Half3(input, int2(gid), int2(input.get_width(), input.get_height()), t);
-    half4 acc = half4(half(-0.004601904), half(-0.0030944077), half(0.14569537), half(-0.016794242));
-    acc = mulAdd3x4(t[0], half3x4(half(6.5515305e-05), half(0.09565814), half(-0.0022499533), half(0.14627136), half(-0.0065872427), half(0.1441769), half(0.17772098), half(0.16298898), half(0.03727593), half(0.02010636), half(0.013131043), half(0.07891907)), acc);
-    acc = mulAdd3x4(t[1], half3x4(half(0.029612074), half(-0.01204274), half(0.07698074), half(0.3855172), half(0.0045466167), half(-0.0859741), half(0.26930287), half(0.67549795), half(-0.036623597), half(0.051749162), half(-0.04714053), half(0.16092339)), acc);
-    acc = mulAdd3x4(t[2], half3x4(half(-0.030328937), half(-0.15884648), half(0.0082092965), half(-0.05052196), half(0.041409027), half(-0.23017453), half(0.31568366), half(0.05136558), half(-0.0106390705), half(-0.12503141), half(-0.07030922), half(-0.08512375)), acc);
-    acc = mulAdd3x4(t[3], half3x4(half(0.059616547), half(-0.12322959), half(0.058520414), half(-0.039292034), half(0.08059592), half(-0.22441447), half(0.15380386), half(-0.17675085), half(-0.009270574), half(0.034731936), half(-0.048767723), half(0.025933916)), acc);
-    acc = mulAdd3x4(t[4], half3x4(half(-0.4495482), half(0.37551787), half(-0.4227873), half(-0.4890034), half(-0.9007091), half(0.7524192), half(-1.271679), half(-0.68366605), half(-0.07302573), half(0.09378561), half(0.010367829), half(-0.24593607)), acc);
-    acc = mulAdd3x4(t[5], half3x4(half(0.12684742), half(-0.11042779), half(0.01793761), half(0.06982078), half(0.12901784), half(-0.10123104), half(-0.2129385), half(-0.15062876), half(0.019824497), half(-0.015181707), half(0.070795976), half(0.13549626)), acc);
-    acc = mulAdd3x4(t[6], half3x4(half(-0.036070887), half(-0.2733308), half(0.05836442), half(-0.06817092), half(-0.08980838), half(-0.514616), half(0.2965783), half(0.103823625), half(-0.015213521), half(-0.16376303), half(0.0017071419), half(-0.0922202)), acc);
-    acc = mulAdd3x4(t[7], half3x4(half(-0.053406045), half(0.011273207), half(-0.05544644), half(0.09432561), half(-0.04143601), half(-0.0783786), half(-0.39899537), half(0.040322974), half(-0.046442945), half(0.052499074), half(0.03397099), half(0.05516481)), acc);
-    acc = mulAdd3x4(t[8], half3x4(half(0.35976252), half(0.197882), half(0.031213427), half(-0.02211337), half(0.7940331), half(0.327452), half(0.30120966), half(0.03181121), half(0.13782893), half(0.060073618), half(-0.00940469), half(-0.0358819)), acc);
-    outTex.write(acc, gid);
+    const int2 size = int2(lumaIn.get_width(), lumaIn.get_height());
+    // 1D Gaussian blur [1, 4, 6, 4, 1] / 16
+    const float wts[5] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f };
+    float acc = 0.0f;
+    for (int dx = -2; dx <= 2; ++dx) {
+        acc += float(lumaIn.read(a4kClamp(int2(int(gid.x) + dx, int(gid.y)), size)).r) * wts[dx + 2];
+    }
+    outTex.write(half4(half(acc), 0.0h, 0.0h, 1.0h), gid);
 }
 
-kernel void anime4k_upscale_pass2(
-    texture2d<half, access::read> featIn [[texture(0)]],
-    texture2d<half, access::write> featOut [[texture(1)]],
+kernel void anime4k_darken_diff_y(
+    texture2d<half, access::read> blurX [[texture(0)]],
+    texture2d<half, access::read> origLuma [[texture(1)]],
+    texture2d<half, access::write> lineDiff [[texture(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    const uint w = featOut.get_width();
-    const uint h = featOut.get_height();
+    const uint w = lineDiff.get_width();
+    const uint h = lineDiff.get_height();
     if (gid.x >= w || gid.y >= h) return;
-    half4 t[9];
-    load3x3Half4(featIn, int2(gid), int2(featIn.get_width(), featIn.get_height()), t);
-    half4 acc = half4(half(0.022899346), half(0.033619333), half(0.030674957), half(-0.017047008));
-    acc = mulAdd4x4(max(t[0], half4(0.0h)), half4x4(half(-0.103708945), half(-0.050891697), half(-0.2067834), half(-0.033582103), half(-0.08676132), half(0.15528207), half(-0.10070597), half(-0.13641205), half(0.030959459), half(0.12798834), half(-0.058627255), half(-0.008511715), half(0.023304658), half(-0.027084433), half(0.120355256), half(-0.023104342)), acc);
-    acc = mulAdd4x4(max(t[1], half4(0.0h)), half4x4(half(0.0550643), half(-0.26851672), half(0.11073926), half(0.21989855), half(0.012853378), half(0.028077757), half(0.073306665), half(-0.04551125), half(0.16005373), half(-0.018154016), half(-0.12347146), half(-0.07590073), half(-0.10193998), half(0.084696375), half(0.04041413), half(-0.030883553)), acc);
-    acc = mulAdd4x4(max(t[2], half4(0.0h)), half4x4(half(-0.04816972), half(0.0804637), half(0.0071406), half(-0.08482986), half(0.11176785), half(0.060121994), half(-0.047804814), half(-0.036170192), half(0.01989302), half(-0.12537469), half(-0.16283676), half(0.19132937), half(-0.052577138), half(-0.005143432), half(0.045614418), half(0.04198543)), acc);
-    acc = mulAdd4x4(max(t[3], half4(0.0h)), half4x4(half(-0.33660156), half(0.036350835), half(-0.4623589), half(-0.04140598), half(0.2436438), half(-0.044735093), half(0.20876355), half(-0.004252532), half(0.81046224), half(-0.18550895), half(0.32743093), half(0.109012894), half(-0.34675312), half(-0.03464997), half(-0.09489919), half(-0.07961427)), acc);
-    acc = mulAdd4x4(max(t[4], half4(0.0h)), half4x4(half(-0.08862038), half(-0.8168393), half(0.03584266), half(0.32159033), half(0.06634099), half(0.2985745), half(-0.18204363), half(-0.016070427), half(0.35503992), half(1.1388919), half(0.16171643), half(-0.63834023), half(-0.0037699202), half(-0.27919513), half(-0.20949292), half(0.03270466)), acc);
-    acc = mulAdd4x4(max(t[5], half4(0.0h)), half4x4(half(0.021701936), half(-0.04537874), half(-0.05514495), half(0.23225744), half(0.024968185), half(0.1816845), half(0.03485249), half(-0.28249854), half(-0.37759346), half(-0.3225813), half(0.021595621), half(0.17104608), half(-0.0044055753), half(0.01621266), half(-0.015169225), half(0.08956203)), acc);
-    acc = mulAdd4x4(max(t[6], half4(0.0h)), half4x4(half(-0.033255238), half(-0.110517226), half(0.10664505), half(0.019566126), half(-0.0695305), half(0.059743922), half(-0.19161415), half(-0.024217626), half(-0.08578889), half(-0.16358584), half(-0.23050265), half(-0.004697784), half(-0.060790297), half(0.1174991), half(0.08205285), half(-0.011846926)), acc);
-    acc = mulAdd4x4(max(t[7], half4(0.0h)), half4x4(half(0.6119327), half(0.0791928), half(-0.118774265), half(0.42233524), half(-0.16248553), half(-0.017692063), half(0.13530938), half(-0.3207985), half(-0.147722), half(-0.24525681), half(0.05243329), half(-0.38583818), half(0.5147888), half(-0.072632834), half(-0.6014986), half(0.26713687)), acc);
-    acc = mulAdd4x4(max(t[8], half4(0.0h)), half4x4(half(0.23735437), half(-0.032110002), half(0.17445332), half(-0.3272264), half(0.020623574), half(0.26734766), half(-0.16806662), half(0.0796467), half(-0.34921628), half(0.016648084), half(-0.14200358), half(0.59190625), half(0.13177821), half(0.11139572), half(-0.14972521), half(-0.16784541)), acc);
-    acc = mulAdd4x4(max(-t[0], half4(0.0h)), half4x4(half(-0.047283772), half(-0.003196778), half(0.44890094), half(0.14619343), half(-0.17113213), half(-0.068454474), half(0.07681565), half(-0.04306807), half(-0.0022641511), half(-0.20954822), half(0.0344229), half(0.014815744), half(-0.010632933), half(0.13355999), half(-0.0860752), half(-0.069001146)), acc);
-    acc = mulAdd4x4(max(-t[1], half4(0.0h)), half4x4(half(0.11664345), half(0.099102855), half(0.1642523), half(0.047408774), half(0.038490184), half(0.16064398), half(-0.08694127), half(-0.2149453), half(-0.1413128), half(-0.06531084), half(-0.10105762), half(0.19743964), half(0.10458527), half(-0.04133969), half(0.1425028), half(-0.01328308)), acc);
-    acc = mulAdd4x4(max(-t[2], half4(0.0h)), half4x4(half(0.0138432095), half(-0.20053013), half(0.079355195), half(0.273772), half(0.05484276), half(0.13891658), half(0.16240036), half(-0.25245088), half(0.011192391), half(0.104164094), half(0.08112111), half(-0.250435), half(-0.0559613), half(-0.031029798), half(-0.015725998), half(0.09240792)), acc);
-    acc = mulAdd4x4(max(-t[3], half4(0.0h)), half4x4(half(0.18754779), half(-0.33171803), half(0.34917468), half(0.29074225), half(-0.37954012), half(0.20898043), half(-0.24973525), half(-0.13707505), half(-0.31585664), half(0.13607393), half(-0.29118514), half(0.015055187), half(0.18549949), half(-0.06351915), half(0.2823401), half(-0.00019733967)), acc);
-    acc = mulAdd4x4(max(-t[4], half4(0.0h)), half4x4(half(0.10060476), half(0.2883022), half(-0.15810104), half(-0.041112892), half(0.31050095), half(0.18517002), half(0.020033397), half(-0.35919502), half(-0.17903808), half(-0.43506318), half(-0.14783014), half(0.20092726), half(-0.002020754), half(0.13320895), half(0.040995706), half(0.052643474)), acc);
-    acc = mulAdd4x4(max(-t[5], half4(0.0h)), half4x4(half(-0.014892139), half(0.005828587), half(0.044784732), half(-0.27272886), half(0.21069369), half(0.044396695), half(-0.03411123), half(0.031441864), half(0.17224072), half(0.1708587), half(-0.00729118), half(-0.13070418), half(-0.19128975), half(-0.09342688), half(-0.051133234), half(-0.089075714)), acc);
-    acc = mulAdd4x4(max(-t[6], half4(0.0h)), half4x4(half(0.08799108), half(0.04157696), half(-0.15010124), half(0.26832178), half(-0.0040120087), half(0.040308744), half(0.17632529), half(-0.09464763), half(0.07786305), half(0.038288828), half(0.40799135), half(0.037377868), half(-0.049877923), half(-0.25080636), half(0.00068664295), half(0.0013101585)), acc);
-    acc = mulAdd4x4(max(-t[7], half4(0.0h)), half4x4(half(0.0353459), half(-0.21445732), half(0.112647906), half(-0.3513759), half(0.16887255), half(0.3224789), half(-0.17073384), half(0.10875396), half(0.18919177), half(0.14288992), half(0.07364533), half(0.20205943), half(-0.34363645), half(-0.3520186), half(0.6763608), half(-0.19051236)), acc);
-    acc = mulAdd4x4(max(-t[8], half4(0.0h)), half4x4(half(-0.032245517), half(0.039594565), half(-0.11825768), half(0.16509856), half(0.11749939), half(-0.005166539), half(0.10740687), half(-0.3794017), half(0.12722437), half(0.14066173), half(0.08025407), half(-0.34773758), half(-0.027300838), half(-0.08963159), half(0.29774833), half(0.053532287)), acc);
-    featOut.write(acc, gid);
+    const int2 size = int2(blurX.get_width(), blurX.get_height());
+    const float wts[5] = { 0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f };
+    float blurred = 0.0f;
+    for (int dy = -2; dy <= 2; ++dy) {
+        blurred += float(blurX.read(a4kClamp(int2(int(gid.x), int(gid.y) + dy), size)).r) * wts[dy + 2];
+    }
+    float orig = float(origLuma.read(a4kClamp(int2(gid), size)).r);
+    // Positive when pixel is darker than its local Gaussian surround (i.e. dark anime ink line)
+    float diff = max(blurred - orig, 0.0f);
+    lineDiff.write(half4(half(diff), 0.0h, 0.0h, 1.0h), gid);
 }
 
-kernel void anime4k_upscale_pass3(
-    texture2d<half, access::read> featIn [[texture(0)]],
-    texture2d<half, access::write> featOut [[texture(1)]],
+kernel void anime4k_darken_apply(
+    texture2d<float, access::read> input [[texture(0)]],
+    texture2d<half, access::read> lineMask [[texture(1)]],
+    texture2d<float, access::write> output [[texture(2)]],
+    constant Anime4KDarkenUniforms &u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    const uint w = featOut.get_width();
-    const uint h = featOut.get_height();
+    const uint w = output.get_width();
+    const uint h = output.get_height();
     if (gid.x >= w || gid.y >= h) return;
-    half4 t[9];
-    load3x3Half4(featIn, int2(gid), int2(featIn.get_width(), featIn.get_height()), t);
-    half4 acc = half4(half(0.04921464), half(-0.0011432811), half(0.062071066), half(-0.06594219));
-    acc = mulAdd4x4(max(t[0], half4(0.0h)), half4x4(half(-0.0714004), half(-0.0545495), half(-0.050848898), half(0.04724593), half(0.2214181), half(0.26353878), half(0.07314053), half(-0.18771721), half(0.06282607), half(-0.03720548), half(0.020577375), half(-0.08951135), half(0.40820515), half(0.012179098), half(0.52947706), half(-0.48448065)), acc);
-    acc = mulAdd4x4(max(t[1], half4(0.0h)), half4x4(half(0.10311368), half(-0.10970221), half(0.07008208), half(-0.07143153), half(0.073753305), half(0.03786335), half(-0.4312538), half(-0.17680745), half(-0.15527713), half(-0.06711554), half(-0.21828765), half(0.27252844), half(-0.0025433605), half(0.31595528), half(-0.06065309), half(0.059542265)), acc);
-    acc = mulAdd4x4(max(t[2], half4(0.0h)), half4x4(half(-0.036736265), half(0.08704119), half(-0.06530063), half(0.04546563), half(0.010335546), half(-0.040761005), half(-0.021500558), half(0.104531065), half(0.094652064), half(-0.05088704), half(0.14768088), half(-0.08585825), half(0.057680476), half(0.09885713), half(0.18074304), half(-0.14277679)), acc);
-    acc = mulAdd4x4(max(t[3], half4(0.0h)), half4x4(half(-0.04810641), half(-0.01735864), half(-0.06405213), half(0.04889552), half(-0.011552542), half(-0.04617259), half(0.023976233), half(0.27587202), half(-0.117965676), half(-0.07052052), half(-0.030583147), half(-0.036600694), half(-0.08542387), half(-0.053850796), half(0.27242282), half(-0.73792183)), acc);
-    acc = mulAdd4x4(max(t[4], half4(0.0h)), half4x4(half(-0.1340838), half(0.1256252), half(-0.040528856), half(0.13554344), half(-0.13733707), half(-0.14641404), half(0.42666963), half(-0.4933124), half(-0.34908), half(0.054332364), half(-0.2768947), half(0.44689894), half(0.42182985), half(-0.027279109), half(-0.17136064), half(-0.009496184)), acc);
-    acc = mulAdd4x4(max(t[5], half4(0.0h)), half4x4(half(0.075086355), half(-0.025501372), half(0.02172236), half(-0.052761186), half(-0.055753034), half(-0.028023237), half(-0.08829973), half(0.14333946), half(0.062496934), half(0.034493748), half(0.17640088), half(-0.084869936), half(0.21283653), half(0.1184779), half(0.0016387368), half(-0.1498814)), acc);
-    acc = mulAdd4x4(max(t[6], half4(0.0h)), half4x4(half(0.054841094), half(0.040639404), half(-0.025044259), half(-0.071105786), half(-0.07473824), half(-0.04719771), half(0.016553668), half(-0.10028357), half(0.009365985), half(-0.0133521445), half(0.022320358), half(-0.09318326), half(0.17342545), half(0.19281831), half(0.16737404), half(-0.09583887)), acc);
-    acc = mulAdd4x4(max(t[7], half4(0.0h)), half4x4(half(-0.03950585), half(0.091417804), half(-0.021395942), half(0.08735149), half(-0.029363452), half(-0.04763804), half(-0.1430701), half(0.15344201), half(-0.006604305), half(0.05897304), half(-0.13595524), half(0.083323576), half(0.008187976), half(0.12946083), half(0.14983748), half(-0.08178542)), acc);
-    acc = mulAdd4x4(max(t[8], half4(0.0h)), half4x4(half(-0.00046765045), half(-0.07914878), half(0.03529457), half(-0.007752294), half(-0.10084779), half(-0.1531338), half(-0.1408283), half(0.20638838), half(0.01466853), half(-0.059309185), half(-0.11161097), half(0.08481583), half(0.090416916), half(0.081118226), half(0.08677104), half(-0.20095336)), acc);
-    acc = mulAdd4x4(max(-t[0], half4(0.0h)), half4x4(half(0.3200496), half(-0.049090706), half(0.11554867), half(-0.11949655), half(-0.18064958), half(0.0012254696), half(-0.032284267), half(0.00076361356), half(-0.13239916), half(-0.13838826), half(-0.20345089), half(0.00692921), half(-0.2271236), half(-0.07132879), half(-0.097703665), half(0.29881954)), acc);
-    acc = mulAdd4x4(max(-t[1], half4(0.0h)), half4x4(half(0.4095371), half(0.3008338), half(-0.43109173), half(-0.495734), half(0.15016843), half(-0.3890023), half(1.0669806), half(-0.20876339), half(-0.32241493), half(-0.10387533), half(-0.018227777), half(0.1349976), half(-0.0019588785), half(-0.19263229), half(0.38952798), half(0.08135965)), acc);
-    acc = mulAdd4x4(max(-t[2], half4(0.0h)), half4x4(half(0.01517036), half(-0.51562387), half(-0.13939962), half(-0.23287989), half(0.09597558), half(0.017624658), half(0.16989397), half(-0.09395267), half(-0.29612765), half(0.11843327), half(-0.07493133), half(0.14523852), half(0.040488124), half(0.016568637), half(0.10204776), half(-0.13137013)), acc);
-    acc = mulAdd4x4(max(-t[3], half4(0.0h)), half4x4(half(-0.1512155), half(-0.12732185), half(0.08002965), half(0.024762904), half(0.05106389), half(0.011125884), half(-0.043196492), half(-0.17617282), half(0.09791206), half(0.120643355), half(0.075500526), half(0.10948051), half(0.04969893), half(-0.20776172), half(-0.06905779), half(-0.20245977)), acc);
-    acc = mulAdd4x4(max(-t[4], half4(0.0h)), half4x4(half(-0.41836104), half(-0.82896453), half(-0.20962712), half(0.7804863), half(0.17322528), half(0.53994787), half(-0.18730208), half(-0.021233026), half(0.7417944), half(-0.4544313), half(0.23165174), half(-0.63969344), half(0.09383021), half(-0.046137553), half(-0.07796646), half(0.11413524)), acc);
-    acc = mulAdd4x4(max(-t[5], half4(0.0h)), half4x4(half(-0.32532063), half(0.09456587), half(0.43708017), half(-0.40595353), half(0.061229162), half(0.006663704), half(-0.19821976), half(0.07661682), half(-0.21427135), half(0.17748164), half(-0.31958643), half(0.3883502), half(0.068938896), half(0.022886515), half(0.022923468), half(-0.04269318)), acc);
-    acc = mulAdd4x4(max(-t[6], half4(0.0h)), half4x4(half(0.23775512), half(0.04026384), half(0.12276414), half(-0.2545085), half(0.0894177), half(0.115443565), half(0.029124375), half(0.08887401), half(-0.0057824687), half(0.017655179), half(-0.025270017), half(-0.06643964), half(0.01316084), half(0.024039604), half(0.034566984), half(-0.12682836)), acc);
-    acc = mulAdd4x4(max(-t[7], half4(0.0h)), half4x4(half(0.036596492), half(0.22772355), half(-0.05508538), half(-0.18005793), half(-0.06432669), half(-0.037058707), half(0.2718052), half(-0.10313161), half(0.016055575), half(0.051271006), half(-0.038919963), half(-0.036601298), half(-0.019457681), half(0.03805731), half(0.03252896), half(-0.07179724)), acc);
-    acc = mulAdd4x4(max(-t[8], half4(0.0h)), half4x4(half(0.15046261), half(0.13090402), half(-0.023847125), half(-0.039356075), half(0.045424663), half(-0.20594294), half(0.2154043), half(-0.18429665), half(-0.07969159), half(0.08719893), half(-0.057626463), half(0.08344988), half(-0.018651528), half(0.047302175), half(0.060727824), half(-0.035960387)), acc);
-    featOut.write(acc, gid);
+    const int2 size = int2(input.get_width(), input.get_height());
+    float3 rgb = input.read(a4kClamp(int2(gid), size)).rgb;
+    float lineAmt = float(lineMask.read(a4kClamp(int2(gid), size)).r);
+    float str = clamp(u.strength, 0.0f, 2.0f);
+    // Subtract proportional luminance delta to deepen ink outlines while preserving hue
+    float3 darkened = saturate(rgb - float3(lineAmt * str));
+    output.write(float4(darkened, 1.0f), gid);
 }
 
-kernel void anime4k_upscale_pass4(
-    texture2d<half, access::sample> input [[texture(0)]],
-    texture2d<half, access::read> featIn [[texture(1)]],
-    texture2d<half, access::write> output [[texture(2)]],
+kernel void anime4k_darken_fast(
+    texture2d<float, access::read> input [[texture(0)]],
+    texture2d<float, access::write> output [[texture(1)]],
+    constant Anime4KDarkenUniforms &u [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    // Dispatched at input resolution (inW x inH); each thread writes a 2x2 output subpixel quad.
-    const uint inW = featIn.get_width();
-    const uint inH = featIn.get_height();
-    if (gid.x >= inW || gid.y >= inH) return;
+    const uint w = output.get_width();
+    const uint h = output.get_height();
+    if (gid.x >= w || gid.y >= h) return;
 
-    const uint outW = output.get_width();
-    const uint outH = output.get_height();
-    constexpr sampler linearSam(filter::linear, address::clamp_to_edge, coord::normalized);
+    const int2 size = int2(input.get_width(), input.get_height());
+    const int2 p = int2(gid);
+    const float3 kLuma = float3(0.299f, 0.587f, 0.114f);
+    float3 center = input.read(a4kClamp(p, size)).rgb;
+    float cLuma = dot(center, kLuma);
 
-    half4 t[9];
-    load3x3Half4(featIn, int2(gid), int2(inW, inH), t);
-    half4 acc = half4(half(-0.0031417734), half(-0.002754766), half(-0.004053268), half(-0.003937834));
-    acc = mulAdd4x4(max(t[0], half4(0.0h)), half4x4(half(-0.04508749), half(0.00222134), half(0.013338363), half(-0.0067310617), half(0.099346675), half(0.05804196), half(0.018694466), half(-0.008126048), half(0.007771997), half(-0.0072556734), half(-0.008293339), half(0.001518462), half(-0.06296499), half(-0.064195156), half(0.0727399), half(0.044078834)), acc);
-    acc = mulAdd4x4(max(t[1], half4(0.0h)), half4x4(half(0.20800652), half(-0.016071903), half(-0.08095607), half(-0.03472411), half(-0.20690396), half(0.061331827), half(-0.10627648), half(0.12838624), half(0.036534917), half(-0.006113497), half(0.029266752), half(-0.002263159), half(0.2937966), half(-0.05544609), half(0.14546311), half(-0.01290958)), acc);
-    acc = mulAdd4x4(max(t[2], half4(0.0h)), half4x4(half(0.07792222), half(-7.288649e-05), half(0.2800036), half(0.019709835), half(-0.010950291), half(0.021879988), half(0.037608813), half(0.055267945), half(0.018646395), half(-0.016691998), half(0.03787624), half(-0.006547077), half(0.03214097), half(-0.018541625), half(0.12142825), half(-0.070806496)), acc);
-    acc = mulAdd4x4(max(t[3], half4(0.0h)), half4x4(half(-0.009798109), half(-0.06606263), half(0.0010101331), half(0.009924258), half(-0.10272075), half(-0.07983353), half(0.028398676), half(0.04967719), half(0.12467993), half(0.06775066), half(0.017111637), half(0.012814711), half(0.0031143876), half(-0.0902014), half(0.11242646), half(0.076476306)), acc);
-    acc = mulAdd4x4(max(t[4], half4(0.0h)), half4x4(half(0.07650971), half(0.35096344), half(0.0612814), half(0.06036218), half(0.253547), half(-0.0460987), half(-0.11145313), half(-0.48844674), half(-0.050644107), half(0.038706005), half(0.19390784), half(0.035322774), half(-0.010191005), half(0.58071), half(-0.2856661), half(-0.009533105)), acc);
-    acc = mulAdd4x4(max(t[5], half4(0.0h)), half4x4(half(-0.071486905), half(-0.036179904), half(-0.07303894), half(0.19301178), half(-0.11499898), half(-0.024847068), half(-0.0027055284), half(0.20373714), half(-0.09671404), half(-0.020897992), half(-0.25572056), half(-0.008931707), half(-0.13582602), half(-0.006546881), half(-0.16154496), half(0.26454738)), acc);
-    acc = mulAdd4x4(max(t[6], half4(0.0h)), half4x4(half(0.005463064), half(0.006769753), half(0.0039625713), half(0.014121269), half(-0.068200685), half(-0.057850275), half(0.008622973), half(0.061149873), half(0.017436448), half(0.11660872), half(-0.02994459), half(0.008590145), half(-0.03223439), half(0.052557915), half(-0.011846354), half(0.03523357)), acc);
-    acc = mulAdd4x4(max(t[7], half4(0.0h)), half4x4(half(-0.00015264735), half(0.0012872831), half(0.021878848), half(0.022240406), half(0.01822283), half(-0.008284247), half(-0.018443186), half(-0.04997753), half(-0.111760505), half(-0.20911667), half(0.006166832), half(0.14597091), half(0.02305932), half(-0.16312876), half(0.023375351), half(-0.028755601)), acc);
-    acc = mulAdd4x4(max(t[8], half4(0.0h)), half4x4(half(0.013701143), half(0.010794129), half(0.0024321147), half(-0.018976321), half(0.0365032), half(-0.006783485), half(0.01046472), half(-0.08473902), half(0.057523903), half(0.029831914), half(0.0040916028), half(-0.2046352), half(0.03542), half(-0.034598), half(0.0031058635), half(-0.20746285)), acc);
-    acc = mulAdd4x4(max(-t[0], half4(0.0h)), half4x4(half(0.09283864), half(-0.0035849356), half(0.013190911), half(-0.035437535), half(0.035798516), half(0.022954805), half(-0.0029692063), half(-0.006633743), half(-0.13456796), half(-0.011448714), half(0.011536131), half(0.046695728), half(-0.0359048), half(-0.01144856), half(-0.0027279712), half(0.0065755467)), acc);
-    acc = mulAdd4x4(max(-t[1], half4(0.0h)), half4x4(half(-0.14295974), half(-0.0034393691), half(0.0051469817), half(-0.021334402), half(-0.05882422), half(-0.003004241), half(0.011182507), half(0.0015169785), half(0.08474255), half(0.1255887), half(-0.23984577), half(0.07119401), half(-0.12547183), half(0.038449038), half(0.007738907), half(0.031506266)), acc);
-    acc = mulAdd4x4(max(-t[2], half4(0.0h)), half4x4(half(-0.028237654), half(0.010254326), half(-0.11843009), half(0.03034298), half(-0.038323015), half(0.0026470951), half(-0.060652684), half(0.0022312272), half(-0.022539174), half(-0.01008126), half(0.14868541), half(0.02881852), half(-0.05327277), half(-0.012296453), half(-0.21280704), half(-0.021286633)), acc);
-    acc = mulAdd4x4(max(-t[3], half4(0.0h)), half4x4(half(-0.034825645), half(0.0877418), half(-0.009103147), half(0.041650586), half(0.0135769), half(-0.005229229), half(0.00082947424), half(-0.0020421906), half(0.12402267), half(0.007698874), half(-0.056337915), half(-0.006580138), half(-0.018867968), half(-0.08487179), half(-0.020938644), half(-0.029210499)), acc);
-    acc = mulAdd4x4(max(-t[4], half4(0.0h)), half4x4(half(-0.37082648), half(-0.30321857), half(-0.22912364), half(-0.07368761), half(0.15169628), half(0.0013253551), half(0.09232649), half(0.011408914), half(0.06347244), half(-0.377988), half(0.13980117), half(-0.41065913), half(-0.00040237256), half(-0.23220152), half(-0.03643865), half(-0.10101427)), acc);
-    acc = mulAdd4x4(max(-t[5], half4(0.0h)), half4x4(half(0.10692653), half(0.049867555), half(-0.011915118), half(-0.10688069), half(0.042109665), half(-0.017163716), half(0.10852331), half(-0.0088934945), half(0.06780516), half(-0.017808875), half(0.26564032), half(0.0523693), half(0.099033475), half(0.042864073), half(0.18299587), half(-0.13503626)), acc);
-    acc = mulAdd4x4(max(-t[6], half4(0.0h)), half4x4(half(0.07014404), half(0.08841395), half(0.01895322), half(0.0036451078), half(-0.00933168), half(0.044764042), half(-0.0034986525), half(0.010701783), half(-0.043601245), half(-0.1375109), half(0.0039965697), half(-0.054331), half(0.018830067), half(0.040386382), half(0.007759782), half(-0.012478715)), acc);
-    acc = mulAdd4x4(max(-t[7], half4(0.0h)), half4x4(half(0.024152381), half(-0.11462646), half(0.07005155), half(0.0424638), half(-0.0048070764), half(0.06089261), half(-0.036675487), half(0.057459857), half(0.02478629), half(0.2926517), half(-0.08248396), half(-0.053960845), half(0.013205341), half(0.09851673), half(-0.04310949), half(-0.001428641)), acc);
-    acc = mulAdd4x4(max(-t[8], half4(0.0h)), half4x4(half(0.016168298), half(0.009701502), half(0.0064305146), half(-0.068672284), half(-0.044653386), half(-0.016051823), half(-0.015055443), half(0.032019246), half(-0.0829852), half(-0.011304939), half(0.0023902296), half(0.30322486), half(-0.023831543), half(-0.0046928846), half(0.026961725), half(0.16314326)), acc);
+    float avgLuma = 0.0f;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            float wgt = (dx == 0 && dy == 0) ? 4.0f : ((dx == 0 || dy == 0) ? 2.0f : 1.0f);
+            avgLuma += dot(input.read(a4kClamp(p + int2(dx, dy), size)).rgb, kLuma) * wgt;
+        }
+    }
+    avgLuma *= (1.0f / 16.0f);
+    float diff = max(avgLuma - cLuma, 0.0f);
+    float3 darkened = saturate(center - float3(diff * clamp(u.strength, 0.0f, 2.0f) * 1.25f));
+    output.write(float4(darkened, 1.0f), gid);
+}
 
-    const float2 outputPt = 1.0f / float2(outW, outH);
-    const uint2 base = gid * 2u;
+// MARK: - Anime4K Clamp Highlights (Standalone Anti-Ringing Pass)
 
-    if (base.x < outW && base.y < outH) {
-        float2 uv = (float2(base) + 0.5f) * outputPt;
-        output.write(half4(saturate(acc.x + input.sample(linearSam, uv).rgb), 1.0h), base);
+struct Anime4KClampUniforms {
+    uint radius; // 1 = 3x3, 2 = 5x5
+    float strength;
+    uint _pad0;
+    uint _pad1;
+};
+
+kernel void anime4k_clamp_highlights(
+    texture2d<float, access::read> input [[texture(0)]],
+    texture2d<float, access::write> output [[texture(1)]],
+    constant Anime4KClampUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint w = output.get_width();
+    const uint h = output.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    const int2 size = int2(input.get_width(), input.get_height());
+    const int2 p = int2(gid);
+    const float3 kLuma = float3(0.299f, 0.587f, 0.114f);
+    const int radius = clamp(int(u.radius), 1, 2);
+    const float str = clamp(u.strength, 0.0f, 1.0f);
+
+    float3 center = input.read(a4kClamp(p, size)).rgb;
+    float cLuma = dot(center, kLuma);
+
+    // Directional opposing-neighbor plateau cap:
+    // On a genuine bright region or clean step edge, at least one side of every axis remains bright,
+    // so max(pos, neg) stays high and real highlights pass through untouched.
+    // On a thin ringing halo (1px for radius=1, up to 2px wide for radius=2) flanked by a dark edge
+    // and background plateau, BOTH opposing neighbors across the perpendicular axis are darker,
+    // cleanly clamping the overshoot ridge down to the surrounding plateau.
+    const int2 axes[4] = { int2(1, 0), int2(0, 1), int2(1, 1), int2(1, -1) };
+    float minAxisCap = 1.0f;
+    float minL = cLuma;
+    float maxL = cLuma;
+
+    for (int step = 1; step <= radius; ++step) {
+        for (int a = 0; a < 4; ++a) {
+            int2 d = axes[a] * step;
+            float lPos = dot(input.read(a4kClamp(p + d, size)).rgb, kLuma);
+            float lNeg = dot(input.read(a4kClamp(p - d, size)).rgb, kLuma);
+            minL = min(minL, min(lPos, lNeg));
+            maxL = max(maxL, max(lPos, lNeg));
+            minAxisCap = min(minAxisCap, max(lPos, lNeg));
+        }
     }
-    if (base.x + 1u < outW && base.y < outH) {
-        uint2 p = base + uint2(1u, 0u);
-        float2 uv = (float2(p) + 0.5f) * outputPt;
-        output.write(half4(saturate(acc.y + input.sample(linearSam, uv).rgb), 1.0h), p);
-    }
-    if (base.x < outW && base.y + 1u < outH) {
-        uint2 p = base + uint2(0u, 1u);
-        float2 uv = (float2(p) + 0.5f) * outputPt;
-        output.write(half4(saturate(acc.z + input.sample(linearSam, uv).rgb), 1.0h), p);
-    }
-    if (base.x + 1u < outW && base.y + 1u < outH) {
-        uint2 p = base + uint2(1u, 1u);
-        float2 uv = (float2(p) + 0.5f) * outputPt;
-        output.write(half4(saturate(acc.w + input.sample(linearSam, uv).rgb), 1.0h), p);
-    }
+
+    // Only clamp bright overshoot near high-contrast edges (prevents flattening gentle gradients)
+    float localContrast = maxL - minL;
+    float edgeMask = smoothstep(0.10f, 0.30f, localContrast);
+    float excess = max(cLuma - minAxisCap, 0.0f) * str * edgeMask;
+    float3 clamped = saturate(center - float3(excess));
+    output.write(float4(clamped, 1.0f), gid);
 }

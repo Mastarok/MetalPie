@@ -17,17 +17,15 @@ inline uint2 clampCoord(int2 p, int2 size) {
 // MARK: - xBRZ Freescale (2-Pass YCbCr Perceptual Pixel-Art Upscaler)
 
 struct XBRZUniforms {
-    float equalColorTolerance; // Default 30.0 (in 0..255 units)
+    float equalColorTolerance;        // Default 30.0 (in 0..255 units)
+    float edgeThreshold;              // Default 2.2 (steep direction ratio)
+    float dominantDirectionThreshold; // Default 3.6
     uint _pad0;
-    uint _pad1;
-    uint _pad2;
 };
 
 constant int XBRZ_BLEND_NONE = 0;
 constant int XBRZ_BLEND_NORMAL = 1;
 constant int XBRZ_BLEND_DOMINANT = 2;
-constant float XBRZ_STEEP_THRESHOLD = 2.2f;
-constant float XBRZ_DOMINANT_THRESHOLD = 3.6f;
 
 inline float xbrzDistYCbCr(float3 pixA, float3 pixB) {
     const float3 w = float3(0.2627f, 0.6780f, 0.0593f);
@@ -79,6 +77,8 @@ kernel void xbrz_pass1(
     const int2 size = int2(inW, inH);
     const int2 center = int2(gid);
     const float tolNorm = clamp(u.equalColorTolerance, 1.0f, 128.0f) / 255.0f;
+    const float steepThresh = clamp(u.edgeThreshold > 0.1f ? u.edgeThreshold : 2.2f, 1.0f, 6.0f);
+    const float domThresh = clamp(u.dominantDirectionThreshold > 0.1f ? u.dominantDirectionThreshold : 3.6f, 1.0f, 8.0f);
 
     float3 src[5][5];
     for (int dx = 0; dx < 5; ++dx) {
@@ -103,7 +103,7 @@ kernel void xbrz_pass1(
     if (!((xbrzEq(E, F) && xbrzEq(H, I)) || (xbrzEq(E, H) && xbrzEq(F, I)))) {
         float dist_H_F = xbrzDistYCbCr(G, E) + xbrzDistYCbCr(E, C) + xbrzDistYCbCr(src[2][4], I) + xbrzDistYCbCr(I, src[4][2]) + 4.0f * xbrzDistYCbCr(H, F);
         float dist_E_I = xbrzDistYCbCr(D, H) + xbrzDistYCbCr(H, src[3][4]) + xbrzDistYCbCr(B, F) + xbrzDistYCbCr(F, src[4][3]) + 4.0f * xbrzDistYCbCr(E, I);
-        bool dominant = (XBRZ_DOMINANT_THRESHOLD * dist_H_F) < dist_E_I;
+        bool dominant = (domThresh * dist_H_F) < dist_E_I;
         blendResult.z = ((dist_H_F < dist_E_I) && xbrzNeq(E, F) && xbrzNeq(E, H)) ? (dominant ? XBRZ_BLEND_DOMINANT : XBRZ_BLEND_NORMAL) : XBRZ_BLEND_NONE;
     }
 
@@ -111,7 +111,7 @@ kernel void xbrz_pass1(
     if (!((xbrzEq(D, E) && xbrzEq(G, H)) || (xbrzEq(D, G) && xbrzEq(E, H)))) {
         float dist_G_E = xbrzDistYCbCr(src[0][3], D) + xbrzDistYCbCr(D, B) + xbrzDistYCbCr(src[1][4], H) + xbrzDistYCbCr(H, F) + 4.0f * xbrzDistYCbCr(G, E);
         float dist_D_H = xbrzDistYCbCr(src[0][2], G) + xbrzDistYCbCr(G, src[2][4]) + xbrzDistYCbCr(A, E) + xbrzDistYCbCr(E, I) + 4.0f * xbrzDistYCbCr(D, H);
-        bool dominant = (XBRZ_DOMINANT_THRESHOLD * dist_D_H) < dist_G_E;
+        bool dominant = (domThresh * dist_D_H) < dist_G_E;
         blendResult.w = ((dist_G_E > dist_D_H) && xbrzNeq(E, D) && xbrzNeq(E, H)) ? (dominant ? XBRZ_BLEND_DOMINANT : XBRZ_BLEND_NORMAL) : XBRZ_BLEND_NONE;
     }
 
@@ -119,7 +119,7 @@ kernel void xbrz_pass1(
     if (!((xbrzEq(B, C) && xbrzEq(E, F)) || (xbrzEq(B, E) && xbrzEq(C, F)))) {
         float dist_E_C = xbrzDistYCbCr(D, B) + xbrzDistYCbCr(B, src[3][0]) + xbrzDistYCbCr(H, F) + xbrzDistYCbCr(F, src[4][1]) + 4.0f * xbrzDistYCbCr(E, C);
         float dist_B_F = xbrzDistYCbCr(A, E) + xbrzDistYCbCr(E, I) + xbrzDistYCbCr(src[2][0], C) + xbrzDistYCbCr(C, src[4][2]) + 4.0f * xbrzDistYCbCr(B, F);
-        bool dominant = (XBRZ_DOMINANT_THRESHOLD * dist_B_F) < dist_E_C;
+        bool dominant = (domThresh * dist_B_F) < dist_E_C;
         blendResult.y = ((dist_E_C > dist_B_F) && xbrzNeq(E, B) && xbrzNeq(E, F)) ? (dominant ? XBRZ_BLEND_DOMINANT : XBRZ_BLEND_NORMAL) : XBRZ_BLEND_NONE;
     }
 
@@ -127,7 +127,7 @@ kernel void xbrz_pass1(
     if (!((xbrzEq(A, B) && xbrzEq(D, E)) || (xbrzEq(A, D) && xbrzEq(B, E)))) {
         float dist_D_B = xbrzDistYCbCr(src[0][2], A) + xbrzDistYCbCr(A, src[2][0]) + xbrzDistYCbCr(G, E) + xbrzDistYCbCr(E, C) + 4.0f * xbrzDistYCbCr(D, B);
         float dist_A_E = xbrzDistYCbCr(src[0][1], D) + xbrzDistYCbCr(D, H) + xbrzDistYCbCr(src[1][0], B) + xbrzDistYCbCr(B, F) + 4.0f * xbrzDistYCbCr(A, E);
-        bool dominant = (XBRZ_DOMINANT_THRESHOLD * dist_D_B) < dist_A_E;
+        bool dominant = (domThresh * dist_D_B) < dist_A_E;
         blendResult.x = ((dist_D_B < dist_A_E) && xbrzNeq(E, D) && xbrzNeq(E, B)) ? (dominant ? XBRZ_BLEND_DOMINANT : XBRZ_BLEND_NORMAL) : XBRZ_BLEND_NONE;
     }
 
@@ -140,8 +140,8 @@ kernel void xbrz_pass1(
         packed.z += 4.0f;
         float dist_F_G = xbrzDistYCbCr(F, G);
         float dist_H_C = xbrzDistYCbCr(H, C);
-        if ((XBRZ_STEEP_THRESHOLD * dist_F_G <= dist_H_C) && xbrzNeq(E, G) && xbrzNeq(D, G)) packed.z += 16.0f;
-        if ((XBRZ_STEEP_THRESHOLD * dist_H_C <= dist_F_G) && xbrzNeq(E, C) && xbrzNeq(B, C)) packed.z += 64.0f;
+        if ((steepThresh * dist_F_G <= dist_H_C) && xbrzNeq(E, G) && xbrzNeq(D, G)) packed.z += 16.0f;
+        if ((steepThresh * dist_H_C <= dist_F_G) && xbrzNeq(E, C) && xbrzNeq(B, C)) packed.z += 64.0f;
     }
 
     if (blendResult.w == XBRZ_BLEND_DOMINANT || (blendResult.w == XBRZ_BLEND_NORMAL &&
@@ -151,8 +151,8 @@ kernel void xbrz_pass1(
         packed.w += 4.0f;
         float dist_H_A = xbrzDistYCbCr(H, A);
         float dist_D_I = xbrzDistYCbCr(D, I);
-        if ((XBRZ_STEEP_THRESHOLD * dist_H_A <= dist_D_I) && xbrzNeq(E, A) && xbrzNeq(B, A)) packed.w += 16.0f;
-        if ((XBRZ_STEEP_THRESHOLD * dist_D_I <= dist_H_A) && xbrzNeq(E, I) && xbrzNeq(F, I)) packed.w += 64.0f;
+        if ((steepThresh * dist_H_A <= dist_D_I) && xbrzNeq(E, A) && xbrzNeq(B, A)) packed.w += 16.0f;
+        if ((steepThresh * dist_D_I <= dist_H_A) && xbrzNeq(E, I) && xbrzNeq(F, I)) packed.w += 64.0f;
     }
 
     if (blendResult.y == XBRZ_BLEND_DOMINANT || (blendResult.y == XBRZ_BLEND_NORMAL &&
@@ -162,8 +162,8 @@ kernel void xbrz_pass1(
         packed.y += 4.0f;
         float dist_B_I = xbrzDistYCbCr(B, I);
         float dist_F_A = xbrzDistYCbCr(F, A);
-        if ((XBRZ_STEEP_THRESHOLD * dist_B_I <= dist_F_A) && xbrzNeq(E, I) && xbrzNeq(H, I)) packed.y += 16.0f;
-        if ((XBRZ_STEEP_THRESHOLD * dist_F_A <= dist_B_I) && xbrzNeq(E, A) && xbrzNeq(D, A)) packed.y += 64.0f;
+        if ((steepThresh * dist_B_I <= dist_F_A) && xbrzNeq(E, I) && xbrzNeq(H, I)) packed.y += 16.0f;
+        if ((steepThresh * dist_F_A <= dist_B_I) && xbrzNeq(E, A) && xbrzNeq(D, A)) packed.y += 64.0f;
     }
 
     if (blendResult.x == XBRZ_BLEND_DOMINANT || (blendResult.x == XBRZ_BLEND_NORMAL &&
@@ -173,8 +173,8 @@ kernel void xbrz_pass1(
         packed.x += 4.0f;
         float dist_D_C = xbrzDistYCbCr(D, C);
         float dist_B_G = xbrzDistYCbCr(B, G);
-        if ((XBRZ_STEEP_THRESHOLD * dist_D_C <= dist_B_G) && xbrzNeq(E, C) && xbrzNeq(F, C)) packed.x += 16.0f;
-        if ((XBRZ_STEEP_THRESHOLD * dist_B_G <= dist_D_C) && xbrzNeq(E, G) && xbrzNeq(H, G)) packed.x += 64.0f;
+        if ((steepThresh * dist_D_C <= dist_B_G) && xbrzNeq(E, C) && xbrzNeq(F, C)) packed.x += 16.0f;
+        if ((steepThresh * dist_B_G <= dist_D_C) && xbrzNeq(E, G) && xbrzNeq(H, G)) packed.x += 64.0f;
     }
 
     blendTex.write(packed / 255.0f, gid);
@@ -278,6 +278,10 @@ struct CRTGeomUniforms {
     float cornerSize;
     float vignette;
     float bloom;
+    float curvatureRadius;
+    uint maskType; // 0 = apertureGrille, 1 = shadowMask, 2 = slotMask, 3 = off
+    float brightness;
+    uint _pad0;
 };
 
 inline float crtFix(float c) { return max(abs(c), 1e-5f); }
@@ -360,7 +364,9 @@ kernel void crt_geom(
     const float dotMask = clamp(u.dotMask, 0.0f, 1.0f);
     const float cornerSize = max(u.cornerSize, 0.0005f);
     const float dist = 1.5f;
-    const float radius = 2.0f;
+    const float radius = clamp(u.curvatureRadius > 0.1f ? u.curvatureRadius : 2.0f, 0.8f, 6.0f);
+    const float halation = clamp(u.bloom, 0.0f, 1.0f);
+    const float brightBoost = clamp(u.brightness > 0.01f ? u.brightness : 1.0f, 0.5f, 1.6f);
     const float cornerSmooth = 1000.0f;
     const float2 aspect = float2(1.0f, 0.75f);
     const float4 sinCos = float4(0.0f, 0.0f, 1.0f, 1.0f);
@@ -407,17 +413,26 @@ kernel void crt_geom(
         0.0f, 1.0f
     );
 
-    float4 weights  = crtScanlineWeights(uvRatio.y, col, scanlineWeight, u.bloom);
-    float4 weights2 = crtScanlineWeights(1.0f - uvRatio.y, col2, scanlineWeight, u.bloom);
+    float4 weights  = crtScanlineWeights(uvRatio.y, col, scanlineWeight, halation * 0.25f);
+    float4 weights2 = crtScanlineWeights(1.0f - uvRatio.y, col2, scanlineWeight, halation * 0.25f);
 
     float uvY = uvRatio.y + (1.0f / 3.0f) * filter;
-    weights  = (weights  + crtScanlineWeights(uvY, col, scanlineWeight, u.bloom)) / 3.0f;
-    weights2 = (weights2 + crtScanlineWeights(abs(1.0f - uvY), col2, scanlineWeight, u.bloom)) / 3.0f;
+    weights  = (weights  + crtScanlineWeights(uvY, col, scanlineWeight, halation * 0.25f)) / 3.0f;
+    weights2 = (weights2 + crtScanlineWeights(abs(1.0f - uvY), col2, scanlineWeight, halation * 0.25f)) / 3.0f;
     uvY -= (2.0f / 3.0f) * filter;
-    weights  += crtScanlineWeights(abs(uvY), col, scanlineWeight, u.bloom) / 3.0f;
-    weights2 += crtScanlineWeights(abs(1.0f - uvY), col2, scanlineWeight, u.bloom) / 3.0f;
+    weights  += crtScanlineWeights(abs(uvY), col, scanlineWeight, halation * 0.25f) / 3.0f;
+    weights2 += crtScanlineWeights(abs(1.0f - uvY), col2, scanlineWeight, halation * 0.25f) / 3.0f;
 
     float3 mulRes = (col * weights + col2 * weights2).rgb;
+
+    // Soft phosphor halation / glow around bright highlights
+    if (halation > 0.001f) {
+        float3 glowSample = (col.rgb + col2.rgb) * 0.5f;
+        float glowLuma = dot(glowSample, float3(0.2126f, 0.7152f, 0.0722f));
+        mulRes += glowSample * smoothstep(0.15f, 1.0f, glowLuma) * halation * 0.35f;
+    }
+
+    mulRes *= brightBoost;
 
     // Subtle CRT tube vignette
     if (u.vignette > 0.0f) {
@@ -428,14 +443,38 @@ kernel void crt_geom(
 
     mulRes *= cval;
 
-    // Phosphor aperture / dot mask (green/magenta alternating subpixel tint)
-    float modFactor = float(gid.x);
-    float3 dotMaskWeights = mix(
-        float3(1.0f, 1.0f - dotMask * 0.35f, 1.0f),
-        float3(1.0f - dotMask * 0.35f, 1.0f, 1.0f - dotMask * 0.35f),
-        floor(fmod(modFactor, 2.0f))
-    );
-    mulRes *= dotMaskWeights;
+    // Selectable phosphor mask: 0=Aperture Grille, 1=Shadow Mask, 2=Slot Mask, 3=Off
+    if (u.maskType != 3u && dotMask > 0.001f) {
+        float strength = dotMask * 0.45f;
+        float3 maskWeights = float3(1.0f);
+        if (u.maskType == 0u) {
+            // Aperture Grille (Trinitron alternating vertical RGB/GM stripes)
+            maskWeights = mix(
+                float3(1.0f, 1.0f - strength, 1.0f),
+                float3(1.0f - strength, 1.0f, 1.0f - strength),
+                floor(fmod(float(gid.x), 2.0f))
+            );
+        } else if (u.maskType == 1u) {
+            // Shadow Mask (staggered RGB phosphor dot triad)
+            float phase = fmod(float(gid.x) + floor(fmod(float(gid.y), 2.0f)) * 1.5f, 3.0f);
+            float3 triad = float3(1.0f - strength);
+            if (phase < 1.0f) triad.r = 1.0f;
+            else if (phase < 2.0f) triad.g = 1.0f;
+            else triad.b = 1.0f;
+            maskWeights = triad;
+        } else {
+            // Slot Mask (arcade staggered brick RGB slots with horizontal dark bars)
+            uint colIdx = gid.x % 3u;
+            uint rowBrick = (gid.y + ((gid.x / 3u) % 2u) * 2u) % 4u;
+            float3 slot = float3(1.0f - strength * 0.85f);
+            if (colIdx == 0u) slot.r = 1.0f;
+            else if (colIdx == 1u) slot.g = 1.0f;
+            else slot.b = 1.0f;
+            if (rowBrick == 3u) slot *= (1.0f - strength * 0.6f);
+            maskWeights = slot;
+        }
+        mulRes *= maskWeights;
+    }
 
     mulRes = pow(max(mulRes, float3(0.0f)), 1.0f / monitorGamma);
     output.write(float4(saturate(mulRes), 1.0f), gid);

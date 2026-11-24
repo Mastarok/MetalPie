@@ -43,6 +43,25 @@ public struct CursorImageSnapshot: @unchecked Sendable {
     }
 }
 
+/// Active cursor alignment & confinement operating mode reported by `CursorOverlayController`.
+///
+/// Allows `AppCoordinator` and UI views to distinguish 1:1 passthrough, fully aligned event-tap
+/// confinement, and non-1:1 sessions waiting for macOS Accessibility trust so MetalPie NEVER
+/// silently renders a misaligned cursor sprite or leaves users guessing why scaled clicks miss.
+public enum CursorAlignmentMode: String, Hashable, Codable, Sendable, CaseIterable {
+    /// Cursor controller is stopped.
+    case inactive
+    /// 1:1 identity passthrough — native OS cursor already matches pixel-for-pixel (no Accessibility needed).
+    case identityPassthrough
+    /// Non-1:1 scaled mode with active `CGEventTap` confining clicks strictly inside the target window
+    /// and keeping the scaled visual cursor synchronized 1:1 with the physical click coordinate.
+    case scaledConfinedEventTap
+    /// Non-1:1 scaled mode WITHOUT Accessibility trust (or tap unavailable): macOS cannot confine or
+    /// remap clicks into the scaled window, so MetalPie keeps the native OS cursor visible, hides the
+    /// scaled sprite (never showing a misleading position), and surfaces an Accessibility prompt state.
+    case accessibilityRequired
+}
+
 /// Complete lock-free/tiny-lock cursor state published for Metal VRR in-pass compositing and HUD consumers.
 public struct CursorRenderSnapshot: Sendable {
     public var state: CursorOverlayState
@@ -50,19 +69,298 @@ public struct CursorRenderSnapshot: Sendable {
     public var spriteGeometry: CursorSpriteGeometry?
     public var interpolation: CursorInterpolation
     public var presentationMode: CursorPresentationMode
+    public var alignmentMode: CursorAlignmentMode
 
     public init(
         state: CursorOverlayState = CursorOverlayState(),
         image: CursorImageSnapshot? = nil,
         spriteGeometry: CursorSpriteGeometry? = nil,
         interpolation: CursorInterpolation = .bilinear,
-        presentationMode: CursorPresentationMode = .overlayLayer
+        presentationMode: CursorPresentationMode = .overlayLayer,
+        alignmentMode: CursorAlignmentMode = .inactive
     ) {
         self.state = state
         self.image = image
         self.spriteGeometry = spriteGeometry
         self.interpolation = interpolation
         self.presentationMode = presentationMode
+        self.alignmentMode = alignmentMode
+    }
+}
+
+/// Pure, unit-testable input event delivered to the cursor event-tap state machine.
+public struct CursorTapEventInput: Hashable, Sendable {
+    public var type: CGEventType
+    public var location: CGPoint
+    public var deltaX: Double
+    public var deltaY: Double
+    public var timestamp: TimeInterval
+
+    public init(
+        type: CGEventType,
+        location: CGPoint,
+        deltaX: Double = 0,
+        deltaY: Double = 0,
+        timestamp: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        self.type = type
+        self.location = location
+        self.deltaX = deltaX
+        self.deltaY = deltaY
+        self.timestamp = timestamp
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(type.rawValue)
+        hasher.combine(location.x)
+        hasher.combine(location.y)
+        hasher.combine(deltaX)
+        hasher.combine(deltaY)
+        hasher.combine(timestamp)
+    }
+}
+
+/// Deterministic decision produced by `CursorOverlayController`'s event-tap processor.
+public struct CursorTapEventDecision: Hashable, Sendable {
+    /// If non-nil, `CGEvent.location` is rewritten to this confined/compensated source CG point.
+    public var rewrittenEventLocation: CGPoint?
+    /// If non-nil, `CGWarpMouseCursorPosition` synchronizes the physical pointer to this CG point.
+    public var warpTarget: CGPoint?
+    /// Resulting effective source CG point (where the OS delivers clicks/scrolls).
+    public var effectiveSourcePoint: CGPoint
+    /// Resulting scaled visual cursor hotspot CG point on the overlay.
+    public var scaledCGPosition: CGPoint
+    /// True if the scaled cursor sprite should be visible after this event.
+    public var isScaledSpriteVisible: Bool
+    /// True if `PointerTracker` detected an active FPS/3D game mouse-grab.
+    public var isMouseGrabbedByGame: Bool
+    /// True if `confineCursor == false` and the physical pointer escaped outside `sourceRect`
+    /// (requiring native OS cursor restoration while outside).
+    public var isPointerOutsideUnconfinedSource: Bool
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(rewrittenEventLocation?.x)
+        hasher.combine(rewrittenEventLocation?.y)
+        hasher.combine(warpTarget?.x)
+        hasher.combine(warpTarget?.y)
+        hasher.combine(effectiveSourcePoint.x)
+        hasher.combine(effectiveSourcePoint.y)
+        hasher.combine(scaledCGPosition.x)
+        hasher.combine(scaledCGPosition.y)
+        hasher.combine(isScaledSpriteVisible)
+        hasher.combine(isMouseGrabbedByGame)
+        hasher.combine(isPointerOutsideUnconfinedSource)
+    }
+}
+
+/// Deterministic, unit-testable event-tap state machine powering `CursorOverlayController`.
+///
+/// Guarantees:
+/// - **Exact click & scroll alignment**: mouse button down/up, drags, and scroll-wheel events ALWAYS
+///   use the exact synchronized `virtualSourcePosition` matching the rendered scaled cursor sprite
+///   (never snapping back to stale uncompensated `incoming` coordinates!).
+/// - **Zero FPS grab false-positives**: every internal speed-compensation or edge-confinement warp calls
+///   `pointerTracker.recordSelfWarp(to:)` so normal desktop apps (e.g. Terminal) never trigger game grab.
+/// - **Multi-monitor unconfined escape**: when `confineCursor == false`, moving outside `sourceRect`
+///   restores the native OS cursor at 1:1 desktop speed until re-entering `sourceRect`.
+public struct CursorEventTapProcessor: Sendable {
+    public var pointerTracker = PointerTracker()
+    public var virtualSourcePosition: CGPoint?
+    public var pressedButtonsMask: UInt32 = 0
+    public var lastWarpedPoint: CGPoint?
+    public var lastWarpedTimestamp: TimeInterval = 0
+    public var isPointerOutsideUnconfinedSource: Bool = false
+
+    public init() {}
+
+    public mutating func reset(initialSourcePosition: CGPoint? = nil) {
+        pointerTracker.reset()
+        virtualSourcePosition = initialSourcePosition
+        pressedButtonsMask = 0
+        lastWarpedPoint = nil
+        lastWarpedTimestamp = 0
+        isPointerOutsideUnconfinedSource = false
+    }
+
+    public mutating func recordExternalWarp(to point: CGPoint, timestamp: TimeInterval) {
+        lastWarpedPoint = point
+        lastWarpedTimestamp = timestamp
+        virtualSourcePosition = point
+        pointerTracker.recordSelfWarp(to: point)
+    }
+
+    /// Processes a single event-tap event. Returns `nil` ONLY when the event is a benign self-warp
+    /// feedback echo (`mouseMoved` with zero delta right after our own `CGWarpMouseCursorPosition`).
+    public mutating func process(
+        input: CursorTapEventInput,
+        mapping: PointerMapping,
+        isHiddenForScreenshot: Bool = false,
+        isIdleHidden: Bool = false
+    ) -> CursorTapEventDecision? {
+        guard mapping.isValid else { return nil }
+        if mapping.isIdentity && !mapping.threeDGameMode {
+            return nil
+        }
+
+        let type = input.type
+        let incoming = input.location
+        let deltaX = input.deltaX
+        let deltaY = input.deltaY
+        let now = input.timestamp
+
+        // Update mouse button mask (pauses idle auto-hide while dragging).
+        switch type {
+        case .leftMouseDown: pressedButtonsMask |= (1 << 0)
+        case .leftMouseUp: pressedButtonsMask &= ~(1 << 0)
+        case .rightMouseDown: pressedButtonsMask |= (1 << 1)
+        case .rightMouseUp: pressedButtonsMask &= ~(1 << 1)
+        case .otherMouseDown: pressedButtonsMask |= (1 << 2)
+        case .otherMouseUp: pressedButtonsMask &= ~(1 << 2)
+        default: break
+        }
+
+        let hasDelta = abs(deltaX) > 0.001 || abs(deltaY) > 0.001
+
+        // Skip self-warp feedback echoes ONLY on zero-delta `.mouseMoved` — NEVER skip clicks, drags, or scroll!
+        if type == .mouseMoved && !hasDelta,
+           let warped = lastWarpedPoint,
+           now - lastWarpedTimestamp < 0.05,
+           hypot(incoming.x - warped.x, incoming.y - warped.y) < 1.0
+        {
+            return nil
+        }
+
+        let isMotionEvent = (
+            type == .mouseMoved ||
+            type == .leftMouseDragged ||
+            type == .rightMouseDragged ||
+            type == .otherMouseDragged
+        )
+
+        // Track FPS / 3D game mouse-grab strictly on motion events (button clicks have 0 delta by nature).
+        let grabbed: Bool
+        if mapping.settings.respectGameMouseGrab {
+            if isMotionEvent {
+                grabbed = pointerTracker.recordEvent(
+                    location: incoming,
+                    deltaX: deltaX,
+                    deltaY: deltaY,
+                    mapping: mapping,
+                    timestamp: now
+                )
+            } else {
+                grabbed = pointerTracker.isGrabbed
+            }
+        } else {
+            grabbed = false
+        }
+
+        var newEventLocation: CGPoint?
+        var warpTarget: CGPoint?
+        let effectiveSourcePoint: CGPoint
+
+        let enforceConfinement = mapping.settings.confineCursor || mapping.threeDGameMode
+
+        // When confinement is explicitly disabled and pointer already escaped outside sourceRect,
+        // keep 1:1 native OS cursor motion across other monitors until re-entering sourceRect.
+        if !enforceConfinement && isPointerOutsideUnconfinedSource && !mapping.isPointInsideSource(incoming) {
+            effectiveSourcePoint = incoming
+            virtualSourcePosition = incoming
+            isPointerOutsideUnconfinedSource = true
+            let scaledPos = mapping.mapSourceToScaled(effectiveSourcePoint, clampToContent: true)
+            return CursorTapEventDecision(
+                rewrittenEventLocation: nil,
+                warpTarget: nil,
+                effectiveSourcePoint: effectiveSourcePoint,
+                scaledCGPosition: scaledPos,
+                isScaledSpriteVisible: false,
+                isMouseGrabbedByGame: grabbed,
+                isPointerOutsideUnconfinedSource: true
+            )
+        }
+
+        if grabbed || mapping.threeDGameMode {
+            // Zero-delta-drift confinement: NEVER touch relative deltas or speed scaling!
+            if enforceConfinement {
+                let constrained = mapping.constrainSourcePoint(incoming)
+                if constrained.wasClamped {
+                    newEventLocation = constrained.point
+                    warpTarget = constrained.point
+                }
+                effectiveSourcePoint = constrained.point
+            } else {
+                effectiveSourcePoint = incoming
+            }
+            virtualSourcePosition = effectiveSourcePoint
+        } else if mapping.settings.adjustCursorSpeed && !mapping.isIdentity {
+            // Smooth 1 / scaleFactor speed compensation synchronized across motion, clicks, drags & scroll!
+            let base: CGPoint
+            if let existing = virtualSourcePosition {
+                base = existing
+            } else {
+                base = enforceConfinement ? mapping.constrainSourcePoint(incoming).point : incoming
+            }
+
+            let targetPos: CGPoint
+            if isMotionEvent && hasDelta {
+                let comp = mapping.speedCompensationScale
+                let rawNext = CGPoint(
+                    x: base.x + deltaX * comp.width,
+                    y: base.y + deltaY * comp.height
+                )
+                targetPos = enforceConfinement ? mapping.constrainSourcePoint(rawNext).point : rawNext
+            } else {
+                // Clicks (*MouseDown/*MouseUp), scrollWheel, and zero-delta motion MUST stay locked
+                // to `virtualSourcePosition` so the physical click ALWAYS hits the visual cursor hotspot!
+                targetPos = enforceConfinement ? mapping.constrainSourcePoint(base).point : base
+            }
+
+            virtualSourcePosition = targetPos
+            effectiveSourcePoint = targetPos
+            newEventLocation = targetPos
+
+            if hypot(incoming.x - targetPos.x, incoming.y - targetPos.y) >= 0.5 {
+                warpTarget = targetPos
+            }
+        } else {
+            // Standard zero-delta-drift confinement across ALL events (motion, clicks, drags, scroll).
+            if enforceConfinement {
+                let constrained = mapping.constrainSourcePoint(incoming)
+                if constrained.wasClamped {
+                    newEventLocation = constrained.point
+                    warpTarget = constrained.point
+                }
+                effectiveSourcePoint = constrained.point
+            } else {
+                effectiveSourcePoint = incoming
+            }
+            virtualSourcePosition = effectiveSourcePoint
+        }
+
+        isPointerOutsideUnconfinedSource = !enforceConfinement && !mapping.isPointInsideSource(effectiveSourcePoint)
+
+        if let wt = warpTarget {
+            lastWarpedPoint = wt
+            lastWarpedTimestamp = now
+            pointerTracker.recordSelfWarp(to: wt, rawIncoming: incoming)
+        }
+
+        let scaledPos = mapping.mapSourceToScaled(effectiveSourcePoint, clampToContent: true)
+        let spriteVisible = mapping.requiresScaledOverlayCursor
+            && !isHiddenForScreenshot
+            && !isIdleHidden
+            && !isPointerOutsideUnconfinedSource
+            && !(mapping.settings.respectGameMouseGrab && grabbed)
+
+        return CursorTapEventDecision(
+            rewrittenEventLocation: newEventLocation,
+            warpTarget: warpTarget,
+            effectiveSourcePoint: effectiveSourcePoint,
+            scaledCGPosition: scaledPos,
+            isScaledSpriteVisible: spriteVisible,
+            isMouseGrabbedByGame: grabbed,
+            isPointerOutsideUnconfinedSource: isPointerOutsideUnconfinedSource
+        )
     }
 }
 
@@ -83,6 +381,7 @@ public struct PointerTracker: Sendable {
 
     private var lastLocation: CGPoint?
     private var previousLocation: CGPoint?
+    private var lastSelfWarpRawIncoming: CGPoint?
     private var grabAnchor: CGPoint?
     private var lastWarpTimestamp: TimeInterval = 0
     private var releaseMoveCount: Int = 0
@@ -98,9 +397,21 @@ public struct PointerTracker: Sendable {
         warpToCenterCount = 0
         lastLocation = nil
         previousLocation = nil
+        lastSelfWarpRawIncoming = nil
         grabAnchor = nil
         lastWarpTimestamp = 0
         releaseMoveCount = 0
+    }
+
+    /// Updates reference location after `CursorOverlayController` itself calls `CGWarpMouseCursorPosition`
+    /// (for speed compensation or edge confinement). Stores `rawIncoming` so:
+    /// - Normal apps (which follow our warp and advance by `(deltaX, deltaY)`) NEVER false-positive as FPS grab.
+    /// - FPS games locking the cursor via `CGAssociateMouseAndMouseCursorPosition(false)` (where `location`
+    ///   remains pinned at `rawIncoming` ignoring BOTH deltas and warps) STILL trigger `isGrabbed = true`!
+    public mutating func recordSelfWarp(to point: CGPoint, rawIncoming: CGPoint? = nil) {
+        lastLocation = point
+        previousLocation = nil
+        lastSelfWarpRawIncoming = rawIncoming
     }
 
     /// Processes one mouse motion event and returns whether mouse-grab is currently active.
@@ -114,10 +425,12 @@ public struct PointerTracker: Sendable {
     ) -> Bool {
         let eps = 0.001
         let hasDelta = abs(deltaX) > eps || abs(deltaY) > eps
+        let prevRawIncoming = lastSelfWarpRawIncoming
 
         defer {
             previousLocation = lastLocation
             lastLocation = location
+            lastSelfWarpRawIncoming = nil
         }
 
         guard let last = lastLocation else {
@@ -149,8 +462,15 @@ public struct PointerTracker: Sendable {
         }
 
         // Case 1: Non-zero relative deltas while pointer coordinates remain stationary
-        // (characteristic of CGAssociateMouseAndMouseCursorPosition(false)).
-        if moveDist < 0.5 {
+        // (either unchanged from `lastLocation`, OR pinned identically at `prevRawIncoming` ignoring our self-warp —
+        // both are signatures of CGAssociateMouseAndMouseCursorPosition(false)!).
+        let pinnedAtPreWarpIncoming = prevRawIncoming.map {
+            hypot(location.x - $0.x, location.y - $0.y) < 0.5
+        } ?? false
+        let followedSelfWarpDelta = prevRawIncoming != nil &&
+            hypot(Double(movedX) - deltaX, Double(movedY) - deltaY) < max(0.75, hypot(deltaX, deltaY) * 0.35)
+
+        if (moveDist < 0.5 || pinnedAtPreWarpIncoming) && !followedSelfWarpDelta {
             if mapping.isDeltaPushingOutward(deltaX: deltaX, deltaY: deltaY, at: location) {
                 // Normal user pushing mouse against an edge; not a game mouse-grab.
                 stillEventCount = 0
@@ -556,6 +876,11 @@ private final class SystemCursorMirror {
 private final class NonActivatingCursorPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+    /// Never let AppKit shift the cursor overlay below the menu bar or clamp it onto the primary display
+    /// (critical for exact Y-alignment on primary displays AND negative-CG-Y / diagonal secondary monitors!).
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
 }
 
 @MainActor
@@ -738,20 +1063,18 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         var isSuspended: Bool = false
         var isHiddenForScreenshot: Bool = false
         var isUsingEventTap: Bool = false
+        var alignmentMode: CursorAlignmentMode = .inactive
         var presentationMode: CursorPresentationMode
         var configuration: CursorMappingConfiguration?
         var mapping: PointerMapping?
         var displays: [DisplayDescriptor] = []
-        var pointerTracker = PointerTracker()
+        var tapProcessor = CursorEventTapProcessor()
         var currentState = CursorOverlayState()
         var cachedCursorImage: CursorImageSnapshot?
         var latestRenderSnapshot = CursorRenderSnapshot()
         var onStateChange: (@Sendable (CursorOverlayState) -> Void)?
+        var onAlignmentModeChange: (@Sendable (CursorAlignmentMode) -> Void)?
         var lastActivityUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
-        var pressedButtonsMask: UInt32 = 0
-        var virtualSourcePosition: CGPoint?
-        var lastWarpedPoint: CGPoint?
-        var lastWarpedTimestamp: TimeInterval = 0
         var lastCursorShapeRefreshUptime: TimeInterval = 0
         var drawPending: Bool = false
         var recoveryToken: RunGuardWatchdog.RecoveryToken?
@@ -821,6 +1144,18 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         state.withLock(\.isUsingEventTap)
     }
 
+    /// Current cursor alignment operating mode (`.inactive`, `.identityPassthrough`,
+    /// `.scaledConfinedEventTap`, or `.accessibilityRequired`).
+    public var alignmentMode: CursorAlignmentMode {
+        state.withLock(\.alignmentMode)
+    }
+
+    /// True when the active session is scaling non-1:1 without Accessibility permission so macOS
+    /// cannot confine or align mouse clicks (UI should prompt the user to enable Accessibility!).
+    public var isAccessibilityRequiredForAlignment: Bool {
+        state.withLock { $0.alignmentMode == .accessibilityRequired }
+    }
+
     /// Latest render snapshot (state + `NSCursor.currentSystem` CGImage + hotspot geometry) for VRR Metal pass.
     public var latestRenderSnapshot: CursorRenderSnapshot {
         state.withLock(\.latestRenderSnapshot)
@@ -832,6 +1167,12 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     }
 
     // MARK: - Configuration & Output Mode Controls
+
+    /// Registers an optional callback fired whenever `alignmentMode` transitions (e.g. `.accessibilityRequired`
+    /// -> `.scaledConfinedEventTap` upon live Accessibility grant!).
+    public func setAlignmentModeHandler(_ handler: (@Sendable (CursorAlignmentMode) -> Void)?) {
+        state.withLock { $0.onAlignmentModeChange = handler }
+    }
 
     /// Switches between non-VRR `CALayer` sprite panel and VRR direct-scanout external compositor output.
     public func setPresentationMode(_ mode: CursorPresentationMode) {
@@ -868,7 +1209,16 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         let updatedConfig = state.withLock { s -> CursorMappingConfiguration? in
             s.displays = displays
             guard let config = s.configuration else { return nil }
-            s.mapping = PointerMapping(configuration: config, displays: displays)
+            let mapping = PointerMapping(configuration: config, displays: displays)
+            s.mapping = mapping
+            if let currentVirtual = s.tapProcessor.virtualSourcePosition {
+                let effective = mapping.settings.confineCursor && !mapping.isIdentity
+                    ? mapping.constrainSourcePoint(currentVirtual).point
+                    : currentVirtual
+                s.tapProcessor.virtualSourcePosition = effective
+                s.currentState.scaledCGPosition = mapping.mapSourceToScaled(effective, clampToContent: true)
+                s.latestRenderSnapshot.state = s.currentState
+            }
             return config
         }
         if updatedConfig != nil {
@@ -908,7 +1258,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     ) throws {
         stop()
 
-        let displays = Self.snapshotCurrentDisplays()
+        let existingDisplays = state.withLock(\.displays)
+        let displays = existingDisplays.isEmpty ? Self.snapshotCurrentDisplays() : existingDisplays
         let mapping = PointerMapping(configuration: configuration, displays: displays)
         let axGranted = AXIsProcessTrusted()
 
@@ -922,10 +1273,13 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
 
         let now = ProcessInfo.processInfo.systemUptime
         let initialPointer = Self.currentCGPointerLocation()
-        let clampedInitial = mapping.settings.confineCursor && !mapping.isIdentity
-            ? mapping.constrainSourcePoint(initialPointer).point
-            : initialPointer
-        let scaledInitial = mapping.mapSourceToScaled(clampedInitial, clampToContent: true)
+        let initialPlacement: (point: CGPoint, shouldWarp: Bool)
+        if (mapping.settings.confineCursor || configuration.threeDGameMode) && !mapping.isIdentity {
+            initialPlacement = mapping.safeInitialSourcePoint(from: initialPointer)
+        } else {
+            initialPlacement = (initialPointer, false)
+        }
+        let scaledInitial = mapping.mapSourceToScaled(initialPlacement.point, clampToContent: true)
 
         state.withLock { s in
             s.isActive = true
@@ -934,13 +1288,11 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.configuration = configuration
             s.displays = displays
             s.mapping = mapping
-            s.pointerTracker.reset()
+            s.tapProcessor.reset(initialSourcePosition: initialPlacement.point)
             s.onStateChange = onStateChange
             s.lastActivityUptime = now
-            s.pressedButtonsMask = 0
-            s.virtualSourcePosition = clampedInitial
-            s.lastWarpedPoint = nil
             s.recoveryToken = recoveryToken
+            s.alignmentMode = .inactive
             s.currentState = CursorOverlayState(
                 isVisible: false,
                 scaledCGPosition: scaledInitial,
@@ -953,12 +1305,14 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 image: s.cachedCursorImage,
                 spriteGeometry: nil,
                 interpolation: configuration.settings.interpolation,
-                presentationMode: s.presentationMode
+                presentationMode: s.presentationMode,
+                alignmentMode: .inactive
             )
         }
 
         if mapping.isIdentity && !configuration.threeDGameMode {
             // 1:1 Identity passthrough: zero Accessibility requirement, zero event tap, native OS cursor.
+            setAlignmentMode(.identityPassthrough)
             PipelineLog.shared.info(.cursor, "CursorOverlayController started in 1:1 identity passthrough mode (no Accessibility needed).")
             notifyStateChange()
             return
@@ -971,54 +1325,78 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 if !tapStarted {
                     PipelineLog.shared.warning(
                         .cursor,
-                        "CGEventTap creation failed despite Accessibility trust; falling back to cursor-tracking-only mode."
+                        "CGEventTap creation failed despite Accessibility trust; keeping native OS cursor visible and reporting accessibilityRequired."
                     )
                 }
             } else {
                 PipelineLog.shared.warning(
                     .cursor,
-                    "Accessibility permission denied; CursorOverlayController falling back to cursor-tracking-only mode (OS cursor remains visible)."
+                    "Accessibility permission denied for non-1:1 scaling; keeping native OS cursor visible and hiding scaled sprite to avoid misaligned clicks."
                 )
             }
         }
 
         let didStartTap = tapStarted
+        let resolvedMode: CursorAlignmentMode = didStartTap
+            ? .scaledConfinedEventTap
+            : (mapping.requiresEventTap ? .accessibilityRequired : .identityPassthrough)
+
         state.withLock { s in
             s.isUsingEventTap = didStartTap
+            s.alignmentMode = resolvedMode
+            s.latestRenderSnapshot.alignmentMode = resolvedMode
             if didStartTap && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode) {
+                if !mapping.settings.confineCursor && !configuration.threeDGameMode {
+                    s.tapProcessor.isPointerOutsideUnconfinedSource = !mapping.isPointInsideSource(initialPlacement.point)
+                }
                 Self.recomputeVisibilityLocked(&s)
             } else {
+                // NEVER draw a misleading remapped cursor sprite when OS clicks cannot be confined/aligned!
                 s.currentState.isVisible = false
-                s.latestRenderSnapshot.state = s.currentState
             }
+            s.latestRenderSnapshot.state = s.currentState
         }
 
-        if tapStarted && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode) {
-            cursorHider.hide()
-            if mapping.settings.confineCursor {
-                let constrained = mapping.constrainSourcePoint(initialPointer)
-                if constrained.wasClamped {
-                    recordWarp(constrained.point)
-                    CGWarpMouseCursorPosition(constrained.point)
-                }
+        if didStartTap && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode) {
+            let outsideUnconfined = state.withLock(\.tapProcessor.isPointerOutsideUnconfinedSource)
+            if !outsideUnconfined {
+                cursorHider.hide()
             }
+            if (mapping.settings.confineCursor || configuration.threeDGameMode) && initialPlacement.shouldWarp {
+                recordWarp(initialPlacement.point)
+                CGWarpMouseCursorPosition(initialPlacement.point)
+            }
+        } else {
+            cursorHider.show()
+            hideSpritePanelOnMain()
         }
 
-        startMaintenanceTimer(pollingMode: !tapStarted)
-        scheduleVisualUpdate(refreshCursorShape: true)
+        startMaintenanceTimer(pollingMode: !didStartTap)
+        if didStartTap {
+            scheduleVisualUpdate(refreshCursorShape: true)
+        }
+        notifyAlignmentMode(resolvedMode)
         notifyStateChange()
 
         PipelineLog.shared.info(
             .cursor,
-            "CursorOverlayController started (eventTap: \(tapStarted), identity: \(mapping.isIdentity), 3DMode: \(configuration.threeDGameMode), scale: \(String(format: "%.2fx", mapping.averageScale)))."
+            "CursorOverlayController started (mode: \(resolvedMode.rawValue), eventTap: \(didStartTap), identity: \(mapping.isIdentity), 3DMode: \(configuration.threeDGameMode), scale: \(String(format: "%.2fx", mapping.averageScale)))."
         )
     }
 
     public func update(configuration: CursorMappingConfiguration) {
-        let transition = state.withLock { s -> (active: Bool, needsTapChange: Bool, shouldHaveTap: Bool, shouldHideOS: Bool)? in
+        let transition = state.withLock { s -> (
+            active: Bool,
+            needsTapChange: Bool,
+            shouldHaveTap: Bool,
+            shouldHideOS: Bool,
+            mapping: PointerMapping,
+            prevMode: CursorAlignmentMode
+        )? in
             guard s.isActive else { return nil }
             let displays = s.displays.isEmpty ? Self.snapshotCurrentDisplays() : s.displays
             let mapping = PointerMapping(configuration: configuration, displays: displays)
+            let prevMode = s.alignmentMode
             s.configuration = configuration
             s.displays = displays
             s.mapping = mapping
@@ -1030,26 +1408,22 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             let needsTapChange = (shouldHaveTap != s.isUsingEventTap)
             let shouldHideOS = !s.isSuspended && shouldHaveTap && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode)
 
-            if !shouldHideOS {
-                s.currentState.isVisible = false
-            } else {
-                Self.recomputeVisibilityLocked(&s)
-            }
-            s.latestRenderSnapshot.state = s.currentState
-            return (true, needsTapChange, shouldHaveTap, shouldHideOS)
+            return (true, needsTapChange, shouldHaveTap, shouldHideOS, mapping, prevMode)
         }
 
         guard let transition, transition.active else { return }
 
+        var justStartedTap = false
         if transition.needsTapChange {
             if transition.shouldHaveTap {
                 let started = startEventTapThread()
+                justStartedTap = started
                 state.withLock { $0.isUsingEventTap = started }
                 startMaintenanceTimer(pollingMode: !started)
             } else {
                 stopEventTapThread()
                 state.withLock { $0.isUsingEventTap = false }
-                let stillScaled = state.withLock { !($0.mapping?.isIdentity ?? true) }
+                let stillScaled = !transition.mapping.isIdentity
                 if stillScaled {
                     startMaintenanceTimer(pollingMode: true)
                 } else {
@@ -1058,13 +1432,90 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             }
         }
 
-        if transition.shouldHideOS && state.withLock(\.isUsingEventTap) {
-            cursorHider.hide()
+        let tapActive = state.withLock(\.isUsingEventTap)
+        let resolvedMode: CursorAlignmentMode
+        if transition.mapping.isIdentity && !configuration.threeDGameMode {
+            resolvedMode = .identityPassthrough
+        } else if tapActive {
+            resolvedMode = .scaledConfinedEventTap
+        } else if transition.mapping.requiresEventTap {
+            resolvedMode = .accessibilityRequired
         } else {
-            cursorHider.show()
+            resolvedMode = .identityPassthrough
         }
 
-        scheduleVisualUpdate(refreshCursorShape: true)
+        let startedTapNow = justStartedTap
+        let warpPoint: CGPoint? = state.withLock { s in
+            s.alignmentMode = resolvedMode
+            s.latestRenderSnapshot.alignmentMode = resolvedMode
+
+            let mapping = transition.mapping
+            let enforceConfinement = mapping.settings.confineCursor || configuration.threeDGameMode
+
+            var pendingWarp: CGPoint? = nil
+            if tapActive && !s.isSuspended && !mapping.isIdentity {
+                let currentRef = startedTapNow
+                    ? Self.currentCGPointerLocation()
+                    : (s.tapProcessor.virtualSourcePosition ?? Self.currentCGPointerLocation())
+
+                if enforceConfinement {
+                    if startedTapNow {
+                        let placed = mapping.safeInitialSourcePoint(from: currentRef)
+                        s.tapProcessor.virtualSourcePosition = placed.point
+                        if placed.shouldWarp {
+                            pendingWarp = placed.point
+                        }
+                    } else {
+                        let constrained = mapping.constrainSourcePoint(currentRef)
+                        s.tapProcessor.virtualSourcePosition = constrained.point
+                        if constrained.wasClamped {
+                            pendingWarp = constrained.point
+                        }
+                    }
+                    s.tapProcessor.isPointerOutsideUnconfinedSource = false
+                } else {
+                    s.tapProcessor.virtualSourcePosition = currentRef
+                    s.tapProcessor.isPointerOutsideUnconfinedSource = !mapping.isPointInsideSource(currentRef)
+                }
+
+                let finalSource = s.tapProcessor.virtualSourcePosition ?? currentRef
+                s.currentState.scaledCGPosition = mapping.mapSourceToScaled(finalSource, clampToContent: true)
+                Self.recomputeVisibilityLocked(&s)
+            } else {
+                let curPtr = Self.currentCGPointerLocation()
+                s.tapProcessor.virtualSourcePosition = curPtr
+                s.tapProcessor.isPointerOutsideUnconfinedSource = false
+                s.currentState.scaledCGPosition = mapping.mapSourceToScaled(curPtr, clampToContent: true)
+                s.currentState.isVisible = false
+            }
+
+            s.latestRenderSnapshot.state = s.currentState
+            if let img = s.cachedCursorImage {
+                s.latestRenderSnapshot.spriteGeometry = mapping.spriteGeometry(
+                    forScaledPoint: s.currentState.scaledCGPosition,
+                    cursorPointSize: img.pointSize,
+                    hotSpot: img.hotSpot
+                )
+            }
+            return pendingWarp
+        }
+
+        let outsideUnconfined = state.withLock(\.tapProcessor.isPointerOutsideUnconfinedSource)
+        if transition.shouldHideOS && tapActive && !outsideUnconfined {
+            cursorHider.hide()
+            if let wp = warpPoint {
+                recordWarp(wp)
+                CGWarpMouseCursorPosition(wp)
+            }
+            scheduleVisualUpdate(refreshCursorShape: true)
+        } else {
+            cursorHider.show()
+            hideSpritePanelOnMain()
+        }
+
+        if resolvedMode != transition.prevMode {
+            notifyAlignmentMode(resolvedMode)
+        }
         notifyStateChange()
     }
 
@@ -1075,8 +1526,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.currentState.isVisible = false
             s.currentState.isMouseGrabbedByGame = false
             s.currentState.isIdleHidden = false
-            s.pointerTracker.reset()
-            s.pressedButtonsMask = 0
+            s.tapProcessor.reset()
             s.latestRenderSnapshot.state = s.currentState
             return true
         }
@@ -1092,25 +1542,32 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     }
 
     public func resume() {
-        let resumeInfo = state.withLock { s -> (shouldTap: Bool, shouldHideOS: Bool, mapping: PointerMapping)? in
+        let resumeInfo = state.withLock { s -> (
+            shouldTap: Bool,
+            shouldHideOS: Bool,
+            mapping: PointerMapping,
+            placement: (point: CGPoint, shouldWarp: Bool),
+            prevMode: CursorAlignmentMode
+        )? in
             guard s.isActive, s.isSuspended, let mapping = s.mapping else { return nil }
+            let prevMode = s.alignmentMode
             s.isSuspended = false
             s.lastActivityUptime = ProcessInfo.processInfo.systemUptime
             s.currentState.isIdleHidden = false
-            s.pointerTracker.reset()
-            s.pressedButtonsMask = 0
 
             let currentPtr = Self.currentCGPointerLocation()
-            let clamped = mapping.settings.confineCursor && !mapping.isIdentity
-                ? mapping.constrainSourcePoint(currentPtr).point
-                : currentPtr
-            s.virtualSourcePosition = clamped
-            s.currentState.scaledCGPosition = mapping.mapSourceToScaled(clamped, clampToContent: true)
+            let enforceConfinement = (mapping.settings.confineCursor || mapping.threeDGameMode) && !mapping.isIdentity
+            let placement: (point: CGPoint, shouldWarp: Bool) = enforceConfinement
+                ? mapping.safeInitialSourcePoint(from: currentPtr)
+                : (point: currentPtr, shouldWarp: false)
+
+            s.tapProcessor.reset(initialSourcePosition: placement.point)
+            s.currentState.scaledCGPosition = mapping.mapSourceToScaled(placement.point, clampToContent: true)
 
             let axGranted = AXIsProcessTrusted()
             let shouldTap = mapping.requiresEventTap && axGranted
             let shouldHideOS = shouldTap && (mapping.requiresScaledOverlayCursor || mapping.threeDGameMode)
-            return (shouldTap, shouldHideOS, mapping)
+            return (shouldTap, shouldHideOS, mapping, placement, prevMode)
         }
 
         guard let resumeInfo else { return }
@@ -1125,44 +1582,65 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         let tapActive = state.withLock(\.isUsingEventTap)
-        if resumeInfo.shouldHideOS && tapActive {
-            cursorHider.hide()
-            if resumeInfo.mapping.settings.confineCursor {
-                let currentPtr = Self.currentCGPointerLocation()
-                let constrained = resumeInfo.mapping.constrainSourcePoint(currentPtr)
-                if constrained.wasClamped {
-                    recordWarp(constrained.point)
-                    CGWarpMouseCursorPosition(constrained.point)
-                }
-            }
-            state.withLock { s in
-                Self.recomputeVisibilityLocked(&s)
-                s.latestRenderSnapshot.state = s.currentState
-            }
+        let resolvedMode: CursorAlignmentMode
+        if resumeInfo.mapping.isIdentity && !resumeInfo.mapping.threeDGameMode {
+            resolvedMode = .identityPassthrough
+        } else if tapActive {
+            resolvedMode = .scaledConfinedEventTap
+        } else if resumeInfo.mapping.requiresEventTap {
+            resolvedMode = .accessibilityRequired
         } else {
-            cursorHider.show()
+            resolvedMode = .identityPassthrough
         }
 
-        scheduleVisualUpdate(refreshCursorShape: true)
+        state.withLock { s in
+            s.alignmentMode = resolvedMode
+            s.latestRenderSnapshot.alignmentMode = resolvedMode
+            if !resumeInfo.mapping.settings.confineCursor && !resumeInfo.mapping.threeDGameMode {
+                s.tapProcessor.isPointerOutsideUnconfinedSource = !resumeInfo.mapping.isPointInsideSource(resumeInfo.placement.point)
+            }
+            if resumeInfo.shouldHideOS && tapActive {
+                Self.recomputeVisibilityLocked(&s)
+            } else {
+                s.currentState.isVisible = false
+            }
+            s.latestRenderSnapshot.state = s.currentState
+        }
+
+        let outsideUnconfined = state.withLock(\.tapProcessor.isPointerOutsideUnconfinedSource)
+        if resumeInfo.shouldHideOS && tapActive && !outsideUnconfined {
+            cursorHider.hide()
+            if (resumeInfo.mapping.settings.confineCursor || resumeInfo.mapping.threeDGameMode) && resumeInfo.placement.shouldWarp {
+                recordWarp(resumeInfo.placement.point)
+                CGWarpMouseCursorPosition(resumeInfo.placement.point)
+            }
+            scheduleVisualUpdate(refreshCursorShape: true)
+        } else {
+            cursorHider.show()
+            hideSpritePanelOnMain()
+        }
+
+        if resolvedMode != resumeInfo.prevMode {
+            notifyAlignmentMode(resolvedMode)
+        }
         notifyStateChange()
-        PipelineLog.shared.debug(.cursor, "CursorOverlayController resumed.")
+        PipelineLog.shared.debug(.cursor, "CursorOverlayController resumed (mode: \(resolvedMode.rawValue)).")
     }
 
     public func stop() {
-        let cleanup = state.withLock { s -> (wasActive: Bool, token: RunGuardWatchdog.RecoveryToken?) in
+        let cleanup = state.withLock { s -> (wasActive: Bool, prevMode: CursorAlignmentMode, token: RunGuardWatchdog.RecoveryToken?) in
             let wasActive = s.isActive
+            let prevMode = s.alignmentMode
             let token = s.recoveryToken
             s.isActive = false
             s.isSuspended = false
             s.isUsingEventTap = false
+            s.alignmentMode = .inactive
             s.isHiddenForScreenshot = false
             s.configuration = nil
             s.mapping = nil
             s.onStateChange = nil
-            s.pointerTracker.reset()
-            s.pressedButtonsMask = 0
-            s.virtualSourcePosition = nil
-            s.lastWarpedPoint = nil
+            s.tapProcessor.reset()
             s.recoveryToken = nil
             s.overlayWindowID = nil
             s.drawPending = false
@@ -1172,9 +1650,10 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 image: nil,
                 spriteGeometry: nil,
                 interpolation: .bilinear,
-                presentationMode: s.presentationMode
+                presentationMode: s.presentationMode,
+                alignmentMode: .inactive
             )
-            return (wasActive, token)
+            return (wasActive, prevMode, token)
         }
 
         if let token = cleanup.token {
@@ -1205,6 +1684,10 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                     }
                 }
             }
+        }
+
+        if cleanup.prevMode != .inactive {
+            notifyAlignmentMode(.inactive)
         }
 
         if cleanup.wasActive {
@@ -1383,7 +1866,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
     }
 
-    // MARK: - Event Tap Processing (Zero-Delta-Drift + Optional Speed Compensation)
+    // MARK: - Event Tap Processing (Zero-Delta-Drift + Synchronized Speed Compensation)
 
     private func handleEventTap(
         proxy: CGEventTapProxy,
@@ -1392,15 +1875,23 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     ) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if !AXIsProcessTrusted() {
-                PipelineLog.shared.warning(.cursor, "Accessibility trust revoked mid-session; restoring OS cursor and switching to tracking-only mode.")
+                PipelineLog.shared.warning(.cursor, "Accessibility trust revoked mid-session; restoring OS cursor and switching to accessibilityRequired mode.")
                 cursorHider.show()
-                state.withLock { s in
+                let changedToAXRequired = state.withLock { s -> Bool in
+                    let prev = s.alignmentMode
                     s.isUsingEventTap = false
+                    s.alignmentMode = .accessibilityRequired
                     s.currentState.isVisible = false
+                    s.latestRenderSnapshot.alignmentMode = .accessibilityRequired
                     s.latestRenderSnapshot.state = s.currentState
+                    return prev != .accessibilityRequired
                 }
                 hideSpritePanelOnMain()
                 startMaintenanceTimer(pollingMode: true)
+                if changedToAXRequired {
+                    notifyAlignmentMode(.accessibilityRequired)
+                }
+                notifyStateChange()
                 return Unmanaged.passUnretained(event)
             }
 
@@ -1412,9 +1903,13 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         let now = ProcessInfo.processInfo.systemUptime
-        let incoming = event.location
-        let deltaX = event.getDoubleValueField(.mouseEventDeltaX)
-        let deltaY = event.getDoubleValueField(.mouseEventDeltaY)
+        let tapInput = CursorTapEventInput(
+            type: type,
+            location: event.location,
+            deltaX: event.getDoubleValueField(.mouseEventDeltaX),
+            deltaY: event.getDoubleValueField(.mouseEventDeltaY),
+            timestamp: now
+        )
 
         enum TapAction {
             case passthrough
@@ -1422,7 +1917,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 newEventLocation: CGPoint?,
                 warpTarget: CGPoint?,
                 shouldNotify: Bool,
-                refreshShape: Bool
+                refreshShape: Bool,
+                osCursorHideTransition: Bool?
             )
         }
 
@@ -1435,110 +1931,20 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 return .passthrough
             }
 
-            // Update mouse button mask (pauses idle auto-hide during mouse drags).
-            switch type {
-            case .leftMouseDown: s.pressedButtonsMask |= (1 << 0)
-            case .leftMouseUp: s.pressedButtonsMask &= ~(1 << 0)
-            case .rightMouseDown: s.pressedButtonsMask |= (1 << 1)
-            case .rightMouseUp: s.pressedButtonsMask &= ~(1 << 1)
-            case .otherMouseDown: s.pressedButtonsMask |= (1 << 2)
-            case .otherMouseUp: s.pressedButtonsMask &= ~(1 << 2)
-            case .scrollWheel:
-                s.lastActivityUptime = now
-                if s.currentState.isIdleHidden {
-                    s.currentState.isIdleHidden = false
-                    Self.recomputeVisibilityLocked(&s)
-                    s.latestRenderSnapshot.state = s.currentState
-                    return .update(newEventLocation: nil, warpTarget: nil, shouldNotify: true, refreshShape: false)
-                }
-                return .passthrough
-            default:
-                break
-            }
-
-            // Skip self-warp feedback events (identical location with zero delta right after our own warp).
-            if abs(deltaX) < 0.001 && abs(deltaY) < 0.001,
-               let warped = s.lastWarpedPoint,
-               now - s.lastWarpedTimestamp < 0.05,
-               hypot(incoming.x - warped.x, incoming.y - warped.y) < 1.0
-            {
+            let wasOutsideUnconfined = s.tapProcessor.isPointerOutsideUnconfinedSource
+            guard let decision = s.tapProcessor.process(
+                input: tapInput,
+                mapping: mapping,
+                isHiddenForScreenshot: s.isHiddenForScreenshot,
+                isIdleHidden: false
+            ) else {
                 return .passthrough
             }
-
-            // Track FPS / 3D game mouse-grab state.
-            let grabbed: Bool
-            if mapping.settings.respectGameMouseGrab {
-                grabbed = s.pointerTracker.recordEvent(
-                    location: incoming,
-                    deltaX: deltaX,
-                    deltaY: deltaY,
-                    mapping: mapping,
-                    timestamp: now
-                )
-            } else {
-                grabbed = false
-            }
-
-            var newEventLocation: CGPoint?
-            var warpTarget: CGPoint?
-            let effectiveSourcePoint: CGPoint
-
-            let isMotionEvent = (type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged)
-            let hasDelta = abs(deltaX) > 0.001 || abs(deltaY) > 0.001
-
-            if grabbed || mapping.threeDGameMode {
-                // Zero-delta-drift confinement: NEVER touch relative deltas or speed scaling!
-                if mapping.settings.confineCursor {
-                    let constrained = mapping.constrainSourcePoint(incoming)
-                    if constrained.wasClamped {
-                        newEventLocation = constrained.point
-                        warpTarget = constrained.point
-                    }
-                    effectiveSourcePoint = constrained.point
-                } else {
-                    effectiveSourcePoint = incoming
-                }
-                s.virtualSourcePosition = effectiveSourcePoint
-            } else if mapping.settings.adjustCursorSpeed && !mapping.isIdentity && isMotionEvent && hasDelta {
-                // Smooth 1 / scaleFactor cursor speed compensation inside the event tap
-                // without ever mutating global macOS pointer speed preferences!
-                let base = s.virtualSourcePosition ?? incoming
-                let comp = mapping.speedCompensationScale
-                var nextPos = CGPoint(
-                    x: base.x + deltaX * comp.width,
-                    y: base.y + deltaY * comp.height
-                )
-                if mapping.settings.confineCursor {
-                    nextPos = mapping.constrainSourcePoint(nextPos).point
-                }
-                s.virtualSourcePosition = nextPos
-                effectiveSourcePoint = nextPos
-                newEventLocation = nextPos
-
-                if hypot(incoming.x - nextPos.x, incoming.y - nextPos.y) >= 0.75 {
-                    warpTarget = nextPos
-                }
-            } else {
-                // Standard zero-delta-drift confinement (MetalGoose architecture).
-                if mapping.settings.confineCursor {
-                    let constrained = mapping.constrainSourcePoint(incoming)
-                    if constrained.wasClamped {
-                        newEventLocation = constrained.point
-                        warpTarget = constrained.point
-                    }
-                    effectiveSourcePoint = constrained.point
-                } else {
-                    effectiveSourcePoint = incoming
-                }
-                s.virtualSourcePosition = effectiveSourcePoint
-            }
-
-            let scaledPos = mapping.mapSourceToScaled(effectiveSourcePoint, clampToContent: true)
 
             s.lastActivityUptime = now
             s.currentState.isIdleHidden = false
-            s.currentState.isMouseGrabbedByGame = grabbed
-            s.currentState.scaledCGPosition = scaledPos
+            s.currentState.isMouseGrabbedByGame = decision.isMouseGrabbedByGame
+            s.currentState.scaledCGPosition = decision.scaledCGPosition
             s.currentState.scaleFactor = mapping.effectiveCursorScaleFactor
             Self.recomputeVisibilityLocked(&s)
 
@@ -1546,7 +1952,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.latestRenderSnapshot.state = s.currentState
             if let img = s.cachedCursorImage {
                 s.latestRenderSnapshot.spriteGeometry = mapping.spriteGeometry(
-                    forScaledPoint: scaledPos,
+                    forScaledPoint: decision.scaledCGPosition,
                     cursorPointSize: img.pointSize,
                     hotSpot: img.hotSpot
                 )
@@ -1557,16 +1963,19 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 s.lastCursorShapeRefreshUptime = now
             }
 
-            if let wt = warpTarget {
-                s.lastWarpedPoint = wt
-                s.lastWarpedTimestamp = now
+            let osCursorHideTransition: Bool?
+            if wasOutsideUnconfined != decision.isPointerOutsideUnconfinedSource {
+                osCursorHideTransition = !decision.isPointerOutsideUnconfinedSource
+            } else {
+                osCursorHideTransition = nil
             }
 
             return .update(
-                newEventLocation: newEventLocation,
-                warpTarget: warpTarget,
+                newEventLocation: decision.rewrittenEventLocation,
+                warpTarget: decision.warpTarget,
                 shouldNotify: true,
-                refreshShape: refreshShape
+                refreshShape: refreshShape,
+                osCursorHideTransition: osCursorHideTransition
             )
         }
 
@@ -1574,13 +1983,20 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         case .passthrough:
             return Unmanaged.passUnretained(event)
 
-        case .update(let newEventLocation, let warpTarget, let shouldNotify, let refreshShape):
+        case .update(let newEventLocation, let warpTarget, let shouldNotify, let refreshShape, let osCursorHideTransition):
             if let loc = newEventLocation {
                 // Update event location only; NEVER mutate mouseEventDeltaX / mouseEventDeltaY!
                 event.location = loc
             }
             if let target = warpTarget {
                 CGWarpMouseCursorPosition(target)
+            }
+            if let shouldHide = osCursorHideTransition {
+                if shouldHide {
+                    cursorHider.hide()
+                } else {
+                    cursorHider.show()
+                }
             }
             if shouldNotify {
                 scheduleVisualUpdate(refreshCursorShape: refreshShape)
@@ -1623,7 +2039,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         let now = ProcessInfo.processInfo.systemUptime
 
         if pollingMode {
-            // Accessibility denied fallback: publish accurate mapped cursor state without hiding OS cursor.
+            // Accessibility denied fallback: keep native OS cursor visible and scaled sprite strictly hidden
+            // so MetalPie NEVER renders a misleading remapped cursor that disagrees with where OS clicks land.
             let pointer = Self.currentCGPointerLocation()
             let changed = state.withLock { s -> Bool in
                 guard s.isActive, !s.isSuspended, let mapping = s.mapping, mapping.isValid else {
@@ -1651,7 +2068,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
 
             var idleChanged = false
             if let idleTimeout = mapping.settings.hideOnIdleSeconds,
-               s.pressedButtonsMask == 0,
+               s.tapProcessor.pressedButtonsMask == 0,
                !s.currentState.isIdleHidden
             {
                 if (now - s.lastActivityUptime) >= idleTimeout {
@@ -1662,7 +2079,9 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 }
             }
 
-            let shouldCheckDrift = s.isUsingEventTap && (mapping.requiresScaledOverlayCursor || mapping.threeDGameMode)
+            let shouldCheckDrift = s.isUsingEventTap
+                && !s.tapProcessor.isPointerOutsideUnconfinedSource
+                && (mapping.requiresScaledOverlayCursor || mapping.threeDGameMode)
             return (idleChanged, shouldCheckDrift)
         }
 
@@ -1797,9 +2216,25 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     private func recordWarp(_ point: CGPoint) {
         let now = ProcessInfo.processInfo.systemUptime
         state.withLock { s in
-            s.lastWarpedPoint = point
-            s.lastWarpedTimestamp = now
+            s.tapProcessor.recordExternalWarp(to: point, timestamp: now)
         }
+    }
+
+    private func setAlignmentMode(_ mode: CursorAlignmentMode) {
+        let changed = state.withLock { s -> Bool in
+            let prev = s.alignmentMode
+            s.alignmentMode = mode
+            s.latestRenderSnapshot.alignmentMode = mode
+            return prev != mode
+        }
+        if changed {
+            notifyAlignmentMode(mode)
+        }
+    }
+
+    private func notifyAlignmentMode(_ mode: CursorAlignmentMode) {
+        let cb = state.withLock(\.onAlignmentModeChange)
+        cb?(mode)
     }
 
     private func notifyStateChange() {
@@ -1814,7 +2249,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
               s.isUsingEventTap,
               mapping.requiresScaledOverlayCursor,
               !s.isHiddenForScreenshot,
-              !s.currentState.isIdleHidden
+              !s.currentState.isIdleHidden,
+              !s.tapProcessor.isPointerOutsideUnconfinedSource
         else {
             s.currentState.isVisible = false
             return

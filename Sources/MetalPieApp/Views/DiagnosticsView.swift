@@ -13,7 +13,7 @@ private enum BenchmarkResolutionPreset: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .p720to1440: return "720p → 1440p (2×)"
+        case .p720to1440: return "720p → 2K (2×)"
         case .p1080to4K: return "1080p → 4K (2×)"
         case .p360to720: return "360p → 720p (2×)"
         }
@@ -36,8 +36,7 @@ private enum BenchmarkResolutionPreset: String, CaseIterable, Identifiable {
     }
 }
 
-/// System & GPU Capabilities, Connected Displays table, Shader Binary Archive management,
-/// One-Click Real Apple Silicon GPU Shader Benchmark, and interactive `PipelineLog` Console!
+/// Hardware & Multi-Monitor Inspector, One-Click 30-Shader GPU Benchmark, Shader Cache & Logs (`显卡测速` / `Benchmark`).
 struct DiagnosticsView: View {
     @Bindable var coordinator: AppCoordinator
 
@@ -58,16 +57,17 @@ struct DiagnosticsView: View {
 
     var body: some View {
         let l10n = coordinator.l10n
+        let effectCount = EffectID.allCases.count
 
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(l10n.tr("Diagnostics, GPU Capabilities & Benchmark", "系统诊断、硬件能力与 GPU 基准测试"))
+                        Text(l10n.tr("GPU Benchmark & Hardware Info", "显卡测速与硬件信息"))
                             .font(.system(size: 22, weight: .bold))
                         Text(l10n.tr(
-                            "Inspect Apple Silicon Metal / MetalFX / VideoToolbox ML capabilities, benchmark all 22 built-in shaders, and inspect PipelineLog.",
-                            "查看 Apple Silicon Metal / MetalFX / VideoToolbox ML 硬件加速支持、一键实测全部 22 个内置着色器耗时，并实时检索管线日志。"
+                            "Check your Apple Silicon GPU, connected multi-monitor setup, benchmark all \(effectCount) shaders, and inspect logs.",
+                            "查看本机芯片与多显示器状态、一键实测全部 \(effectCount) 种画质算法的帧率表现，并查看运行日志。"
                         ))
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
@@ -75,9 +75,9 @@ struct DiagnosticsView: View {
 
                     hardwareCapabilitiesCard(l10n: l10n)
                     connectedDisplaysCard(l10n: l10n)
-                    shaderBinaryCacheCard(l10n: l10n)
                     gpuBenchmarkCard(l10n: l10n)
                         .id("gpuBenchmarkCard")
+                    shaderBinaryCacheCard(l10n: l10n)
                     pipelineLogConsoleCard(l10n: l10n)
                 }
                 .padding(20)
@@ -112,40 +112,44 @@ struct DiagnosticsView: View {
         let columns = [GridItem(.adaptive(minimum: 205), spacing: 10)]
 
         return SectionCard(
-            title: l10n.tr("Apple Silicon GPU & ML Capabilities", "Apple Silicon GPU 与神经网络加速能力"),
+            title: l10n.tr("Apple Silicon GPU & Hardware Features", "芯片显卡与硬件加速"),
             subtitle: cap.macOSVersionString,
             symbol: "cpu.fill",
             accent: .cyan
         ) {
             LazyVGrid(columns: columns, spacing: 10) {
                 capabilityTile(
-                    title: l10n.tr("Metal GPU", "Metal 显卡"),
+                    title: l10n.tr("Graphics (GPU)", "图形处理器"),
                     value: cap.gpuName,
                     detail: "\(cap.recommendedWorkingSetMB) MB \(l10n.tr("Unified Memory", "统一内存"))",
                     ok: true
                 )
                 capabilityTile(
-                    title: l10n.tr("Metal Family", "Metal 架构"),
+                    title: l10n.tr("Metal Support", "Metal 支持"),
                     value: cap.supportsMetal4 ? "Metal 4 + Metal 3" : (cap.supportsMetal3 ? "Metal 3" : "Metal 2"),
-                    detail: l10n.tr("TBDR Compute & Render", "TBDR 分块计算渲染"),
+                    detail: l10n.tr("GPU Shader Pipeline", "支持全部实时画质算法"),
                     ok: cap.supportsMetal3
                 )
                 capabilityTile(
-                    title: "MTLFXSpatialScaler",
+                    title: l10n.tr("MetalFX Upscaler", "MetalFX 硬件超分"),
                     value: cap.supportsMetalFXSpatial ? l10n.tr("SDR + HDR Ready", "支持 SDR 与 HDR") : l10n.tr("Unavailable", "不支持"),
-                    detail: l10n.tr("Hardware Spatial Upscaler", "硬件级空间超分"),
+                    detail: l10n.tr("Apple Hardware Spatial Upscaling", "Apple 芯片原生硬件超分"),
                     ok: cap.supportsMetalFXSpatial
                 )
                 capabilityTile(
-                    title: l10n.tr("VideoToolbox ML FG", "VideoToolbox ML 帧生成"),
-                    value: cap.supportsVTFrameInterpolation ? l10n.tr("ANE 2× / 4× Active", "神经引擎 2× / 4× 就绪") : l10n.tr("Optical Flow Fallback", "使用 Metal 光流回退"),
-                    detail: l10n.tr("Low-Latency Frame Interp", "低延迟 AI 插帧 (macOS 26+)"),
+                    title: l10n.tr("Hardware Frame Gen", "硬件流畅补帧"),
+                    value: cap.supportsVTFrameInterpolation
+                        ? l10n.tr("Apple Silicon Hardware Ready", "支持 Apple 芯片硬件补帧")
+                        : l10n.tr("Metal Optical Flow", "使用 Metal 光流补帧"),
+                    detail: l10n.tr("2× / 3× / 4× Smooth Motion", "2× / 3× / 4× 丝滑插帧"),
                     ok: cap.supportsVTFrameInterpolation
                 )
                 capabilityTile(
-                    title: l10n.tr("VideoToolbox ML SR", "VideoToolbox ML 超分"),
-                    value: cap.supportsVTSuperResolution ? l10n.tr("ANE 1.5× / 2× / 4×", "神经引擎 1.5× / 2× / 4×") : l10n.tr("macOS 26+ Required", "需 macOS 26+"),
-                    detail: l10n.tr("Low-Latency Super Res", "低延迟神经网络超分"),
+                    title: l10n.tr("Apple ML Upscaler", "Apple 神经引擎超分"),
+                    value: cap.supportsVTSuperResolution
+                        ? l10n.tr("1.5× / 2× / 4× Ready", "支持 1.5× / 2× / 4×")
+                        : l10n.tr("Requires macOS 26+", "需 macOS 26+"),
+                    detail: l10n.tr("Neural Engine Super Resolution", "神经引擎 AI 超分辨率"),
                     ok: cap.supportsVTSuperResolution
                 )
             }
@@ -175,21 +179,27 @@ struct DiagnosticsView: View {
         .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
-    // MARK: - Connected Displays Table
+    // MARK: - Connected Multi-Monitor Table
 
     private func connectedDisplaysCard(l10n: L10n) -> some View {
-        SectionCard(
-            title: l10n.tr("Connected Displays", "已连接的显示器"),
+        let primaryDisplay = ScreenGeometry.primaryDisplay(in: coordinator.displays)
+
+        return SectionCard(
+            title: l10n.tr("Connected Displays (\(coordinator.displays.count))", "已连接的显示器（共 \(coordinator.displays.count) 台）"),
+            subtitle: l10n.tr(
+                "Shows resolution, HiDPI scaling, refresh rate, and multi-monitor layout position for each screen.",
+                "实时识别每块屏幕的分辨率、清晰度缩放（@2x/@1x）、刷新率与多屏相对位置。"
+            ),
             symbol: "display.2",
             accent: .blue
         ) {
             VStack(spacing: 6) {
                 HStack {
-                    Text(l10n.tr("Display", "显示器")).frame(maxWidth: .infinity, alignment: .leading)
-                    Text(l10n.tr("Pixels", "物理分辨率")).frame(width: 110, alignment: .trailing)
-                    Text(l10n.tr("Scale", "缩放")).frame(width: 55, alignment: .trailing)
-                    Text(l10n.tr("Refresh", "刷新率")).frame(width: 70, alignment: .trailing)
-                    Text("EDR / HDR").frame(width: 90, alignment: .trailing)
+                    Text(l10n.tr("Display & Position", "显示器与位置")).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(l10n.tr("Resolution", "物理分辨率")).frame(width: 105, alignment: .trailing)
+                    Text("DPI").frame(width: 48, alignment: .trailing)
+                    Text(l10n.tr("Refresh", "刷新率")).frame(width: 68, alignment: .trailing)
+                    Text("HDR").frame(width: 82, alignment: .trailing)
                 }
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -198,12 +208,19 @@ struct DiagnosticsView: View {
                 Divider()
 
                 ForEach(coordinator.displays) { display in
+                    let posLabel = multiMonitorPositionBadge(for: display, relativeTo: primaryDisplay, l10n: l10n)
                     HStack {
                         HStack(spacing: 6) {
+                            Image(systemName: display.isPrimary ? "laptopcomputer" : "display")
+                                .font(.system(size: 12))
+                                .foregroundStyle(display.isPrimary ? .blue : .secondary)
                             Text(display.name)
                                 .font(.system(size: 12.5, weight: .medium))
+                                .lineLimit(1)
                             if display.isPrimary {
                                 StatusBadge(l10n.tr("Primary", "主屏"), color: .blue)
+                            } else {
+                                StatusBadge(posLabel, color: .indigo)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -211,76 +228,70 @@ struct DiagnosticsView: View {
                         Text(verbatim: "\(display.pixelSize.width)×\(display.pixelSize.height)")
                             .font(.system(size: 12, design: .monospaced))
                             .monospacedDigit()
-                            .frame(width: 110, alignment: .trailing)
+                            .frame(width: 105, alignment: .trailing)
 
-                        Text(String(format: "%.0f×", display.backingScaleFactor))
-                            .font(.system(size: 12, design: .monospaced))
-                            .frame(width: 55, alignment: .trailing)
+                        Text(String(format: "@%.0fx", display.backingScaleFactor))
+                            .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 48, alignment: .trailing)
 
                         Text(String(format: "%.0f Hz", display.refreshRateHz))
                             .font(.system(size: 12, weight: .semibold, design: .monospaced))
                             .foregroundStyle(display.refreshRateHz >= 100 ? .cyan : .primary)
-                            .frame(width: 70, alignment: .trailing)
+                            .frame(width: 68, alignment: .trailing)
 
-                        Text(display.supportsHDR ? String(format: "%.1f× EDR", display.maxEDRHeadroom) : "SDR")
+                        Text(display.supportsHDR ? String(format: "%.1f× HDR", display.maxEDRHeadroom) : "SDR")
                             .font(.system(size: 11.5, weight: .medium, design: .monospaced))
                             .foregroundStyle(display.supportsHDR ? .orange : .secondary)
-                            .frame(width: 90, alignment: .trailing)
+                            .frame(width: 82, alignment: .trailing)
                     }
                     .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
+                    .padding(.vertical, 6)
                     .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
             }
         }
     }
 
-    // MARK: - Shader Binary Archive Cache
-
-    private func shaderBinaryCacheCard(l10n: L10n) -> some View {
-        let formattedSize = ByteCountFormatter.string(fromByteCount: coordinator.shaderCacheSizeBytes, countStyle: .file)
-
-        return SectionCard(
-            title: l10n.tr("Metal Binary Archive Cache", "Metal 着色器二进制缓存 (MTLBinaryArchive)"),
-            subtitle: l10n.tr("Pre-compiled GPU machine code keyed by GPU model, macOS build & shader SHA-256 for <1ms warm launches.", "按显卡型号、系统版本与着色器源码 SHA-256 哈希缓存机器码，实现 <1ms 极速冷启加载。"),
-            symbol: "memorychip.fill",
-            accent: .indigo
-        ) {
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(coordinator.shaderCachePath.isEmpty ? "—" : coordinator.shaderCachePath)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text("\(l10n.tr("Archive Size", "缓存体积")): \(formattedSize) • \(coordinator.effectChainRenderer?.shaderManager.cachedPipelineCount ?? 0) \(l10n.tr("cached pipelines", "个已缓存管线"))")
-                        .font(.system(size: 11.5, weight: .medium))
-                }
-                Spacer()
-                Button {
-                    Task { await coordinator.clearAndRebuildShaderCache() }
-                } label: {
-                    Label(l10n.tr("Clear & Rebuild Cache", "清理并重建缓存"), systemImage: "arrow.triangle.2.circlepath")
-                }
-                .controlSize(.small)
-                .buttonStyle(.bordered)
-            }
+    private func multiMonitorPositionBadge(
+        for display: DisplayDescriptor,
+        relativeTo primary: DisplayDescriptor?,
+        l10n: L10n
+    ) -> String {
+        guard let primary, display.id != primary.id else {
+            return l10n.tr("Primary", "主屏")
         }
+        var parts: [String] = []
+        if display.cgBounds.midX < primary.cgBounds.minX {
+            parts.append(l10n.tr("Left", "左侧外接"))
+        } else if display.cgBounds.midX > primary.cgBounds.maxX {
+            parts.append(l10n.tr("Right", "右侧外接"))
+        }
+        if display.cgBounds.midY < primary.cgBounds.minY {
+            parts.append(l10n.tr("Above", "上方"))
+        } else if display.cgBounds.midY > primary.cgBounds.maxY {
+            parts.append(l10n.tr("Below", "下方"))
+        }
+        if parts.isEmpty {
+            return l10n.tr("External", "外接屏")
+        }
+        return parts.joined(separator: " · ")
     }
 
-    // MARK: - Real GPU Shader Benchmark
+    // MARK: - One-Click 30-Shader GPU Benchmark
 
     private func gpuBenchmarkCard(l10n: L10n) -> some View {
+        let totalEffects = EffectID.allCases.count
         let maxMs = max(
             0.5,
             coordinator.benchmarkResults.filter(\.succeeded).map(\.averageGPUMilliseconds).max() ?? 4.0
         )
 
         return SectionCard(
-            title: l10n.tr("Real Apple Silicon GPU Shader Benchmark", "Apple Silicon GPU 全着色器实时基准测试"),
+            title: l10n.tr("One-Click \(totalEffects)-Shader GPU Benchmark", "一键显卡测速（全部 \(totalEffects) 种画质算法）"),
             subtitle: l10n.tr(
-                "Executes every one of MetalPie's 22 built-in shaders & Apple ML scalers live on \(coordinator.capabilities.gpuName).",
-                "直接在 \(coordinator.capabilities.gpuName) 上实测 MetalPie 全部 22 个内置着色器与 Apple 神经引擎超分的真实耗时。"
+                "Measures real rendering speed of all \(totalEffects) built-in effects directly on \(coordinator.capabilities.gpuName).",
+                "在 \(coordinator.capabilities.gpuName) 上实地测试全部 \(totalEffects) 种超分与滤镜的单帧耗时与理论帧率。"
             ),
             symbol: "speedometer",
             accent: .green
@@ -309,8 +320,8 @@ struct DiagnosticsView: View {
                 } label: {
                     Label(
                         coordinator.isBenchmarkRunning
-                            ? l10n.tr("Benchmarking…", "正在测试…")
-                            : l10n.tr("Run Benchmark", "运行全部测试"),
+                            ? l10n.tr("Testing…", "测速中…")
+                            : l10n.tr("Start Benchmark", "开始一键测速"),
                         systemImage: "play.fill"
                     )
                 }
@@ -337,7 +348,7 @@ struct DiagnosticsView: View {
                         HStack(spacing: 10) {
                             Text(l10n.effectName(desc))
                                 .font(.system(size: 11.5, weight: .medium))
-                                .frame(width: 175, alignment: .leading)
+                                .frame(width: 190, alignment: .leading)
                                 .lineLimit(1)
 
                             GeometryReader { geo in
@@ -379,18 +390,54 @@ struct DiagnosticsView: View {
         }
     }
 
-    // MARK: - PipelineLog Console
+    // MARK: - Shader Acceleration Cache
+
+    private func shaderBinaryCacheCard(l10n: L10n) -> some View {
+        let formattedSize = ByteCountFormatter.string(fromByteCount: coordinator.shaderCacheSizeBytes, countStyle: .file)
+
+        return SectionCard(
+            title: l10n.tr("Shader Pre-Compile Cache", "着色器加速缓存"),
+            subtitle: l10n.tr(
+                "Stores compiled Metal shaders on disk so future scaling starts in under 1 ms.",
+                "自动把编译好的画质算法缓存到本地，下次开启缩放几乎瞬间启动。"
+            ),
+            symbol: "memorychip.fill",
+            accent: .indigo
+        ) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(coordinator.shaderCachePath.isEmpty ? "—" : coordinator.shaderCachePath)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("\(l10n.tr("Cache Size", "缓存占用")): \(formattedSize) • \(coordinator.effectChainRenderer?.shaderManager.cachedPipelineCount ?? 0) \(l10n.tr("ready shaders", "个已就绪算法"))")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                Spacer()
+                Button {
+                    Task { await coordinator.clearAndRebuildShaderCache() }
+                } label: {
+                    Label(l10n.tr("Rebuild Cache", "清理并重建缓存"), systemImage: "arrow.triangle.2.circlepath")
+                }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    // MARK: - Logs Console
 
     private func pipelineLogConsoleCard(l10n: L10n) -> some View {
         SectionCard(
-            title: l10n.tr("PipelineLog Diagnostic Console", "管线诊断日志控制台 (PipelineLog)"),
-            subtitle: l10n.tr("\(filteredLogs.count) of \(coordinator.logEntries.count) entries shown", "显示 \(filteredLogs.count) / 共 \(coordinator.logEntries.count) 条日志"),
+            title: l10n.tr("Runtime Logs", "运行日志"),
+            subtitle: l10n.tr("Showing \(filteredLogs.count) of \(coordinator.logEntries.count) entries", "当前显示 \(filteredLogs.count) 条（共 \(coordinator.logEntries.count) 条）"),
             symbol: "terminal.fill",
             accent: .secondary
         ) {
             HStack(spacing: 8) {
-                Picker(l10n.tr("Category", "模块"), selection: $selectedLogCategory) {
-                    Text(l10n.tr("All", "全部模块")).tag(LogCategory?.none)
+                Picker(l10n.tr("Module", "分类"), selection: $selectedLogCategory) {
+                    Text(l10n.tr("All", "全部分类")).tag(LogCategory?.none)
                     ForEach(LogCategory.allCases) { cat in
                         Text(l10n.logCategory(cat)).tag(LogCategory?.some(cat))
                     }
@@ -407,7 +454,7 @@ struct DiagnosticsView: View {
                 .labelsHidden()
                 .frame(width: 95)
 
-                TextField(l10n.tr("Search logs…", "搜索日志内容…"), text: $logSearchQuery)
+                TextField(l10n.tr("Search logs…", "搜索日志关键字…"), text: $logSearchQuery)
                     .textFieldStyle(.roundedBorder)
 
                 Button {
@@ -416,7 +463,7 @@ struct DiagnosticsView: View {
                     NSPasteboard.general.setString(text, forType: .string)
                     coordinator.showToast(
                         icon: "doc.on.clipboard.fill",
-                        title: l10n.tr("Logs Copied to Clipboard", "日志已复制到剪贴板"),
+                        title: l10n.tr("Logs Copied", "日志已复制到剪贴板"),
                         style: .info
                     )
                 } label: {
@@ -428,7 +475,7 @@ struct DiagnosticsView: View {
                 Button {
                     exportLogFile(l10n: l10n)
                 } label: {
-                    Label(l10n.tr("Export .log", "导出 .log"), systemImage: "square.and.arrow.up")
+                    Label(l10n.tr("Export .log", "导出日志"), systemImage: "square.and.arrow.up")
                 }
                 .buttonStyle(.bordered)
 
@@ -464,7 +511,7 @@ struct DiagnosticsView: View {
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(height: 200)
+            .frame(height: 190)
             .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
     }
@@ -493,7 +540,7 @@ struct DiagnosticsView: View {
                 try PipelineLog.shared.export(to: url, minimumLevel: minimumLogLevel, category: selectedLogCategory)
                 coordinator.showToast(
                     icon: "checkmark.circle.fill",
-                    title: l10n.tr("Diagnostic Log Exported", "诊断日志已导出"),
+                    title: l10n.tr("Log Exported", "运行日志已导出"),
                     subtitle: url.lastPathComponent,
                     style: .success
                 )

@@ -17,22 +17,23 @@ inline uint2 clampCoord(int2 p, int2 size) {
     return uint2(clamp(p, int2(0), max(size - int2(1), int2(0))));
 }
 
-// MARK: - 2-Pass Separable Lanczos6 (Radius 3) with Anti-Ringing
+// MARK: - 2-Pass Separable Lanczos6 (Radius 3) with Anti-Ringing & Sharpness
 
 struct LanczosUniforms {
     float arStrength;
+    float sharpness;
     uint _pad0;
     uint _pad1;
-    uint _pad2;
 };
 
-inline float lanczos3Weight(float x) {
+inline float lanczos3Weight(float x, float sharpness) {
     float ax = abs(x);
     if (ax < 1e-5f) return 1.0f;
     if (ax >= 3.0f) return 0.0f;
     const float pi = 3.14159265359f;
+    float b = clamp(sharpness, 0.5f, 1.5f);
     float pix = pi * ax;
-    return (3.0f * sin(pix) * sin(pix / 3.0f)) / (pix * pix);
+    return (3.0f * sin(pix * b) * sin(pix / 3.0f)) / (pix * pix * b);
 }
 
 kernel void lanczos6_h(
@@ -50,6 +51,7 @@ kernel void lanczos6_h(
     const int inW = int(input.get_width());
     const int inH = int(input.get_height());
     const int2 inSize = int2(inW, inH);
+    const float sharp = clamp(u.sharpness > 0.01f ? u.sharpness : 1.0f, 0.5f, 1.5f);
 
     // Map output x center to source pixel space.
     float srcX = (float(gid.x) + 0.5f) * (float(inW) / float(outW)) - 0.5f;
@@ -63,7 +65,7 @@ kernel void lanczos6_h(
     float3 c1 = float3(0.0f);
 
     for (int k = -2; k <= 3; ++k) {
-        float w = lanczos3Weight(float(k) - fracX);
+        float w = lanczos3Weight(float(k) - fracX, sharp);
         float3 s = input.read(clampCoord(int2(baseX + k, y), inSize)).rgb;
         sum += s * w;
         wSum += w;
@@ -93,6 +95,7 @@ kernel void lanczos6_v(
     const int inW = int(input.get_width());
     const int inH = int(input.get_height());
     const int2 inSize = int2(inW, inH);
+    const float sharp = clamp(u.sharpness > 0.01f ? u.sharpness : 1.0f, 0.5f, 1.5f);
 
     float srcY = (float(gid.y) + 0.5f) * (float(inH) / float(outH)) - 0.5f;
     int baseY = int(floor(srcY));
@@ -105,7 +108,7 @@ kernel void lanczos6_v(
     float3 c1 = float3(0.0f);
 
     for (int k = -2; k <= 3; ++k) {
-        float w = lanczos3Weight(float(k) - fracY);
+        float w = lanczos3Weight(float(k) - fracY, sharp);
         float3 s = input.read(clampCoord(int2(x, baseY + k), inSize)).rgb;
         sum += s * w;
         wSum += w;
@@ -117,6 +120,73 @@ kernel void lanczos6_v(
     float3 min2 = min(c0, c1);
     float3 max2 = max(c0, c1);
     color = mix(color, clamp(color, min2, max2), clamp(u.arStrength, 0.0f, 1.0f));
+    output.write(float4(max(color, float3(0.0f)), 1.0f), gid);
+}
+
+// MARK: - Jinc2 / EWA Lanczos (2D Circular Elliptical Filter with Anti-Ringing)
+
+struct JincUniforms {
+    float windowSinc;  // A: default 0.5
+    float sinc;        // B: default 0.825
+    float antiRinging; // default 0.5
+    uint _pad0;
+};
+
+inline float jincResampler(float d, float wa, float wb) {
+    if (d < 1e-5f) {
+        return wa * wb;
+    }
+    return sin(d * wa) * sin(d * wb) / (d * d);
+}
+
+kernel void jinc(
+    texture2d<float, access::read> input [[texture(0)]],
+    texture2d<float, access::write> output [[texture(1)]],
+    constant JincUniforms &u [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint outW = output.get_width();
+    const uint outH = output.get_height();
+    if (gid.x >= outW || gid.y >= outH) {
+        return;
+    }
+
+    const int inW = int(input.get_width());
+    const int inH = int(input.get_height());
+    const int2 inSize = int2(inW, inH);
+    const float pi = 3.14159265359f;
+
+    const float wa = clamp(u.windowSinc, 0.05f, 1.0f) * pi;
+    const float wb = clamp(u.sinc, 0.1f, 1.0f) * pi;
+    const float ar = clamp(u.antiRinging, 0.0f, 1.0f);
+
+    float2 pc = (float2(gid) + 0.5f) * (float2(inW, inH) / float2(outW, outH));
+    float2 tc = floor(pc - 0.5f) + 0.5f;
+    int2 base = int2(floor(pc - 0.5f)) - int2(1, 1);
+
+    float3 sum = float3(0.0f);
+    float wSum = 0.0f;
+    float3 c00 = float3(0.0f), c10 = float3(0.0f), c01 = float3(0.0f), c11 = float3(0.0f);
+
+    for (int dy = 0; dy < 4; ++dy) {
+        for (int dx = 0; dx < 4; ++dx) {
+            float2 sampleCenter = tc + float2(float(dx - 1), float(dy - 1));
+            float dist = length(sampleCenter - pc);
+            float w = jincResampler(dist, wa, wb);
+            float3 s = input.read(clampCoord(base + int2(dx, dy), inSize)).rgb;
+            sum += s * w;
+            wSum += w;
+            if (dx == 1 && dy == 1) c00 = s;
+            if (dx == 2 && dy == 1) c10 = s;
+            if (dx == 1 && dy == 2) c01 = s;
+            if (dx == 2 && dy == 2) c11 = s;
+        }
+    }
+
+    float3 color = (abs(wSum) > 1e-6f) ? (sum / wSum) : c00;
+    float3 min4 = min(min(c00, c10), min(c01, c11));
+    float3 max4 = max(max(c00, c10), max(c01, c11));
+    color = mix(color, clamp(color, min4, max4), ar);
     output.write(float4(max(color, float3(0.0f)), 1.0f), gid);
 }
 

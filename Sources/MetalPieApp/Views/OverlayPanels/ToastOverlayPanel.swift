@@ -29,8 +29,8 @@ public final class ToastOverlayPanel {
     private var dismissTimer: Timer?
     private var presentationGeneration: UInt64 = 0
 
-    private static let toastWidth: CGFloat = 330
-    private static let toastHeight: CGFloat = 56
+    private static let toastWidth: CGFloat = 376
+    private static let toastHeight: CGFloat = 68
 
     public init() {}
 
@@ -151,8 +151,9 @@ private struct ToastPillSwiftUIView: View {
                 if let sub = state.subtitle, !sub.isEmpty {
                     Text(sub)
                         .font(.system(size: 11, weight: .regular))
-                        .foregroundStyle(Color.white.opacity(0.75))
-                        .lineLimit(1)
+                        .foregroundStyle(Color.white.opacity(0.78))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: 4)

@@ -10,6 +10,12 @@ final class NonActivatingChromePanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
+    /// Allows multi-monitor placement on displays with negative CG Y or non-primary coordinates
+    /// without AppKit clamping or shifting the panel onto the primary display or below the menu bar.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+
     convenience init(globalCocoaRect: CGRect, ignoresMouseEvents: Bool = false) {
         self.init(
             contentRect: globalCocoaRect,
@@ -82,6 +88,10 @@ public final class OverlayToolbarPanel {
     private static let toolbarSize = CGSize(width: 420, height: 42)
     private static let topMargin: CGFloat = 10
     private static let fittsTopStripHeight: CGFloat = 28
+
+    /// Optional provider returning the active scaled cursor position in global Cocoa coordinates
+    /// when `CGEventTap` confines the physical pointer inside the source window.
+    public var scaledCursorCocoaProvider: (@MainActor () -> CGPoint?)?
 
     public init() {}
 
@@ -219,7 +229,7 @@ public final class OverlayToolbarPanel {
 
     private func evaluateAutoHideHover() {
         guard isShown, mode == .autoHide, let panel else { return }
-        let mouse = NSEvent.mouseLocation
+        let mouse = scaledCursorCocoaProvider?() ?? NSEvent.mouseLocation
         let topStrip = CGRect(
             x: anchorOverlayFrame.midX - Self.toolbarSize.width * 0.65,
             y: anchorOverlayFrame.maxY - Self.fittsTopStripHeight,
@@ -297,7 +307,7 @@ private struct OverlayToolbarSwiftUIView: View {
                     symbol: state.isWindowedClickThrough ? "lock.fill" : "arrow.up.and.down.and.arrow.left.and.right",
                     active: !state.isWindowedClickThrough,
                     helpText: state.isWindowedClickThrough
-                        ? l10n.tr("Unlock Window Drag/Resize", "解锁窗口拖拽与缩放")
+                        ? l10n.tr("Unlock Window Drag/Resize", "解锁窗口拖拽与调大小")
                         : l10n.tr("Lock Click-Through", "锁定鼠标穿透")
                 ) {
                     actionsProvider()?.onToggleClickThrough()
@@ -308,7 +318,7 @@ private struct OverlayToolbarSwiftUIView: View {
             toolbarIconButton(
                 symbol: "chart.bar.xaxis",
                 active: state.isProfilerVisible,
-                helpText: l10n.tr("Toggle Profiler HUD", "切换性能监视 HUD")
+                helpText: l10n.tr("Toggle Performance Overlay", "显示 / 隐藏帧率信息")
             ) {
                 actionsProvider()?.onToggleProfilerHUD()
             }
@@ -317,7 +327,7 @@ private struct OverlayToolbarSwiftUIView: View {
             toolbarIconButton(
                 symbol: "camera.fill",
                 active: false,
-                helpText: l10n.tr("Cursor-Free Screenshot", "捕获无光标截图")
+                helpText: l10n.tr("Cursor-Free Screenshot", "无光标高清截图")
             ) {
                 actionsProvider()?.onCaptureScreenshot()
             }
@@ -330,8 +340,8 @@ private struct OverlayToolbarSwiftUIView: View {
                         : "arrow.up.left.and.arrow.down.right",
                     active: false,
                     helpText: state.isFullscreen
-                        ? l10n.tr("Switch to Windowed Scaling", "切换为窗口缩放")
-                        : l10n.tr("Switch to Fullscreen Scaling", "切换为全屏缩放")
+                        ? l10n.tr("Switch to Windowed Scaling", "切换为窗口放大")
+                        : l10n.tr("Switch to Fullscreen Scaling", "切换为全屏放大")
                 ) {
                     actionsProvider()?.onTogglePresentationMode()
                 }
@@ -342,7 +352,7 @@ private struct OverlayToolbarSwiftUIView: View {
                 symbol: state.isPaused ? "play.fill" : "pause.fill",
                 active: state.isPaused,
                 helpText: state.isPaused
-                    ? l10n.tr("Resume Scaling", "恢复缩放")
+                    ? l10n.tr("Resume Scaling", "继续缩放")
                     : l10n.tr("Pause Scaling", "暂停缩放")
             ) {
                 actionsProvider()?.onTogglePause()
@@ -357,7 +367,7 @@ private struct OverlayToolbarSwiftUIView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "stop.fill")
                         .font(.system(size: 10, weight: .bold))
-                    Text(l10n.tr("Stop", "停止"))
+                    Text(l10n.tr("Stop", "退出"))
                         .font(.system(size: 11.5, weight: .semibold))
                 }
                 .foregroundStyle(.white)
@@ -366,7 +376,7 @@ private struct OverlayToolbarSwiftUIView: View {
                 .background(Color.red.opacity(0.82), in: Capsule())
             }
             .buttonStyle(.plain)
-            .help(l10n.tr("Stop Scaling (⌃⌥⌘⎋ Panic Stop)", "停止缩放（⌃⌥⌘⎋ 紧急熔断）"))
+            .help(l10n.tr("Stop Scaling (⌃⌥⌘⎋ Force Exit)", "退出缩放（按 ⌃⌥⌘⎋ 随时强制退出）"))
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)

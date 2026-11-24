@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
 import MetalPieCore
 import os
@@ -137,6 +138,9 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
     public static let defaultPollIntervalMilliseconds: Int = 40 // 25 Hz
     public static let defaultMinimumWindowDimension: CGFloat = 64.0
     public static let defaultOverlapThresholdPoints: CGFloat = 8.0
+    /// Grace window after starting/switching tracked window during which delayed activation bounce
+    /// notifications belonging to MetalPie's own PID are ignored (preventing instant session dismissal!).
+    public static let defaultActivationGraceSeconds: TimeInterval = 0.45
 
     private struct WatcherState {
         var isObserving: Bool = false
@@ -145,6 +149,7 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
         var trackedLastDescriptor: WindowDescriptor?
         var trackedLastDisplayID: CGDirectDisplayID?
         var trackedHasFocus: Bool = false
+        var activationGraceDeadlineUptime: TimeInterval = 0
         var autoRepositionState: AutoRepositionWaitState = .inactive
         var consecutiveMissingTicks: Int = 0
         var lastActiveWindowID: CGWindowID?
@@ -170,12 +175,15 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
     )
     private let state: OSAllocatedUnfairLock<WatcherState>
     private let pollIntervalMs: Int
+    private let activationGraceSeconds: TimeInterval
 
     public init(
         excludedBundleIDs: [String] = AppConfig.defaultAutoScaleExcludedBundleIDs,
-        pollIntervalMilliseconds: Int = WindowLifecycleWatcher.defaultPollIntervalMilliseconds
+        pollIntervalMilliseconds: Int = WindowLifecycleWatcher.defaultPollIntervalMilliseconds,
+        activationGraceSeconds: TimeInterval = WindowLifecycleWatcher.defaultActivationGraceSeconds
     ) {
         self.pollIntervalMs = max(20, min(pollIntervalMilliseconds, 200))
+        self.activationGraceSeconds = max(0.0, activationGraceSeconds)
         let initialDisplays = CursorOverlayController.snapshotCurrentDisplays()
         self.state = OSAllocatedUnfairLock(
             uncheckedState: WatcherState(
@@ -278,6 +286,7 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
         stopObserving()
 
         let displays = CursorOverlayController.snapshotCurrentDisplays()
+        let graceDeadline = ProcessInfo.processInfo.systemUptime + activationGraceSeconds
         state.withLockUnchecked { s in
             s.isObserving = true
             s.onEvent = onEvent
@@ -287,6 +296,7 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
             s.trackedLastDescriptor = nil
             s.trackedLastDisplayID = nil
             s.trackedHasFocus = false
+            s.activationGraceDeadlineUptime = graceDeadline
             s.consecutiveMissingTicks = 0
             s.hasReportedOverlapForCurrentTarget = false
             s.autoRepositionState = trackedWindowID.map { .tracking($0) } ?? .inactive
@@ -307,6 +317,7 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
     }
 
     public func updateTrackedWindow(_ windowID: CGWindowID?) {
+        let graceDeadline = ProcessInfo.processInfo.systemUptime + activationGraceSeconds
         watcherQueue.async { [weak self] in
             guard let self else { return }
             let isObserving = self.state.withLockUnchecked { $0.isObserving }
@@ -319,6 +330,7 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
                 s.trackedLastDescriptor = nil
                 s.trackedLastDisplayID = nil
                 s.trackedHasFocus = false
+                s.activationGraceDeadlineUptime = graceDeadline
                 s.consecutiveMissingTicks = 0
                 s.hasReportedOverlapForCurrentTarget = false
                 s.autoRepositionState = windowID.map { .tracking($0) } ?? .inactive
@@ -370,6 +382,99 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
 
         if teardown.wasObserving {
             PipelineLog.shared.info(.input, "WindowLifecycleWatcher stopped.")
+        }
+    }
+
+    // MARK: - Cooperative Target Window Activation (macOS 14–27 Safe)
+
+    /// Cooperatively hands focus from MetalPie to the target application and raises the exact target
+    /// window so MetalPie's own window is NEVER left physically covering the target underneath the
+    /// click-through `OverlayPanel` (which would cause the very first mouse click to hit MetalPie
+    /// and immediately dismiss scaling!).
+    ///
+    /// - Orders back any visible non-panel MetalPie windows (`orderBack(nil)`).
+    /// - Calls `NSApp.yieldActivation(to: targetApp)` + `targetApp.activate()` (macOS 14+ cooperative API).
+    /// - When Accessibility is granted, raises the specific `AXUIElement` window matching `windowID`
+    ///   (`kAXRaiseAction` + `kAXMainAttribute`) so multi-window apps like Terminal bring the exact window forward.
+    /// - Polls briefly (up to `timeoutMilliseconds`) until `frontmostApplication?.processIdentifier == pid`.
+    @MainActor
+    @discardableResult
+    public static func activateAndRaiseTargetWindow(
+        windowID: CGWindowID,
+        pid: Int32,
+        orderBackOwnMainWindows: Bool = true,
+        timeoutMilliseconds: Int = 300
+    ) async -> Bool {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        guard pid != ownPID else { return true }
+
+        let app = NSApplication.shared
+        if orderBackOwnMainWindows {
+            for win in app.windows where win.isVisible && !(win is NSPanel) {
+                win.orderBack(nil)
+            }
+        }
+
+        guard let targetApp = NSRunningApplication(processIdentifier: pid) else {
+            return false
+        }
+
+        app.yieldActivation(to: targetApp)
+        _ = targetApp.activate()
+
+        if AXIsProcessTrusted() {
+            raiseSpecificAXWindowIfPossible(windowID: windowID, pid: pid)
+        }
+
+        let maxMs = max(0, min(timeoutMilliseconds, 1500))
+        if maxMs == 0 || NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+            return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+        }
+
+        let deadline = CFAbsoluteTimeGetCurrent() + Double(maxMs) / 1000.0
+        while CFAbsoluteTimeGetCurrent() < deadline {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(15))
+        }
+        return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+    }
+
+    /// Pure grace-window helper preventing delayed MetalPie activation bounce notifications during
+    /// cooperative handoff from immediately aborting a newly started scaling session.
+    public static func shouldIgnoreActivationBounce(
+        activatedPID: Int32,
+        trackedPID: Int32,
+        ownPID: Int32 = ProcessInfo.processInfo.processIdentifier,
+        nowUptime: TimeInterval,
+        graceDeadlineUptime: TimeInterval
+    ) -> Bool {
+        guard activatedPID != trackedPID else { return false }
+        return activatedPID == ownPID && nowUptime < graceDeadlineUptime
+    }
+
+    private static func raiseSpecificAXWindowIfPossible(windowID: CGWindowID, pid: Int32) {
+        typealias AXGetWindowFn = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let sym = dlsym(rtldDefault, "_AXUIElementGetWindow") else { return }
+        let getWindowID = unsafeBitCast(sym, to: AXGetWindowFn.self)
+
+        let appElem = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement]
+        else {
+            return
+        }
+
+        for axWin in axWindows {
+            var candidateID: CGWindowID = 0
+            if getWindowID(axWin, &candidateID) == .success && candidateID == windowID {
+                _ = AXUIElementSetAttributeValue(axWin, kAXMainAttribute as CFString, kCFBooleanTrue)
+                _ = AXUIElementPerformAction(axWin, kAXRaiseAction as CFString)
+                return
+            }
         }
     }
 
@@ -693,15 +798,28 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
                 trackedID: s.trackedWindowID,
                 trackedPID: s.trackedPID,
                 hadFocus: s.trackedHasFocus,
+                graceDeadline: s.activationGraceDeadlineUptime,
                 repositionState: s.autoRepositionState
             )
         }
         guard info.isObserving else { return }
 
-        // 1. Tracked window focus transitions (IMMEDIATE focus-loss emission on Cmd+Tab!).
+        // 1. Tracked window focus transitions (IMMEDIATE focus-loss emission on Cmd+Tab,
+        //    protected against delayed startup MetalPie activation bounce during grace window!).
         if let trackedID = info.trackedID, let trackedPID = info.trackedPID {
             if let activatedPID = pid, activatedPID != trackedPID {
-                if info.hadFocus {
+                let nowUptime = ProcessInfo.processInfo.systemUptime
+                if Self.shouldIgnoreActivationBounce(
+                    activatedPID: activatedPID,
+                    trackedPID: trackedPID,
+                    nowUptime: nowUptime,
+                    graceDeadlineUptime: info.graceDeadline
+                ) {
+                    PipelineLog.shared.debug(
+                        .input,
+                        "Ignored own-app activation bounce during startup grace window for tracked window \(trackedID)."
+                    )
+                } else if info.hadFocus {
                     state.withLockUnchecked { s in
                         s.trackedHasFocus = false
                         s.hasReportedOverlapForCurrentTarget = false
@@ -948,6 +1066,14 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
             emit(.trackedWindowRestored(desc), detailed: .targetRestored(desc))
             if nowFocused && !snapState.hadFocus {
                 emit(.trackedWindowFocusGained(desc), detailed: .targetGainedFocus(desc))
+            }
+        } else if !snapState.hadFocus {
+            // Synchronize focus flag if target app completed cooperative activation right as observing started.
+            let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            if frontPID == raw.pid {
+                state.withLockUnchecked { s in
+                    s.trackedHasFocus = true
+                }
             }
         }
 

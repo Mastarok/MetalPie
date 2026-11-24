@@ -134,7 +134,9 @@ public struct CursorSpriteGeometry: Hashable, Sendable {
 /// 9-point OutputAlignment, Windowed scaling, multi-monitor desktop layouts via `ScreenGeometry`,
 /// and clean 1:1 identity passthrough (avoiding any Accessibility requirement when unscaled).
 public struct PointerMapping: Hashable, Sendable {
-    public static let defaultEdgeInset: CGFloat = 0.5
+    /// Strict 1.0pt inward inset guarantees confined coordinates lie inside half-open `[min, max)` window bounds
+    /// even after macOS WindowServer sub-pixel rounding (preventing accidental click-through onto Desktop/other apps).
+    public static let defaultEdgeInset: CGFloat = 1.0
     public static let identityTolerance: CGFloat = 0.5
 
     /// Active (cropped/visible) source window rect in global CG (Y-down) logical points.
@@ -450,6 +452,49 @@ public struct PointerMapping: Hashable, Sendable {
 
         let wasClamped = !clampedEdges.isEmpty
         return ConstrainResult(point: candidate, wasClamped: wasClamped, clampedEdges: clampedEdges)
+    }
+
+    /// Returns `true` if `cgPoint` lies inside `sourceRect` (optionally inset by `margin` points).
+    public func isPointInsideSource(_ cgPoint: CGPoint, margin: CGFloat = 0.0) -> Bool {
+        guard isValid else { return false }
+        let safeMargin = max(0, margin)
+        let dx = min(safeMargin, max(0, (sourceRect.width - 1.0) * 0.5))
+        let dy = min(safeMargin, max(0, (sourceRect.height - 1.0) * 0.5))
+        let checkRect = CGRect(
+            x: sourceRect.minX + dx,
+            y: sourceRect.minY + dy,
+            width: max(0, sourceRect.width - dx * 2.0),
+            height: max(0, sourceRect.height - dy * 2.0)
+        )
+        return cgPoint.x >= checkRect.minX && cgPoint.x <= checkRect.maxX &&
+            cgPoint.y >= checkRect.minY && cgPoint.y <= checkRect.maxY
+    }
+
+    /// Resolves a safe starting physical source point when starting/resuming confinement.
+    ///
+    /// - If `cgPoint` is already strictly inside the confined interior of `sourceRect` (e.g. triggered
+    ///   via global hotkey while interacting with the target window), preserves `cgPoint` with zero jump.
+    /// - If `cgPoint` is outside `confinementRect` (e.g. user clicked "Scale" in MetalPie's UI window),
+    ///   returns the **center** of the largest reachable confinement region rather than clamping onto an
+    ///   extreme corner/resize border where the first click could miss or hit a window border.
+    public func safeInitialSourcePoint(
+        from cgPoint: CGPoint
+    ) -> (point: CGPoint, shouldWarp: Bool) {
+        guard isValid else { return (cgPoint, false) }
+        let constrained = constrainSourcePoint(cgPoint)
+        if !constrained.wasClamped {
+            return (cgPoint, false)
+        }
+
+        // Target center of the largest reachable display intersection (handles L-shaped multi-monitor windows cleanly).
+        if reachableSourceRects.count > 1,
+           let largest = reachableSourceRects.max(by: { ($0.width * $0.height) < ($1.width * $1.height) })
+        {
+            let insetLargest = Self.insetConfinementRect(largest, edgeInset: edgeInset)
+            return (CGPoint(x: insetLargest.midX, y: insetLargest.midY), true)
+        }
+
+        return (CGPoint(x: confinementRect.midX, y: confinementRect.midY), true)
     }
 
     /// Returns `true` if `cgPoint` lies inside the overlay window's black letterbox/pillarbox bars

@@ -74,6 +74,12 @@ public final class OverlayPanel: NSPanel {
     public override var canBecomeKey: Bool { false }
     public override var canBecomeMain: Bool { false }
 
+    /// Never let AppKit clamp or shift the borderless overlay below the menu bar (notch) or onto the
+    /// primary display when positioning on secondary, negative-origin, diagonal, or multi-monitor spans!
+    public override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
+    }
+
     public override init(
         contentRect: NSRect,
         styleMask style: NSWindow.StyleMask,
@@ -290,10 +296,26 @@ public final class MetalOverlayView: NSView {
         syncDrawableGeometry()
     }
 
+    /// Host-display backing scale override used while the overlay panel is off-screen (before first-frame
+    /// reveal) so mixed-DPI multi-monitor overlays (e.g. @1x external + @2x Retina primary) never inherit
+    /// `NSScreen.main`'s backing scale factor.
+    public var preferredBackingScaleFactor: Double?
+
     /// Synchronizes `metalLayer.contentsScale` and `metalLayer.drawableSize` explicitly from view bounds.
     @discardableResult
-    public func syncDrawableGeometry() -> (PixelSize, Double) {
-        let scale = max(1.0, Double(window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0))
+    public func syncDrawableGeometry(preferredBackingScale: Double? = nil) -> (PixelSize, Double) {
+        if let preferredBackingScale {
+            preferredBackingScaleFactor = max(1.0, preferredBackingScale)
+        }
+        let resolvedScale: Double
+        if let preferred = preferredBackingScaleFactor {
+            resolvedScale = preferred
+        } else if let win = window, win.isVisible, let screen = win.screen {
+            resolvedScale = Double(screen.backingScaleFactor)
+        } else {
+            resolvedScale = Double(window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0)
+        }
+        let scale = max(1.0, resolvedScale)
         let pixelW = max(1, Int((Double(bounds.width) * scale).rounded()))
         let pixelH = max(1, Int((Double(bounds.height) * scale).rounded()))
         let targetSize = CGSize(width: pixelW, height: pixelH)
@@ -758,12 +780,15 @@ public final class OverlayWindowController {
             applyAntiOcclusion: shouldApplyAntiOcclusion(mode: currentPresentationMode, nativeFullscreenSpace: nativeFS)
         )
 
-        if abs(panel.frame.origin.x - targetCocoaRect.origin.x) >= 0.5
+        let targetDisplay = ScreenGeometry.bestDisplay(forCocoaRect: targetCocoaRect, in: displays)
+        let frameChanged = abs(panel.frame.origin.x - targetCocoaRect.origin.x) >= 0.5
             || abs(panel.frame.origin.y - targetCocoaRect.origin.y) >= 0.5
             || abs(panel.frame.size.width - targetCocoaRect.size.width) >= 0.5
             || abs(panel.frame.size.height - targetCocoaRect.size.height) >= 0.5
-        {
-            panel.setFrame(targetCocoaRect, display: false, animate: false)
+        let displayChanged = targetDisplay != nil && targetDisplay?.id != activeDisplayID
+
+        if frameChanged || displayChanged {
+            panel.setFrame(targetCocoaRect, display: isRevealed && !isSuspended, animate: false)
             applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: nativeFS)
             refreshScreenCapabilitiesAndColorSpace()
             emitCurrentMetrics()
@@ -896,7 +921,23 @@ public final class OverlayWindowController {
         let bestDisplay = ScreenGeometry.bestDisplay(forCocoaRect: cocoaFrame, in: displays)
             ?? ScreenGeometry.primaryDisplay(in: displays)
 
-        let scale = max(1.0, Double(panel?.backingScaleFactor ?? CGFloat(bestDisplay?.backingScaleFactor ?? 2.0)))
+        // Prefer the hosting display's exact backingScaleFactor (avoiding stale `NSScreen.main` DPI
+        // when the panel is off-screen before first-frame reveal or transitioning across mixed-DPI displays!).
+        let panelScreenMatchesBest: Bool = {
+            guard let panel, panel.isVisible, let screen = panel.screen, let best = bestDisplay else {
+                return false
+            }
+            return WindowEnumerator.screenDisplayID(for: screen) == best.id
+        }()
+        let resolvedScale: Double
+        if panelScreenMatchesBest, let panelScale = panel?.backingScaleFactor, panelScale >= 1.0 {
+            resolvedScale = Double(panelScale)
+        } else if let displayScale = bestDisplay?.backingScaleFactor, displayScale >= 1.0 {
+            resolvedScale = displayScale
+        } else {
+            resolvedScale = max(1.0, Double(panel?.backingScaleFactor ?? 2.0))
+        }
+        let scale = max(1.0, resolvedScale)
         let drawableSize: PixelSize
         if let layerSize = overlayView?.metalLayer.drawableSize, layerSize.width > 0, layerSize.height > 0 {
             drawableSize = PixelSize(cgSize: layerSize)
@@ -919,33 +960,15 @@ public final class OverlayWindowController {
         )
     }
 
-    // MARK: - Private Layout & Display Synchronization
-
-    private func isEffectiveVRRDirectScanout() -> Bool {
-        isVRRDirectScanoutEnabled
-            && currentPresentationMode.isFullscreen
-            && currentMultiMonitorMode == .closest
-    }
-
-    private func shouldApplyAntiOcclusion(mode: PresentationMode, nativeFullscreenSpace: Bool) -> Bool {
-        guard antiOcclusionEnabled else { return false }
-        if isEffectiveVRRDirectScanout() {
-            // ProMotion VRR requires exact full-display coverage.
-            return false
-        }
-        if nativeFullscreenSpace {
-            return false
-        }
-        return true
-    }
-
-    private func computeOverlayCocoaFrame(
+    /// Pure, unit-testable multi-monitor overlay frame solver returning global AppKit (Y-up) coordinates.
+    public static func computeOverlayCocoaFrame(
         sourceCGRect: CGRect,
         presentationMode: PresentationMode,
         multiMonitorMode: MultiMonitorMode,
         displays: [DisplayDescriptor],
         aspectRatio: CGFloat,
-        applyAntiOcclusion: Bool
+        lastWindowedWidth: CGFloat? = nil,
+        applyAntiOcclusion: Bool = true
     ) -> CGRect {
         switch presentationMode {
         case .fullscreen:
@@ -1011,17 +1034,57 @@ public final class OverlayWindowController {
         }
     }
 
+    // MARK: - Private Layout & Display Synchronization
+
+    private func isEffectiveVRRDirectScanout() -> Bool {
+        isVRRDirectScanoutEnabled
+            && currentPresentationMode.isFullscreen
+            && currentMultiMonitorMode == .closest
+    }
+
+    private func shouldApplyAntiOcclusion(mode: PresentationMode, nativeFullscreenSpace: Bool) -> Bool {
+        guard antiOcclusionEnabled else { return false }
+        if isEffectiveVRRDirectScanout() {
+            // ProMotion VRR requires exact full-display coverage.
+            return false
+        }
+        if nativeFullscreenSpace {
+            return false
+        }
+        return true
+    }
+
+    private func computeOverlayCocoaFrame(
+        sourceCGRect: CGRect,
+        presentationMode: PresentationMode,
+        multiMonitorMode: MultiMonitorMode,
+        displays: [DisplayDescriptor],
+        aspectRatio: CGFloat,
+        applyAntiOcclusion: Bool
+    ) -> CGRect {
+        Self.computeOverlayCocoaFrame(
+            sourceCGRect: sourceCGRect,
+            presentationMode: presentationMode,
+            multiMonitorMode: multiMonitorMode,
+            displays: displays,
+            aspectRatio: aspectRatio,
+            lastWindowedWidth: lastWindowedWidth,
+            applyAntiOcclusion: applyAntiOcclusion
+        )
+    }
+
     private func applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: Bool) {
         guard let panel else { return }
         isCoveringNativeFullscreenSpace = nativeFullscreenSpace
 
+        let app = NSApplication.shared
         if nativeFullscreenSpace {
             panel.level = Self.nativeFullscreenOverlayLevel
             if savedActivationPolicy == nil {
-                savedActivationPolicy = NSApp.activationPolicy()
+                savedActivationPolicy = app.activationPolicy()
             }
-            if NSApp.activationPolicy() != .accessory {
-                NSApp.setActivationPolicy(.accessory)
+            if app.activationPolicy() != .accessory {
+                app.setActivationPolicy(.accessory)
             }
         } else {
             panel.level = Self.normalOverlayLevel
@@ -1032,8 +1095,9 @@ public final class OverlayWindowController {
     private func restoreActivationPolicyIfNeeded() {
         guard let original = savedActivationPolicy else { return }
         savedActivationPolicy = nil
-        if NSApp.activationPolicy() != original {
-            NSApp.setActivationPolicy(original)
+        let app = NSApplication.shared
+        if app.activationPolicy() != original {
+            app.setActivationPolicy(original)
         }
     }
 
@@ -1118,7 +1182,9 @@ public final class OverlayWindowController {
         layer.displaySyncEnabled = currentDisplaySyncEnabled
 
         CATransaction.commit()
-        view.syncDrawableGeometry()
+        let hostScale = hostDisplay?.backingScaleFactor
+            ?? (hostScreen.map { Double($0.backingScaleFactor) })
+        view.syncDrawableGeometry(preferredBackingScale: hostScale)
     }
 
     private func installWindowObservers(for panel: OverlayPanel) {

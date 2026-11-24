@@ -1,7 +1,7 @@
 import MetalPieCore
 import SwiftUI
 
-/// Root native macOS `NavigationSplitView` window hosting MetalPie's 6 workspaces
+/// Root native macOS `NavigationSplitView` window hosting MetalPie's streamlined 5 workspaces
 /// and a persistent live Apple Silicon engine status pill in the sidebar footer.
 public struct MainWindowView: View {
     @Bindable var coordinator: AppCoordinator
@@ -35,9 +35,10 @@ public struct MainWindowView: View {
                     VStack(alignment: .leading, spacing: 0) {
                         Text("MetalPie")
                             .font(.system(size: 14, weight: .bold))
-                        Text(l10n.tr("Apple Silicon Upscaler", "Apple Silicon 实时超分"))
-                            .font(.system(size: 10))
+                        Text(l10n.tr("GPU Upscaler & Frame Gen", "窗口高清放大与补帧"))
+                            .font(.system(size: 9.5))
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                     Spacer()
                 }
@@ -65,7 +66,7 @@ public struct MainWindowView: View {
                 engineStatusPill(l10n: l10n)
                     .padding(10)
             }
-            .navigationSplitViewColumnWidth(min: 205, ideal: 220, max: 250)
+            .navigationSplitViewColumnWidth(min: 196, ideal: 214, max: 245)
         } detail: {
             Group {
                 switch coordinator.selectedTab {
@@ -75,8 +76,6 @@ public struct MainWindowView: View {
                     EffectChainEditorView(coordinator: coordinator)
                 case .profiles:
                     ProfilesView(coordinator: coordinator)
-                case .capture:
-                    CaptureCursorView(coordinator: coordinator)
                 case .settings:
                     SettingsView(coordinator: coordinator)
                 case .diagnostics:
@@ -139,15 +138,17 @@ public struct MainWindowView: View {
                     Button {
                         Task { await coordinator.stopScaling(isManual: true, showToast: true) }
                     } label: {
-                        Label(l10n.tr("Stop", "停止"), systemImage: "stop.fill")
+                        Label(l10n.tr("Exit", "退出"), systemImage: "stop.fill")
                             .font(.system(size: 10.5, weight: .semibold))
                     }
                     .controlSize(.mini)
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
                 } else {
-                    Text(coordinator.capabilities.supportsVTFrameInterpolation ? "ANE ML" : "Metal 3")
-                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                    Text(coordinator.capabilities.supportsVTFrameInterpolation
+                         ? l10n.tr("Apple ML", "芯片补帧")
+                         : "Metal 3")
+                        .font(.system(size: 9.5, weight: .bold))
                         .foregroundStyle(Color.cyan)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1.5)

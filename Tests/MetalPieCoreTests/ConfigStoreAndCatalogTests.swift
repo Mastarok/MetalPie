@@ -12,19 +12,30 @@ struct ConfigStoreAndCatalogTests {
         return url
     }
 
-    @Test("EffectCatalog covers all 22 EffectIDs with valid parameter defaults")
+    @Test("EffectCatalog covers all 30 EffectIDs, Chinese UX descriptions, ScenarioTags, and 21 presets")
     func effectCatalogCompleteness() {
-        #expect(EffectID.allCases.count == 22)
-        #expect(EffectCatalog.all.count == 22)
+        #expect(EffectID.allCases.count == 30)
+        #expect(EffectCatalog.all.count == 30)
 
         for id in EffectID.allCases {
             let desc = EffectCatalog.descriptor(for: id)
             #expect(desc.id == id)
             #expect(!desc.nameEN.isEmpty)
             #expect(!desc.nameZH.isEmpty)
+            #expect(!desc.summaryEN.isEmpty)
+            #expect(!desc.summaryZH.isEmpty)
+            #expect(desc.displayNameEN == desc.nameEN)
+            #expect(desc.displayNameZH == desc.nameZH)
+            #expect(desc.descriptionEN == desc.summaryEN)
+            #expect(desc.descriptionZH == desc.summaryZH)
+            #expect(!desc.localizedDescription.isEmpty)
             for param in desc.parameters {
                 #expect(!param.labelEN.isEmpty)
                 #expect(!param.labelZH.isEmpty)
+                #expect(!param.descriptionEN.isEmpty)
+                #expect(!param.descriptionZH.isEmpty)
+                #expect(param.displayNameZH == param.labelZH)
+                #expect(!param.localizedDescription.isEmpty)
                 switch param.kind {
                 case .float(let def, let minVal, let maxVal, let step):
                     #expect(def >= minVal && def <= maxVal)
@@ -37,14 +48,56 @@ struct ConfigStoreAndCatalogTests {
                 case .choice(let def, let options):
                     let hasDefaultOption = options.contains { $0.value == def }
                     #expect(hasDefaultOption)
+                    for opt in options {
+                        #expect(!opt.labelEN.isEmpty)
+                        #expect(!opt.labelZH.isEmpty)
+                    }
                 }
             }
         }
 
-        // All 12 built-in ScalingMode presets exist with unique stable IDs
-        #expect(ScalingMode.builtInPresets.count == 12)
-        #expect(Set(ScalingMode.builtInPresets.map(\.id)).count == 12)
+        // All 21 built-in ScalingMode presets exist with unique stable IDs, Chinese labels, and ScenarioTags
+        #expect(ScalingMode.builtInPresets.count == 21)
+        #expect(Set(ScalingMode.builtInPresets.map(\.id)).count == 21)
         #expect(ScalingMode.defaultMode.id == ScalingMode.metalFXSpatialID)
+        #expect(ScalingMode.anime4kModeAID == ScalingMode.anime4kID)
+
+        for preset in ScalingMode.builtInPresets {
+            #expect(!preset.name.isEmpty)
+            #expect(!preset.nameZH.isEmpty)
+            #expect(!preset.localizedDescription.isEmpty)
+            #expect(!preset.descriptionZH.isEmpty)
+            #expect(!preset.displayName(isChinese: true).isEmpty)
+            #expect(!preset.displayDescription(isChinese: true).isEmpty)
+        }
+
+        // Verify all 4 ScenarioTag tabs have presets and plain-Chinese labels
+        #expect(ScenarioTag.allCases.count == 4)
+        for tag in ScenarioTag.allCases {
+            #expect(!tag.labelEN.isEmpty)
+            #expect(!tag.labelZH.isEmpty)
+            #expect(!tag.symbolName.isEmpty)
+            #expect(ScalingMode.builtInPresets(for: tag).count >= 2)
+        }
+
+        // Verify the 6 official Anime4K v4 modes (A, B, C, A+A, B+B, C+A) and Magpie flagship presets exist
+        let presetIDs = Set(ScalingMode.builtInPresets.map(\.id))
+        #expect(presetIDs.contains(ScalingMode.anime4kModeAID))
+        #expect(presetIDs.contains(ScalingMode.anime4kModeBID))
+        #expect(presetIDs.contains(ScalingMode.anime4kModeCID))
+        #expect(presetIDs.contains(ScalingMode.anime4kModeAAID))
+        #expect(presetIDs.contains(ScalingMode.anime4kModeBBID))
+        #expect(presetIDs.contains(ScalingMode.anime4kModeCAID))
+        #expect(presetIDs.contains(ScalingMode.cunnyAnimeID))
+        #expect(presetIDs.contains(ScalingMode.fxaaFSR1ID))
+        #expect(presetIDs.contains(ScalingMode.jincVideoID))
+        #expect(presetIDs.contains(ScalingMode.crtLottesArcadeID))
+
+        // Verify Anime4K user-facing configuration stays clean and concise (no intimidating low-level knobs)
+        #expect(EffectCatalog.descriptor(for: .anime4kRestore).parameters.count <= 2)
+        #expect(EffectCatalog.descriptor(for: .anime4kUpscale).parameters.count <= 2)
+        #expect(EffectCatalog.descriptor(for: .anime4kUpscaleDenoise).parameters.count <= 2)
+        #expect(EffectCatalog.descriptor(for: .anime4kClampHighlights).parameters.isEmpty)
     }
 
     @Test("ConfigStore atomic round-trip persistence")
@@ -61,7 +114,7 @@ struct ConfigStoreAndCatalogTests {
         #expect(initial.config.schemaVersion == AppConfig.currentSchemaVersion)
         let initialHasDefault = initial.config.profiles.contains(where: \.isDefault)
         #expect(initialHasDefault)
-        #expect(initial.config.scalingModes.count == 12)
+        #expect(initial.config.scalingModes.count == 21)
         #expect(initial.config.hotkeys.panicStop == HotkeyBinding.panicStop)
 
         // Customize config and save atomically
@@ -118,8 +171,104 @@ struct ConfigStoreAndCatalogTests {
         #expect(result.config.schemaVersion == AppConfig.currentSchemaVersion)
         let recoveredHasDefault = result.config.profiles.contains(where: \.isDefault)
         #expect(recoveredHasDefault)
-        #expect(result.config.scalingModes.count == 12)
+        #expect(result.config.scalingModes.count == 21)
         #expect(log.entries(minimumLevel: .error).count == 1)
+    }
+
+    @Test("ConfigStore backwards-compatibly upgrades v1.0 configs, migrates legacy keys, and seeds new presets")
+    func legacyV1ConfigBackwardsCompatibilityAndPresetSeeding() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let configURL = dir.appendingPathComponent("config.json")
+        let customID = UUID()
+
+        // Encode a real AppConfig with only 1 old built-in mode + 1 custom mode, then strip
+        // newly added v1.1 fields (`nameZH`, `descriptionZH`, `scenario`) to simulate an authentic v1.0 file.
+        var base = AppConfig.defaultConfig
+        base.scalingModes = [
+            ScalingMode(
+                id: ScalingMode.anime4kID,
+                name: "Anime4K 2x",
+                localizedDescription: "Legacy Anime4K",
+                effects: [
+                    EffectInstance(
+                        effectID: .anime4kRestore,
+                        scalingType: .normal,
+                        parameters: ["strength": .float(0.72)]
+                    )
+                ],
+                isBuiltIn: true
+            ),
+            ScalingMode(
+                id: customID,
+                name: "My Legacy Custom Chain",
+                localizedDescription: "User custom preset",
+                effects: [
+                    EffectInstance(
+                        effectID: .lanczos6,
+                        scalingType: .fit,
+                        parameters: ["arStrength": .float(0.65)]
+                    ),
+                    EffectInstance(
+                        effectID: .crtGeom,
+                        scalingType: .normal,
+                        parameters: ["bloom": .float(0.28)]
+                    )
+                ],
+                isBuiltIn: false
+            )
+        ]
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let rawData = try encoder.encode(base)
+        var jsonObj = try #require(JSONSerialization.jsonObject(with: rawData) as? [String: Any])
+        if var modes = jsonObj["scalingModes"] as? [[String: Any]] {
+            for i in modes.indices {
+                modes[i].removeValue(forKey: "nameZH")
+                modes[i].removeValue(forKey: "descriptionZH")
+                modes[i].removeValue(forKey: "scenario")
+            }
+            jsonObj["scalingModes"] = modes
+        }
+        let legacyData = try JSONSerialization.data(withJSONObject: jsonObj, options: [.prettyPrinted])
+        try legacyData.write(to: configURL, options: [.atomic])
+
+        let store = ConfigStore(fileURL: configURL, logger: PipelineLog(maxEntries: 50))
+        let result = store.loadResult()
+        #expect(result.status == .loaded)
+
+        // All 21 built-in presets + 1 user custom preset = 22 total
+        #expect(result.config.scalingModes.count == 22)
+
+        // Built-in Anime4K preset kept user's strength=0.72 while backfilling Chinese metadata, scenario, variant, clampHighlights
+        let animeMode = try #require(result.config.scalingModes.first { $0.id == ScalingMode.anime4kID })
+        #expect(animeMode.scenario == .anime)
+        #expect(!animeMode.nameZH.isEmpty)
+        #expect(!animeMode.descriptionZH.isEmpty)
+        #expect(animeMode.effects[0].parameters["strength"]?.floatValue == 0.72)
+        #expect(animeMode.effects[0].parameters["variant"]?.choiceValue != nil)
+        #expect(animeMode.effects[0].parameters["clampHighlights"]?.boolValue == true)
+
+        // All 6 official Anime4K modes + CuNNy + FXAA presets were seamlessly seeded
+        let loadedIDs = Set(result.config.scalingModes.map(\.id))
+        #expect(loadedIDs.contains(ScalingMode.anime4kModeAID))
+        #expect(loadedIDs.contains(ScalingMode.anime4kModeBID))
+        #expect(loadedIDs.contains(ScalingMode.anime4kModeCID))
+        #expect(loadedIDs.contains(ScalingMode.anime4kModeAAID))
+        #expect(loadedIDs.contains(ScalingMode.anime4kModeBBID))
+        #expect(loadedIDs.contains(ScalingMode.anime4kModeCAID))
+        #expect(loadedIDs.contains(ScalingMode.cunnyAnimeID))
+        #expect(loadedIDs.contains(ScalingMode.fxaaFSR1ID))
+
+        // User's custom preset preserved and legacy parameter keys migrated cleanly
+        let userMode = try #require(result.config.scalingModes.first { $0.id == customID })
+        #expect(userMode.isBuiltIn == false)
+        #expect(userMode.effects[0].parameters["antiRinging"]?.floatValue == 0.65)
+        #expect(userMode.effects[0].parameters["sharpness"]?.floatValue == 1.0)
+        #expect(userMode.effects[1].parameters["halation"]?.floatValue == 0.28)
+        #expect(userMode.effects[1].parameters["maskType"]?.choiceValue == "apertureGrille")
     }
 
     @Test("ConfigStore invokes schema migration hook for older schema versions")

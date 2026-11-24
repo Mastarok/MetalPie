@@ -56,21 +56,21 @@ struct MetalPieApp: App {
             CommandGroup(replacing: .newItem) {}
             CommandMenu("MetalPie") {
                 let l10n = coordinator.l10n
-                Button(l10n.tr("Scale Frontmost Fullscreen", "全屏缩放当前窗口")) {
+                Button(l10n.tr("Scale Frontmost Fullscreen", "全屏放大当前窗口")) {
                     Task { await coordinator.startScalingFrontmost(presentationOverride: .fullscreen) }
                 }
-                Button(l10n.tr("Scale Frontmost Windowed", "窗口缩放当前窗口")) {
+                Button(l10n.tr("Scale Frontmost Windowed", "窗口放大当前窗口")) {
                     Task { await coordinator.startScalingFrontmost(presentationOverride: .windowed()) }
                 }
-                Button(l10n.tr("Countdown Scale (\(coordinator.config.countdownSeconds)s)", "倒计时缩放 (\(coordinator.config.countdownSeconds)s)")) {
+                Button(l10n.tr("Scale in \(coordinator.config.countdownSeconds)s", "\(coordinator.config.countdownSeconds) 秒后放大当前窗口")) {
                     coordinator.startCountdownScale(mode: .fullscreen)
                 }
                 Divider()
-                Button(l10n.tr("Take Cursor-Free Screenshot", "捕获无光标截图")) {
+                Button(l10n.tr("Take Cursor-Free Screenshot", "无光标高清截图")) {
                     Task { await coordinator.captureCursorFreeScreenshot() }
                 }
                 .disabled(!coordinator.isScalingSessionOpen)
-                Button(l10n.tr("Stop Scaling", "停止缩放")) {
+                Button(l10n.tr("Stop Scaling", "退出缩放")) {
                     Task { await coordinator.stopScaling(isManual: true, showToast: true) }
                 }
                 .disabled(!coordinator.isScalingSessionOpen)
@@ -108,35 +108,58 @@ struct MetalPieApp: App {
 
         Divider()
 
-        Button(l10n.tr("Scale Frontmost Fullscreen", "全屏缩放当前窗口")) {
+        Button(l10n.tr("Scale Frontmost Fullscreen", "全屏放大当前窗口")) {
             Task { await coordinator.startScalingFrontmost(presentationOverride: .fullscreen) }
         }
         .disabled(!coordinator.permissions.screenRecordingGranted)
 
-        Button(l10n.tr("Scale Frontmost Windowed", "窗口缩放当前窗口")) {
+        Button(l10n.tr("Scale Frontmost Windowed", "窗口放大当前窗口")) {
             Task { await coordinator.startScalingFrontmost(presentationOverride: .windowed()) }
         }
         .disabled(!coordinator.permissions.screenRecordingGranted)
 
-        Button(l10n.tr("Countdown Scale (\(coordinator.config.countdownSeconds)s)", "倒计时缩放 (\(coordinator.config.countdownSeconds)s)")) {
+        Button(l10n.tr("Scale in \(coordinator.config.countdownSeconds)s", "\(coordinator.config.countdownSeconds) 秒后放大当前窗口")) {
             coordinator.startCountdownScale(mode: .fullscreen)
         }
         .disabled(!coordinator.permissions.screenRecordingGranted)
 
         Divider()
 
-        // Quick Scaling Preset Picker
-        Menu(l10n.tr("Quick Preset", "快速切换超分预设")) {
+        // Scenario-Grouped Quick Scaling Mode Picker
+        Menu(l10n.tr("Scaling Mode", "切换缩放模式")) {
             let activeID = coordinator.config.defaultProfile.scalingModeID
-            ForEach(coordinator.config.scalingModes) { mode in
-                Button {
-                    coordinator.updateDefaultProfile { $0.scalingModeID = mode.id }
-                    coordinator.selectedScalingModeID = mode.id
-                } label: {
-                    if mode.id == activeID {
-                        Label(l10n.builtInModeName(mode), systemImage: "checkmark")
-                    } else {
-                        Text(l10n.builtInModeName(mode))
+            ForEach(ScenarioTag.allCases) { tag in
+                let modes = coordinator.orderedBuiltInModes(for: tag)
+                if !modes.isEmpty {
+                    Menu(l10n.scenarioTag(tag)) {
+                        ForEach(modes) { mode in
+                            Button {
+                                coordinator.updateDefaultProfile { $0.scalingModeID = mode.id }
+                                coordinator.selectedScalingModeID = mode.id
+                            } label: {
+                                if mode.id == activeID {
+                                    Label(l10n.builtInModeName(mode), systemImage: "checkmark")
+                                } else {
+                                    Text(l10n.builtInModeName(mode))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let customModes = coordinator.config.scalingModes.filter { !$0.isBuiltIn }
+            if !customModes.isEmpty {
+                Divider()
+                ForEach(customModes) { mode in
+                    Button {
+                        coordinator.updateDefaultProfile { $0.scalingModeID = mode.id }
+                        coordinator.selectedScalingModeID = mode.id
+                    } label: {
+                        if mode.id == activeID {
+                            Label(l10n.builtInModeName(mode), systemImage: "checkmark")
+                        } else {
+                            Text(l10n.builtInModeName(mode))
+                        }
                     }
                 }
             }
@@ -144,27 +167,27 @@ struct MetalPieApp: App {
 
         Divider()
 
-        Button(l10n.tr("Toggle Floating Toolbar", "切换悬浮工具栏")) {
+        Button(l10n.tr("Show / Hide Floating Toolbar", "显示 / 隐藏顶部工具栏")) {
             coordinator.toggleToolbarVisibility()
         }
         .disabled(!coordinator.isScalingSessionOpen)
 
         Button(coordinator.isProfilerHUDActive
-            ? l10n.tr("Hide Profiler HUD", "隐藏性能 HUD")
-            : l10n.tr("Show Profiler HUD", "显示性能 HUD"))
+            ? l10n.tr("Hide Performance Overlay", "隐藏帧率信息")
+            : l10n.tr("Show Performance Overlay", "显示帧率信息"))
         {
             coordinator.toggleProfilerHUD()
         }
         .disabled(!coordinator.isScalingSessionOpen)
 
-        Button(l10n.tr("Take Cursor-Free Screenshot", "捕获无光标截图")) {
+        Button(l10n.tr("Take Cursor-Free Screenshot", "无光标高清截图")) {
             Task { await coordinator.captureCursorFreeScreenshot() }
         }
         .disabled(!coordinator.isScalingSessionOpen)
 
         if coordinator.isScalingSessionOpen {
             Divider()
-            Button(l10n.tr("Stop Scaling", "停止缩放")) {
+            Button(l10n.tr("Stop Scaling", "退出缩放")) {
                 Task { await coordinator.stopScaling(isManual: true, showToast: true) }
             }
         } else if coordinator.countdownRemaining != nil {
@@ -225,7 +248,7 @@ struct MetalPieApp: App {
             }
         }
 
-        // Optional live 22-shader GPU benchmark before snapshotting Diagnostics.
+        // Optional live 30-shader GPU benchmark before snapshotting Diagnostics.
         if coordinator.autoRunBenchmarkForSnapshot {
             coordinator.selectedTab = .diagnostics
             await coordinator.runShaderBenchmark(

@@ -216,7 +216,7 @@ kernel void fsr1_easu(
 struct RCASUniforms {
     float sharpness;
     uint isHDR;
-    uint _pad0;
+    uint denoise;
     uint _pad1;
 };
 
@@ -267,11 +267,14 @@ kernel void fsr1_rcas(
     float fL = f.b * 0.5f + (f.r * 0.5f + f.g);
     float hL = h.b * 0.5f + (h.r * 0.5f + h.g);
 
-    // Noise detection.
-    float nz = 0.25f * (bL + dL + fL + hL) - eL;
-    float rangeL = max3f(max3f(bL, dL, eL), fL, hL) - min3f(min3f(bL, dL, eL), fL, hL);
-    nz = (rangeL > 1e-6f) ? saturate(abs(nz) / rangeL) : 0.0f;
-    nz = 1.0f - 0.5f * nz;
+    // Noise detection (optional AMD RCAS denoise protection).
+    float nz = 1.0f;
+    if (u.denoise != 0u) {
+        float diffL = 0.25f * (bL + dL + fL + hL) - eL;
+        float rangeL = max3f(max3f(bL, dL, eL), fL, hL) - min3f(min3f(bL, dL, eL), fL, hL);
+        float noiseEst = (rangeL > 1e-6f) ? saturate(abs(diffL) / rangeL) : 0.0f;
+        nz = 1.0f - 0.5f * noiseEst;
+    }
 
     // Min and max of ring — FIXED: uses max(max3(...)) instead of upstream Magpie's min3 typo!
     float mn4R = min(min3f(b.r, d.r, f.r), h.r);

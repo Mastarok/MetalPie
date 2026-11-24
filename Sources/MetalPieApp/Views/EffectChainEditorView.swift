@@ -3,16 +3,19 @@ import MetalPieCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Magpie-class Multi-Pass Effect Chain Builder + Interactive Real-Time Metal Before/After Split-View Preview!
-///
-/// - Left column: Built-in (12) & custom Scaling Modes (`+ New`, `Duplicate`, `Delete`, `Import JSON`, `Export JSON`).
-/// - Right top: Live Apple Silicon GPU `EffectChainRenderer.renderPreview(...)` before/after comparison
-///   with smooth draggable curtain divider, `1×`/`2×`/`4×` zoom, procedural sample scenes + custom image picker,
-///   and real GPU render ms badge!
-/// - Right bottom: Ordered multi-pass effect graph editor supporting all 22 `EffectID`s grouped by category,
-///   reordering, `ScalingType` + scale/pixel inputs, and live typed parameter controls!
+/// Intuitive Scaling Modes workspace (`缩放模式` / `Scaling Modes`):
+/// - Left column: Scenario filter chips (`全部` / `3D 游戏` / `动漫番剧` / `像素复古` / `通用高清`)
+///   covering all 21 built-in presets (including the 6 official Anime4K modes, CuNNy, FXAA+FSR, Jinc, CRT-Lottes)
+///   plus custom user modes (`+ New`, `Duplicate`, `Delete`, `Import`, `Export`).
+/// - Right top: Live Apple Silicon Metal GPU Before/After Split Preview (`原画` vs `放大后`).
+/// - Right middle: Clean, beginner-friendly 「画质微调」 card (for official Anime4K modes: just `画质档位` + `抑制白边`!).
+/// - Right bottom: Collapsible `自定义效果链（进阶）` DisclosureGroup (collapsed for built-in presets, expanded for custom modes)
+///   with full access to all 30 shaders and multi-pass `ScalingType` controls.
 struct EffectChainEditorView: View {
     @Bindable var coordinator: AppCoordinator
+
+    @State private var selectedScenarioFilter: ScenarioTag? = nil
+    @State private var isAdvancedChainExpanded: Bool = false
 
     @State private var selectedScene: PreviewSampleScene = .pixelArtAnime
     @State private var customSourceImage: CGImage? = nil
@@ -33,25 +36,41 @@ struct EffectChainEditorView: View {
             ?? coordinator.config.scalingModes.first
     }
 
+    private static let officialAnime4KIDs: Set<UUID> = [
+        ScalingMode.anime4kModeAID,
+        ScalingMode.anime4kModeBID,
+        ScalingMode.anime4kModeCID,
+        ScalingMode.anime4kModeAAID,
+        ScalingMode.anime4kModeBBID,
+        ScalingMode.anime4kModeCAID
+    ]
+
     var body: some View {
         let l10n = coordinator.l10n
 
         HSplitView {
-            // Left: Scaling Modes Master List
+            // Left: Scenario-Grouped Scaling Modes List
             modesSidebar(l10n: l10n)
-                .frame(minWidth: 205, idealWidth: 225, maxWidth: 270)
+                .frame(minWidth: 236, idealWidth: 256, maxWidth: 296)
 
-            // Right: Live Metal Split-View Preview + Multi-Pass Effect Chain Builder
+            // Right: Live GPU Split Preview + Simple Quality Tuning + Collapsible Advanced Effect Chain
             if let mode = selectedMode {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         modeHeaderBar(mode: mode, l10n: l10n)
                         liveMetalPreviewCard(mode: mode, l10n: l10n)
-                        effectChainBuilderCard(mode: mode, l10n: l10n)
+                        simpleQualityTuningCard(mode: mode, l10n: l10n)
+                        advancedEffectChainSection(mode: mode, l10n: l10n)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(16)
                 }
-                .frame(minWidth: 520)
+                .frame(minWidth: 480, maxWidth: .infinity)
+                .onChange(of: coordinator.selectedScalingModeID) { _, newID in
+                    if let updated = coordinator.config.scalingMode(for: newID) {
+                        isAdvancedChainExpanded = !updated.isBuiltIn
+                    }
+                }
                 .onChange(of: mode) { _, newMode in
                     schedulePreviewRender(for: newMode, debounce: true)
                 }
@@ -61,50 +80,107 @@ struct EffectChainEditorView: View {
                     schedulePreviewRender(for: mode, debounce: false)
                 }
                 .onAppear {
+                    isAdvancedChainExpanded = !mode.isBuiltIn
                     schedulePreviewRender(for: mode, debounce: false)
                 }
             } else {
                 ContentUnavailableView(
-                    l10n.tr("No Scaling Mode Selected", "未选择缩放模式"),
+                    l10n.tr("No Scaling Mode Selected", "请选择一个缩放模式"),
                     systemImage: "sparkles.rectangle.stack"
                 )
             }
         }
     }
 
-    // MARK: - Left Column: Scaling Modes List
+    // MARK: - Left Column: Scenario-Filtered Scaling Modes List
 
     private func modesSidebar(l10n: L10n) -> some View {
-        VStack(spacing: 0) {
+        let customModes = coordinator.config.scalingModes.filter { !$0.isBuiltIn }
+
+        return VStack(spacing: 0) {
             HStack {
-                Text(l10n.tr("Scaling Modes", "缩放预设与管线"))
+                Text(l10n.tr("Scaling Modes", "缩放模式"))
                     .font(.system(size: 13.5, weight: .semibold))
                 Spacer()
                 Button {
-                    _ = coordinator.createNewScalingMode()
+                    let created = coordinator.createNewScalingMode()
+                    selectedScenarioFilter = nil
+                    isAdvancedChainExpanded = true
+                    coordinator.selectedScalingModeID = created.id
                 } label: {
-                    Image(systemName: "plus")
+                    Label(l10n.tr("New", "新建"), systemImage: "plus")
+                        .font(.system(size: 11.5, weight: .medium))
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .help(l10n.tr("New Custom Scaling Mode", "新建自定义缩放模式"))
+                .help(l10n.tr("Create Custom Scaling Mode", "新建自定义缩放模式"))
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
+
+            // Scenario Filter Chips (2 neat rows — compact "All" so "Anime & 2D" & "General & Video" never truncate)
+            VStack(spacing: 5) {
+                HStack(spacing: 5) {
+                    scenarioFilterChip(title: l10n.tr("All", "全部"), symbol: nil, tag: nil, fillWidth: false)
+                    scenarioFilterChip(
+                        title: l10n.scenarioTag(.game3D),
+                        symbol: ScenarioTag.game3D.symbolName,
+                        tag: .game3D,
+                        fillWidth: true
+                    )
+                    scenarioFilterChip(
+                        title: l10n.scenarioTag(.anime),
+                        symbol: ScenarioTag.anime.symbolName,
+                        tag: .anime,
+                        fillWidth: true
+                    )
+                }
+                HStack(spacing: 5) {
+                    scenarioFilterChip(
+                        title: l10n.scenarioTag(.pixelRetro),
+                        symbol: ScenarioTag.pixelRetro.symbolName,
+                        tag: .pixelRetro,
+                        fillWidth: true
+                    )
+                    scenarioFilterChip(
+                        title: l10n.scenarioTag(.generalVideo),
+                        symbol: ScenarioTag.generalVideo.symbolName,
+                        tag: .generalVideo,
+                        fillWidth: true
+                    )
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
 
             Divider()
 
             List(selection: $coordinator.selectedScalingModeID) {
-                Section(l10n.tr("Built-In Presets (12)", "内置精选预设 (12)")) {
-                    ForEach(coordinator.config.scalingModes.filter(\.isBuiltIn)) { mode in
-                        modeListRow(mode, l10n: l10n)
-                            .tag(mode.id)
+                if let filter = selectedScenarioFilter {
+                    let matching = coordinator.orderedBuiltInModes(for: filter)
+                    Section(l10n.scenarioTag(filter)) {
+                        ForEach(matching) { mode in
+                            modeListRow(mode, l10n: l10n)
+                                .tag(mode.id)
+                        }
+                    }
+                } else {
+                    ForEach(ScenarioTag.allCases) { tag in
+                        let group = coordinator.orderedBuiltInModes(for: tag)
+                        if !group.isEmpty {
+                            Section(l10n.scenarioTag(tag)) {
+                                ForEach(group) { mode in
+                                    modeListRow(mode, l10n: l10n)
+                                        .tag(mode.id)
+                                }
+                            }
+                        }
                     }
                 }
 
-                let customModes = coordinator.config.scalingModes.filter { !$0.isBuiltIn }
-                if !customModes.isEmpty {
-                    Section(l10n.tr("Custom Modes", "自定义模式")) {
+                if !customModes.isEmpty && selectedScenarioFilter == nil {
+                    Section(l10n.tr("My Custom Modes", "我的自定义模式")) {
                         ForEach(customModes) { mode in
                             modeListRow(mode, l10n: l10n)
                                 .tag(mode.id)
@@ -116,16 +192,20 @@ struct EffectChainEditorView: View {
 
             Divider()
 
-            // Footer Actions: Duplicate / Delete / Import / Export JSON
+            // Footer Actions: Duplicate / Delete / Import / Export
             HStack(spacing: 6) {
                 Button {
-                    _ = coordinator.duplicateScalingMode(id: coordinator.selectedScalingModeID)
+                    if let copy = coordinator.duplicateScalingMode(id: coordinator.selectedScalingModeID) {
+                        selectedScenarioFilter = nil
+                        isAdvancedChainExpanded = true
+                        coordinator.selectedScalingModeID = copy.id
+                    }
                 } label: {
                     Image(systemName: "plus.square.on.square")
                 }
                 .controlSize(.small)
                 .buttonStyle(.bordered)
-                .help(l10n.tr("Duplicate Mode", "复制当前模式"))
+                .help(l10n.tr("Duplicate as Custom Mode", "复制为自定义模式"))
 
                 Button {
                     coordinator.deleteScalingMode(id: coordinator.selectedScalingModeID)
@@ -156,12 +236,46 @@ struct EffectChainEditorView: View {
         .background(.background)
     }
 
+    private func scenarioFilterChip(
+        title: String,
+        symbol: String?,
+        tag: ScenarioTag?,
+        fillWidth: Bool = true
+    ) -> some View {
+        let isSelected = selectedScenarioFilter == tag
+        return Button {
+            selectedScenarioFilter = tag
+        } label: {
+            HStack(spacing: 3.5) {
+                if let symbol {
+                    Image(systemName: symbol)
+                        .font(.system(size: 9.5, weight: .semibold))
+                }
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.9)
+            }
+            .frame(maxWidth: fillWidth ? .infinity : nil)
+            .padding(.horizontal, fillWidth ? 6 : 9)
+            .padding(.vertical, 5)
+            .foregroundStyle(isSelected ? Color.white : Color.primary)
+            .background(
+                isSelected ? Color.accentColor : Color.primary.opacity(0.06),
+                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
     private func modeListRow(_ mode: ScalingMode, l10n: L10n) -> some View {
         let isDefaultActive = coordinator.config.defaultProfile.scalingModeID == mode.id
+        let subtitle = l10n.builtInModeDescription(mode)
+
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 5) {
                 Text(l10n.builtInModeName(mode))
-                    .font(.system(size: 12.5, weight: .medium))
+                    .font(.system(size: 12.5, weight: .semibold))
                     .lineLimit(1)
                 Spacer(minLength: 2)
                 if isDefaultActive {
@@ -170,9 +284,12 @@ struct EffectChainEditorView: View {
                         .foregroundStyle(.green)
                 }
             }
-            Text("\(mode.effects.filter(\.enabled).count) \(l10n.tr("pass(es)", "个通道"))")
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
+            if !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .padding(.vertical, 2)
     }
@@ -182,20 +299,22 @@ struct EffectChainEditorView: View {
     private func modeHeaderBar(mode: ScalingMode, l10n: L10n) -> some View {
         let isDefaultMode = coordinator.config.defaultProfile.scalingModeID == mode.id
 
-        return HStack(spacing: 12) {
+        return HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 if mode.isBuiltIn {
                     HStack(spacing: 8) {
                         Text(l10n.builtInModeName(mode))
-                            .font(.system(size: 18, weight: .bold))
-                        StatusBadge(l10n.tr("Built-In", "内置预设"), color: .blue)
+                            .font(.system(size: 17.5, weight: .bold))
+                            .lineLimit(2)
+                        StatusBadge(l10n.scenarioTag(mode.scenario), color: .blue, symbol: mode.scenario.symbolName)
                     }
                     Text(l10n.builtInModeDescription(mode))
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else {
                     TextField(
-                        l10n.tr("Scaling Mode Name", "缩放模式名称"),
+                        l10n.tr("Custom Mode Name", "自定义模式名称"),
                         text: Binding(
                             get: { mode.name },
                             set: { newName in
@@ -208,7 +327,7 @@ struct EffectChainEditorView: View {
                     .frame(maxWidth: 320)
 
                     TextField(
-                        l10n.tr("Description", "描述说明"),
+                        l10n.tr("Notes (when to use this mode)", "简短说明（什么时候用它）"),
                         text: Binding(
                             get: { mode.localizedDescription },
                             set: { newDesc in
@@ -222,41 +341,41 @@ struct EffectChainEditorView: View {
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 6)
 
             if isDefaultMode {
-                StatusBadge(l10n.tr("Active Default Preset", "当前默认预设"), color: .green, symbol: "checkmark.circle.fill")
+                StatusBadge(l10n.tr("Default Mode", "当前默认模式"), color: .green, symbol: "checkmark.circle.fill")
             } else {
                 Button {
                     coordinator.updateDefaultProfile { $0.scalingModeID = mode.id }
                     coordinator.showToast(
                         icon: "checkmark.circle.fill",
-                        title: l10n.tr("Set as Default Preset", "已设为默认缩放预设"),
+                        title: l10n.tr("Set as Default Mode", "已设为默认缩放模式"),
                         subtitle: l10n.builtInModeName(mode),
                         style: .success
                     )
                 } label: {
-                    Label(l10n.tr("Use as Default", "设为默认预设"), systemImage: "checkmark.circle")
+                    Label(l10n.tr("Use This Mode", "设为默认模式"), systemImage: "checkmark.circle")
                 }
                 .buttonStyle(.borderedProminent)
             }
         }
     }
 
-    // MARK: - Interactive Real-Time Metal Before/After Split-View Preview
+    // MARK: - Live Metal GPU Before/After Split Preview
 
     private func liveMetalPreviewCard(mode: ScalingMode, l10n: L10n) -> some View {
         SectionCard(
-            title: l10n.tr("Real-Time Metal Before / After Preview", "实时 Metal GPU 前后对比预览"),
+            title: l10n.tr("Live Before / After Preview", "实时画质对比预览"),
             subtitle: l10n.tr(
-                "Drag the vertical curtain to compare raw original input (left) vs live Apple Silicon GPU output (right).",
-                "拖动中间分隔线，实时对比原始低分画面（左）与 Apple Silicon GPU 着色器输出（右）。"
+                "Drag the divider to compare Original (left) vs Upscaled GPU output (right).",
+                "左右拖动中间滑块，实时对比左侧「原画」与右侧「放大后」的实际效果。"
             ),
             symbol: "rectangle.split.2x1.fill",
             accent: .cyan
         ) {
-            // Preview Toolbar
-            HStack(spacing: 8) {
+            // Preview Toolbar (compact min widths so right pane never overflows horizontally in English or Chinese)
+            HStack(spacing: 6) {
                 Picker("", selection: $selectedScene) {
                     ForEach(PreviewSampleScene.allCases) { scene in
                         Text(scene.title(l10n)).tag(scene)
@@ -264,21 +383,21 @@ struct EffectChainEditorView: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(minWidth: 158, maxWidth: 195)
+                .frame(minWidth: 116, maxWidth: 175)
 
                 HStack(spacing: 4) {
                     Button {
                         loadCustomPreviewImage(mode: mode)
                     } label: {
                         Label(
-                            customSourceName ?? l10n.tr("Image…", "图片…"),
+                            customSourceName ?? l10n.tr("Image…", "选本地图片…"),
                             systemImage: "photo.badge.plus"
                         )
                         .lineLimit(1)
                     }
                     .controlSize(.small)
                     .buttonStyle(.bordered)
-                    .fixedSize(horizontal: true, vertical: false)
+                    .frame(maxWidth: 118)
 
                     if customSourceImage != nil {
                         Button {
@@ -290,7 +409,7 @@ struct EffectChainEditorView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
-                        .help(l10n.tr("Revert to Built-In Test Scene", "恢复内置测试场景"))
+                        .help(l10n.tr("Back to Built-In Sample", "恢复示例图片"))
                     }
                 }
 
@@ -304,7 +423,7 @@ struct EffectChainEditorView: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 108)
+                .frame(width: 96)
 
                 // Real GPU Render Time Badge
                 if isRenderingPreview {
@@ -334,7 +453,7 @@ struct EffectChainEditorView: View {
                 ZStack {
                     Color.black
 
-                    // Right side (full background): REAL Metal GPU rendered output!
+                    // Right side (full background): Real Metal GPU rendered output
                     if let rendered = renderedDisplayImage {
                         Image(nsImage: rendered)
                             .resizable()
@@ -345,7 +464,7 @@ struct EffectChainEditorView: View {
                             .clipped()
                     }
 
-                    // Left side (clipped to dividerX): Crisp un-upscaled Original input!
+                    // Left side (clipped to dividerX): Original input
                     if let original = originalDisplayImage {
                         Image(nsImage: original)
                             .resizable()
@@ -363,21 +482,21 @@ struct EffectChainEditorView: View {
                     // Corner Labels
                     VStack {
                         HStack {
-                            Text(verbatim: "\(l10n.tr("ORIGINAL", "原始输入")) (\(previewSourceSize.width)×\(previewSourceSize.height))")
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            Text(verbatim: "\(l10n.tr("ORIGINAL", "原画")) (\(previewSourceSize.width)×\(previewSourceSize.height))")
+                                .font(.system(size: 10.5, weight: .bold))
                                 .foregroundStyle(.white)
-                                .padding(.horizontal, 8)
+                                .padding(.horizontal, 9)
                                 .padding(.vertical, 3.5)
-                                .background(Color.black.opacity(0.65), in: Capsule())
+                                .background(Color.black.opacity(0.68), in: Capsule())
 
                             Spacer()
 
-                            Text(verbatim: "\(l10n.tr("GPU OUTPUT", "GPU 输出")) (\(previewOutputSize.width)×\(previewOutputSize.height))")
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            Text(verbatim: "\(l10n.tr("UPSCALED", "放大后")) (\(previewOutputSize.width)×\(previewOutputSize.height))")
+                                .font(.system(size: 10.5, weight: .bold))
                                 .foregroundStyle(Color.cyan)
-                                .padding(.horizontal, 8)
+                                .padding(.horizontal, 9)
                                 .padding(.vertical, 3.5)
-                                .background(Color.black.opacity(0.70), in: Capsule())
+                                .background(Color.black.opacity(0.72), in: Capsule())
                         }
                         .padding(10)
                         Spacer()
@@ -416,71 +535,348 @@ struct EffectChainEditorView: View {
                         }
                 )
             }
-            .frame(height: 270)
+            .frame(height: 268)
         }
     }
 
-    // MARK: - Magpie-Style Multi-Pass Effect Chain Builder
+    // MARK: - Beginner-Friendly Quality Tuning Card
 
-    private func effectChainBuilderCard(mode: ScalingMode, l10n: L10n) -> some View {
-        SectionCard(
-            title: l10n.tr("Multi-Pass Effect Chain", "多通道着色器链 (Effect Chain)"),
-            subtitle: l10n.tr(
-                "Effects run sequentially from top to bottom on the GPU. An automatic Bicubic Catmull-Rom pass adapts fixed-factor CNNs when needed.",
-                "着色器通道按从上到下的顺序在 GPU 上串联执行。定倍神经网络在输出不匹配时会自动补全双三次平滑通道。"
-            ),
-            symbol: "square.stack.3d.down.right.fill",
-            accent: .indigo
-        ) {
-            // Add Effect Grouped Menu (All 22 EffectIDs grouped by all 9 EffectCategories!)
-            HStack {
-                Menu {
-                    ForEach(EffectCategory.allCases) { category in
-                        let items = EffectCatalog.effects(in: category)
-                        if !items.isEmpty {
-                            Menu(l10n.effectCategory(category)) {
-                                ForEach(items) { desc in
-                                    Button {
-                                        addEffect(desc.id, to: mode.id)
-                                    } label: {
-                                        Text(l10n.effectName(desc))
+    @ViewBuilder
+    private func simpleQualityTuningCard(mode: ScalingMode, l10n: L10n) -> some View {
+        if Self.officialAnime4KIDs.contains(mode.id) {
+            anime4KSimpleTuningCard(mode: mode, l10n: l10n)
+        } else {
+            let tunablePasses: [(instance: EffectInstance, descriptor: EffectDescriptor)] = mode.effects.compactMap { eff in
+                guard eff.enabled else { return nil }
+                let desc = EffectCatalog.descriptor(for: eff.effectID)
+                guard !desc.parameters.isEmpty else { return nil }
+                return (eff, desc)
+            }
+
+            SectionCard(
+                title: l10n.tr("Quality Tuning", "画质微调"),
+                subtitle: l10n.tr(
+                    "Adjust key look & sharpness options — preview updates in real time.",
+                    "常用画质选项已为你整理好，拖动滑块即可在上方实时看到变化。"
+                ),
+                symbol: "slider.horizontal.3",
+                accent: .blue
+            ) {
+                if tunablePasses.isEmpty {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.seal.fill")
+                            .foregroundStyle(.green)
+                        Text(l10n.tr(
+                            "This mode works great out of the box with no manual tuning required.",
+                            "此模式已按最佳效果预设好，无需手动调参，直接开启即可。"
+                        ))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(tunablePasses, id: \.instance.id) { item in
+                            if tunablePasses.count > 1 {
+                                Text(l10n.effectName(item.descriptor))
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            ForEach(item.descriptor.parameters) { param in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    parameterControlRow(
+                                        modeID: mode.id,
+                                        instance: item.instance,
+                                        param: param,
+                                        l10n: l10n
+                                    )
+                                    let descText = l10n.parameterDescription(param)
+                                    if !descText.isEmpty {
+                                        Text(descText)
+                                            .font(.system(size: 10.5))
+                                            .foregroundStyle(.secondary)
+                                            .padding(.leading, 158)
                                     }
                                 }
                             }
                         }
+
+                        if mode.isBuiltIn {
+                            HStack {
+                                Spacer()
+                                Button {
+                                    resetBuiltInModeToDefaults(mode)
+                                } label: {
+                                    Label(l10n.tr("Reset to Preset Default", "恢复预设默认"), systemImage: "arrow.counterclockwise")
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.bordered)
+                            }
+                        }
                     }
-                } label: {
-                    Label(l10n.tr("Add Effect Pass", "添加着色器通道"), systemImage: "plus.circle.fill")
                 }
-                .menuStyle(.borderedButton)
-                .fixedSize()
+            }
+        }
+    }
 
-                Spacer()
+    /// Ultra-clean 2-control card for the 6 Official Anime4K modes (`画质档位` + `抑制白边`).
+    private func anime4KSimpleTuningCard(mode: ScalingMode, l10n: L10n) -> some View {
+        let currentTier = currentAnime4KTier(for: mode)
+        let clampEnabled = currentAnime4KClampHighlights(for: mode)
 
-                Text("\(mode.effects.count) \(l10n.tr("effect(s) configured", "个通道"))")
+        return SectionCard(
+            title: l10n.tr("Anime4K Quality Tuning", "画质微调（Anime4K 官方模式）"),
+            subtitle: l10n.tr(
+                "Pick a quality tier and halo protection — MetalPie handles the official multi-pass recipe automatically.",
+                "官方模式已经配置好完整处理流程，平时只需选择画质档位与是否抑制白边即可。"
+            ),
+            symbol: "sparkles",
+            accent: .purple
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Text(l10n.tr("Quality Tier", "画质档位"))
+                        .font(.system(size: 12.5, weight: .medium))
+                        .frame(width: 84, alignment: .leading)
+
+                    Picker("", selection: Binding<String>(
+                        get: { currentTier },
+                        set: { newTier in
+                            applyAnime4KTier(newTier, to: mode)
+                        }
+                    )) {
+                        Text(l10n.tr("Fast (S)", "轻量 (S)")).tag("S")
+                        Text(l10n.tr("Balanced (M)", "标准 (M)")).tag("M")
+                        Text(l10n.tr("High (L)", "高画质 (L)")).tag("L")
+                        Text(l10n.tr("Ultra (VL)", "超高 (VL)")).tag("VL")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 420)
+
+                    Spacer(minLength: 0)
+                }
+
+                Toggle(isOn: Binding<Bool>(
+                    get: { clampEnabled },
+                    set: { enabled in
+                        applyAnime4KClampHighlights(enabled, to: mode)
+                    }
+                )) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(l10n.tr("Reduce White Edge Halos (Clamp Highlights)", "抑制白边光晕"))
+                            .font(.system(size: 12.5, weight: .medium))
+                        Text(l10n.tr(
+                            "Prevents bright white ringing outlines around dark anime ink lines (recommended ON).",
+                            "防止人物黑边与发丝外侧出现刺眼的白色亮边，建议保持开启。"
+                        ))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack {
+                    Text(l10n.tr(
+                        "Tip: Mode A is best for most 1080p anime; Mode B is softer for 720p; Mode C is cleanest for Blu-ray.",
+                        "小提示：大多数番剧选 Mode A；720p 或柔和画风选 Mode B；高清原盘选 Mode C；片源偏糊可选 A+A / B+B。"
+                    ))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Button {
+                        resetBuiltInModeToDefaults(mode)
+                    } label: {
+                        Label(l10n.tr("Reset", "恢复默认"), systemImage: "arrow.counterclockwise")
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+    }
+
+    private func currentAnime4KTier(for mode: ScalingMode) -> String {
+        // Inspect the primary upscaling pass (or first restore pass) to normalize S / M / L / VL.
+        let primary = mode.effects.first(where: {
+            $0.effectID == .anime4kUpscale || $0.effectID == .anime4kUpscaleDenoise
+        }) ?? mode.effects.first(where: { $0.effectID == .anime4kRestore })
+
+        let raw = primary?.parameters.choice("variant", default: "L") ?? "L"
+        switch raw {
+        case "S": return "S"
+        case "M", "softM": return "M"
+        case "VL": return "VL"
+        default: return "L"
+        }
+    }
+
+    private func currentAnime4KClampHighlights(for mode: ScalingMode) -> Bool {
+        if let clampPass = mode.effects.first(where: { $0.effectID == .anime4kClampHighlights }) {
+            return clampPass.enabled
+        }
+        if let first = mode.effects.first(where: {
+            $0.effectID == .anime4kRestore || $0.effectID == .anime4kUpscale || $0.effectID == .anime4kUpscaleDenoise
+        }) {
+            return first.parameters.bool("clampHighlights", default: true)
+        }
+        return true
+    }
+
+    private func applyAnime4KTier(_ tier: String, to mode: ScalingMode) {
+        let isSoftMode = (mode.id == ScalingMode.anime4kModeBID || mode.id == ScalingMode.anime4kModeBBID)
+        let secondaryRestoreTier: String = {
+            switch tier {
+            case "S": return "S"
+            case "M": return isSoftMode ? "softM" : "M"
+            case "L": return isSoftMode ? "softM" : "M"
+            case "VL": return isSoftMode ? "softL" : "L"
+            default: return isSoftMode ? "softM" : "M"
+            }
+        }()
+        let primaryRestoreTier: String = {
+            switch tier {
+            case "S": return "S"
+            case "M": return isSoftMode ? "softM" : "M"
+            case "L": return isSoftMode ? "softL" : "L"
+            case "VL": return "VL"
+            default: return isSoftMode ? "softL" : "L"
+            }
+        }()
+
+        coordinator.updateScalingMode(id: mode.id) { m in
+            var seenUpscale = false
+            for idx in m.effects.indices {
+                switch m.effects[idx].effectID {
+                case .anime4kUpscale, .anime4kUpscaleDenoise:
+                    seenUpscale = true
+                    m.effects[idx].parameters["variant"] = .choice(tier)
+                case .anime4kRestore:
+                    m.effects[idx].parameters["variant"] = .choice(seenUpscale ? secondaryRestoreTier : primaryRestoreTier)
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private func applyAnime4KClampHighlights(_ enabled: Bool, to mode: ScalingMode) {
+        coordinator.updateScalingMode(id: mode.id) { m in
+            for idx in m.effects.indices {
+                switch m.effects[idx].effectID {
+                case .anime4kClampHighlights:
+                    m.effects[idx].enabled = enabled
+                case .anime4kRestore, .anime4kUpscale, .anime4kUpscaleDenoise:
+                    m.effects[idx].parameters["clampHighlights"] = .bool(enabled)
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private func resetBuiltInModeToDefaults(_ mode: ScalingMode) {
+        guard let canonical = ScalingMode.builtInPresets.first(where: { $0.id == mode.id }) else { return }
+        coordinator.updateScalingMode(id: mode.id) { m in
+            m.effects = canonical.effects
+        }
+    }
+
+    // MARK: - Collapsible Advanced Multi-Pass Effect Chain
+
+    private func advancedEffectChainSection(mode: ScalingMode, l10n: L10n) -> some View {
+        SectionCard {
+            DisclosureGroup(isExpanded: $isAdvancedChainExpanded) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(l10n.tr(
+                        "Combine any of MetalPie's 30 GPU shaders in sequence. Effects run from top to bottom.",
+                        "进阶玩家可在此自由增删、排序全部 30 种画质算法，并设置每个步骤的缩放方式与细节参数。"
+                    ))
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
-            }
+                    .padding(.top, 4)
 
-            if mode.effects.isEmpty {
-                VStack(spacing: 6) {
-                    Text(l10n.tr("No effects in chain — default Bicubic Catmull-Rom fit will be used.", "当前链为空 — 将默认使用双三次 Catmull-Rom 等比缩放。"))
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 20)
-            } else {
-                VStack(spacing: 10) {
-                    ForEach(Array(mode.effects.enumerated()), id: \.element.id) { index, instance in
-                        effectInstanceCard(
-                            modeID: mode.id,
-                            instance: instance,
-                            index: index,
-                            totalCount: mode.effects.count,
-                            l10n: l10n
-                        )
+                    // Add Effect Grouped Menu (All 30 EffectIDs grouped by all 9 categories)
+                    HStack {
+                        Menu {
+                            ForEach(EffectCategory.allCases) { category in
+                                let items = EffectCatalog.effects(in: category)
+                                if !items.isEmpty {
+                                    Menu(l10n.effectCategory(category)) {
+                                        ForEach(items) { desc in
+                                            Button {
+                                                addEffect(desc.id, to: mode.id)
+                                            } label: {
+                                                Text(l10n.effectName(desc))
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label(l10n.tr("Add Effect", "添加画质效果"), systemImage: "plus.circle.fill")
+                        }
+                        .menuStyle(.borderedButton)
+                        .fixedSize()
+
+                        Spacer()
+
+                        if mode.isBuiltIn {
+                            Button {
+                                resetBuiltInModeToDefaults(mode)
+                            } label: {
+                                Label(l10n.tr("Reset Preset Chain", "还原内置效果链"), systemImage: "arrow.counterclockwise")
+                            }
+                            .controlSize(.small)
+                            .buttonStyle(.bordered)
+                        }
+
+                        Text("\(mode.effects.count) \(l10n.tr("step(s)", "个步骤"))")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
                     }
+
+                    if mode.effects.isEmpty {
+                        VStack(spacing: 6) {
+                            Text(l10n.tr("No effects added — smooth Bicubic scaling will be used automatically.", "效果链为空 — 将自动使用平滑双三次缩放。"))
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                    } else {
+                        VStack(spacing: 10) {
+                            ForEach(Array(mode.effects.enumerated()), id: \.element.id) { index, instance in
+                                effectInstanceCard(
+                                    modeID: mode.id,
+                                    instance: instance,
+                                    index: index,
+                                    totalCount: mode.effects.count,
+                                    l10n: l10n
+                                )
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.stack.3d.down.right.fill")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.indigo)
+                        .frame(width: 22, height: 22)
+                        .background(Color.indigo.opacity(0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(l10n.tr("Custom Effect Chain (Advanced)", "自定义效果链（进阶）"))
+                            .font(.system(size: 13.5, weight: .semibold))
+                        Text(l10n.tr(
+                            "\(mode.effects.filter(\.enabled).count) active pass(es) • Expand to edit individual shaders",
+                            "当前包含 \(mode.effects.filter(\.enabled).count) 个步骤 • 展开可自由组合全部 30 种着色器"
+                        ))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer()
                 }
             }
         }
@@ -556,7 +952,7 @@ struct EffectChainEditorView: View {
                         }
                         .controlSize(.small)
                         .buttonStyle(.bordered)
-                        .help(l10n.tr("Reset Parameters to Default", "恢复默认参数"))
+                        .help(l10n.tr("Reset Parameters", "恢复默认参数"))
                     }
 
                     Button {
@@ -567,20 +963,18 @@ struct EffectChainEditorView: View {
                     }
                     .controlSize(.small)
                     .buttonStyle(.bordered)
-                    .help(l10n.tr("Remove Effect", "移除此通道"))
+                    .help(l10n.tr("Remove Effect", "移除此步骤"))
                 }
             }
 
-            // Effect summary description
             Text(l10n.effectSummary(desc))
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            // Scaling Type + Scale/Absolute Inputs (when effect is not strictly sameSize)
             if desc.scaleCapability != .sameSize {
                 HStack(spacing: 12) {
-                    Picker(l10n.tr("Scaling Type", "缩放方式"), selection: Binding(
+                    Picker(l10n.tr("Scaling Mode", "缩放方式"), selection: Binding(
                         get: { instance.scalingType },
                         set: { newType in
                             mutateEffect(modeID: modeID, effectInstanceID: instance.id) { $0.scalingType = newType }
@@ -591,7 +985,7 @@ struct EffectChainEditorView: View {
                         }
                     }
                     .pickerStyle(.menu)
-                    .frame(maxWidth: 220)
+                    .frame(maxWidth: 230)
 
                     if instance.scalingType == .normal || instance.scalingType == .fit {
                         HStack(spacing: 4) {
@@ -675,7 +1069,6 @@ struct EffectChainEditorView: View {
                 }
             }
 
-            // Dynamic Typed Parameter Controls
             if !desc.parameters.isEmpty {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
@@ -790,7 +1183,7 @@ struct EffectChainEditorView: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(maxWidth: 210)
+                .frame(maxWidth: 230)
                 Spacer()
             }
         }
@@ -844,7 +1237,6 @@ struct EffectChainEditorView: View {
         previewSourceSize = srcSize
         previewOutputSize = outSize
 
-        // Prepare crisp nearest-neighbor original comparison image at matching output size
         if let crispOrig = PreviewSampleGenerator.resizeCGImage(
             srcCG,
             width: outSize.width,
@@ -908,6 +1300,8 @@ struct EffectChainEditorView: View {
             do {
                 let data = try Data(contentsOf: url)
                 let imported = try coordinator.importScalingModes(from: data)
+                selectedScenarioFilter = nil
+                isAdvancedChainExpanded = true
                 coordinator.showToast(
                     icon: "square.and.arrow.down.fill",
                     title: l10n.tr("Imported \(imported.count) Scaling Mode(s)", "已导入 \(imported.count) 个缩放模式"),
@@ -930,7 +1324,7 @@ struct EffectChainEditorView: View {
                 try data.write(to: url, options: [.atomic])
                 coordinator.showToast(
                     icon: "square.and.arrow.up.fill",
-                    title: l10n.tr("Exported Scaling Mode", "已导出缩放模式 JSON"),
+                    title: l10n.tr("Exported Scaling Mode", "已导出缩放模式"),
                     subtitle: url.lastPathComponent,
                     style: .success
                 )

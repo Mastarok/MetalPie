@@ -899,7 +899,7 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         }
     }
 
-    // MARK: - Private Effect Dispatch (All 22 Built-In EffectIDs)
+    // MARK: - Private Effect Dispatch (All 30 Built-In EffectIDs)
 
     private func encodeSingleEffect(
         effectID: EffectID,
@@ -975,12 +975,13 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             struct RCASUniforms {
                 var sharpness: Float
                 var isHDR: UInt32
-                var _pad0: UInt32 = 0
+                var denoise: UInt32
                 var _pad1: UInt32 = 0
             }
             var u = RCASUniforms(
                 sharpness: parameters.float32("sharpness", default: 0.87),
-                isHDR: isHDR ? 1 : 0
+                isHDR: isHDR ? 1 : 0,
+                denoise: parameters.bool("denoise", default: true) ? 1 : 0
             )
             let pipe = try shaderManager.computePipeline(library: "FSR1", function: "fsr1_rcas", effectHint: .fsr1RCAS)
             if let enc = commandBuffer.makeComputeCommandEncoder() {
@@ -1016,62 +1017,51 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             }
 
         case .anime4kRestore:
-            struct Anime4KRestoreUniforms {
-                var strength: Float
-                var _pad0: UInt32 = 0
-                var _pad1: UInt32 = 0
-                var _pad2: UInt32 = 0
-            }
-            var u = Anime4KRestoreUniforms(strength: parameters.float32("strength", default: 1.0))
-            let p1 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_restore_pass1", effectHint: .anime4kRestore)
-            let p2 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_restore_pass2", effectHint: .anime4kRestore)
-            let p3 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_restore_pass3", effectHint: .anime4kRestore)
-            let p4 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_restore_pass4", effectHint: .anime4kRestore)
+            let variant = parameters.choice("variant", default: "M")
+            let strength = parameters.float32("strength", default: 1.0)
+            let clampHighlights = parameters.bool("clampHighlights", default: true)
+            try encodeAnime4KRestore(
+                variant: variant,
+                strength: strength,
+                clampHighlights: clampHighlights,
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
 
-            let tex1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            let tex2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            frameLeases.append(contentsOf: [tex1, tex2])
-
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.label = "Anime4K_Restore"
-                enc.setComputePipelineState(p1)
-                enc.setTexture(source, index: 0)
-                enc.setTexture(tex1.texture, index: 1)
-                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
-
-                enc.setComputePipelineState(p2)
-                enc.setTexture(tex1.texture, index: 0)
-                enc.setTexture(tex2.texture, index: 1)
-                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
-
-                enc.setComputePipelineState(p3)
-                enc.setTexture(tex2.texture, index: 0)
-                enc.setTexture(tex1.texture, index: 1)
-                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
-
-                enc.setComputePipelineState(p4)
-                enc.setTexture(source, index: 0)
-                enc.setTexture(tex1.texture, index: 1)
-                enc.setTexture(destination, index: 2)
-                enc.setBytes(&u, length: MemoryLayout<Anime4KRestoreUniforms>.stride, index: 0)
-                dispatch2D(encoder: enc, pipeline: p4, width: outW, height: outH)
-                enc.endEncoding()
-            }
+        case .anime4kUpscale:
+            let variant = parameters.choice("variant", default: "L")
+            let strength = parameters.float32("strength", default: 1.0)
+            let clampHighlights = parameters.bool("clampHighlights", default: true)
+            try encodeAnime4KUpscale(
+                variant: variant,
+                strength: strength,
+                clampHighlights: clampHighlights,
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
 
         case .anime4kUpscaleDenoise:
-            let denoiseStrength = parameters.float32("denoiseStrength", default: 0.5)
-            let lineThinning = parameters.float32("lineThinning", default: 0.0)
+            let variant = parameters.choice("variant", default: "L")
+            let denoiseStrength = parameters.float32("denoiseStrength", default: 1.0)
+            let lineSharpness = parameters.float32("lineSharpness", default: 1.0)
+            let clampHighlights = parameters.bool("clampHighlights", default: true)
+            let legacyThinning = parameters.float32("lineThinning", default: 0.0)
             var cnnInput: any MTLTexture = source
 
-            // Optional bilateral mode denoise pre-pass
-            if denoiseStrength > 0.001 {
+            // Smooth bilateral mode pre-denoise scaled by denoiseStrength (0 = off, 1 = subtle, 2 = strong)
+            if denoiseStrength > 0.01 {
                 struct Anime4KDenoiseUniforms {
                     var denoiseStrength: Float
                     var _pad0: UInt32 = 0
                     var _pad1: UInt32 = 0
                     var _pad2: UInt32 = 0
                 }
-                var du = Anime4KDenoiseUniforms(denoiseStrength: denoiseStrength)
+                let effectiveBilateral = min(max(denoiseStrength * 0.35, 0.0), 1.0)
+                var du = Anime4KDenoiseUniforms(denoiseStrength: effectiveBilateral)
                 let pDenoise = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_bilateral_mode", effectHint: .anime4kUpscaleDenoise)
                 let denoised = try texturePool.acquire(width: inW, height: inH, pixelFormat: source.pixelFormat, usage: rwUsage, storageMode: .private)
                 frameLeases.append(denoised)
@@ -1087,22 +1077,22 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 cnnInput = denoised.texture
             }
 
-            // Optional line-thinning pre-pass
-            if lineThinning > 0.001 {
+            // Backwards-compatible support for legacy saved `lineThinning` parameter if present
+            if legacyThinning > 0.001 {
                 struct Anime4KThinUniforms {
-                    var lineThinning: Float
+                    var strength: Float
+                    var iterations: UInt32
                     var _pad0: UInt32 = 0
                     var _pad1: UInt32 = 0
-                    var _pad2: UInt32 = 0
                 }
-                var tu = Anime4KThinUniforms(lineThinning: lineThinning)
+                var tu = Anime4KThinUniforms(strength: legacyThinning, iterations: 1)
                 let pSobel = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_sobel", effectHint: .anime4kUpscaleDenoise)
                 let pWarp = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_warp", effectHint: .anime4kUpscaleDenoise)
                 let gradTex = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rg16Float, usage: rwUsage, storageMode: .private)
                 let thinned = try texturePool.acquire(width: inW, height: inH, pixelFormat: source.pixelFormat, usage: rwUsage, storageMode: .private)
                 frameLeases.append(contentsOf: [gradTex, thinned])
                 if let enc = commandBuffer.makeComputeCommandEncoder() {
-                    enc.label = "Anime4K_LineThinning"
+                    enc.label = "Anime4K_LineThinningLegacy"
                     enc.setComputePipelineState(pSobel)
                     enc.setTexture(cnnInput, index: 0)
                     enc.setTexture(gradTex.texture, index: 1)
@@ -1119,44 +1109,273 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 cnnInput = thinned.texture
             }
 
-            // 4-pass CReLU RGBA16F CNN + 2x depth-to-space upscaler
-            let p1 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass1", effectHint: .anime4kUpscaleDenoise)
-            let p2 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass2", effectHint: .anime4kUpscaleDenoise)
-            let p3 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass3", effectHint: .anime4kUpscaleDenoise)
-            let p4 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass4", effectHint: .anime4kUpscaleDenoise)
+            try encodeAnime4KUpscaleDenoise(
+                variant: variant,
+                strength: lineSharpness,
+                clampHighlights: clampHighlights,
+                source: cnnInput,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
 
-            let tex1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            let tex2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            frameLeases.append(contentsOf: [tex1, tex2])
+        case .anime4kThin:
+            struct Anime4KThinUniforms {
+                var strength: Float
+                var iterations: UInt32
+                var _pad0: UInt32 = 0
+                var _pad1: UInt32 = 0
+            }
+            let quality = parameters.choice("quality", default: "hq")
+            var tu = Anime4KThinUniforms(
+                strength: parameters.float32("strength", default: 0.6),
+                iterations: UInt32(max(1, min(3, parameters.int("iterations", default: 1))))
+            )
+            let pSobel = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_sobel", effectHint: .anime4kThin)
+            let gradA = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rg16Float, usage: rwUsage, storageMode: .private)
+            frameLeases.append(gradA)
 
+            if quality == "fast" {
+                let pWarp = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_warp", effectHint: .anime4kThin)
+                if let enc = commandBuffer.makeComputeCommandEncoder() {
+                    enc.label = "Anime4K_Thin_Fast"
+                    enc.setComputePipelineState(pSobel)
+                    enc.setTexture(source, index: 0)
+                    enc.setTexture(gradA.texture, index: 1)
+                    dispatch2D(encoder: enc, pipeline: pSobel, width: inW, height: inH)
+
+                    enc.setComputePipelineState(pWarp)
+                    enc.setTexture(source, index: 0)
+                    enc.setTexture(gradA.texture, index: 1)
+                    enc.setTexture(destination, index: 2)
+                    enc.setBytes(&tu, length: MemoryLayout<Anime4KThinUniforms>.stride, index: 0)
+                    dispatch2D(encoder: enc, pipeline: pWarp, width: outW, height: outH)
+                    enc.endEncoding()
+                }
+            } else {
+                let pGX = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_gauss_x", effectHint: .anime4kThin)
+                let pGY = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_gauss_y", effectHint: .anime4kThin)
+                let pKernel = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_kernel", effectHint: .anime4kThin)
+                let pHQWarp = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_hq_warp", effectHint: .anime4kThin)
+                let gradB = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rg16Float, usage: rwUsage, storageMode: .private)
+                frameLeases.append(gradB)
+                if let enc = commandBuffer.makeComputeCommandEncoder() {
+                    enc.label = "Anime4K_Thin_HQ"
+                    enc.setComputePipelineState(pSobel)
+                    enc.setTexture(source, index: 0)
+                    enc.setTexture(gradA.texture, index: 1)
+                    dispatch2D(encoder: enc, pipeline: pSobel, width: inW, height: inH)
+
+                    enc.setComputePipelineState(pGX)
+                    enc.setTexture(gradA.texture, index: 0)
+                    enc.setTexture(gradB.texture, index: 1)
+                    dispatch2D(encoder: enc, pipeline: pGX, width: inW, height: inH)
+
+                    enc.setComputePipelineState(pGY)
+                    enc.setTexture(gradB.texture, index: 0)
+                    enc.setTexture(gradA.texture, index: 1)
+                    dispatch2D(encoder: enc, pipeline: pGY, width: inW, height: inH)
+
+                    enc.setComputePipelineState(pKernel)
+                    enc.setTexture(gradA.texture, index: 0)
+                    enc.setTexture(gradB.texture, index: 1)
+                    dispatch2D(encoder: enc, pipeline: pKernel, width: inW, height: inH)
+
+                    enc.setComputePipelineState(pHQWarp)
+                    enc.setTexture(source, index: 0)
+                    enc.setTexture(gradB.texture, index: 1)
+                    enc.setTexture(destination, index: 2)
+                    enc.setBytes(&tu, length: MemoryLayout<Anime4KThinUniforms>.stride, index: 0)
+                    dispatch2D(encoder: enc, pipeline: pHQWarp, width: outW, height: outH)
+                    enc.endEncoding()
+                }
+            }
+
+        case .anime4kDarken:
+            struct Anime4KDarkenUniforms {
+                var strength: Float
+                var _pad0: UInt32 = 0
+                var _pad1: UInt32 = 0
+                var _pad2: UInt32 = 0
+            }
+            let quality = parameters.choice("quality", default: "hq")
+            var du = Anime4KDarkenUniforms(strength: parameters.float32("strength", default: 0.5))
+            if quality == "fast" {
+                let pFast = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_fast", effectHint: .anime4kDarken)
+                if let enc = commandBuffer.makeComputeCommandEncoder() {
+                    enc.label = "Anime4K_Darken_Fast"
+                    enc.setComputePipelineState(pFast)
+                    enc.setTexture(source, index: 0)
+                    enc.setTexture(destination, index: 1)
+                    enc.setBytes(&du, length: MemoryLayout<Anime4KDarkenUniforms>.stride, index: 0)
+                    dispatch2D(encoder: enc, pipeline: pFast, width: outW, height: outH)
+                    enc.endEncoding()
+                }
+            } else {
+                let pLuma = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_luma", effectHint: .anime4kDarken)
+                let pDiffX = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_diff_x", effectHint: .anime4kDarken)
+                let pDiffY = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_diff_y", effectHint: .anime4kDarken)
+                let pApply = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_apply", effectHint: .anime4kDarken)
+                let tLuma = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rg16Float, usage: rwUsage, storageMode: .private)
+                let tBlurX = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rg16Float, usage: rwUsage, storageMode: .private)
+                let tDiff = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rg16Float, usage: rwUsage, storageMode: .private)
+                frameLeases.append(contentsOf: [tLuma, tBlurX, tDiff])
+                if let enc = commandBuffer.makeComputeCommandEncoder() {
+                    enc.label = "Anime4K_Darken_HQ"
+                    enc.setComputePipelineState(pLuma)
+                    enc.setTexture(source, index: 0)
+                    enc.setTexture(tLuma.texture, index: 1)
+                    dispatch2D(encoder: enc, pipeline: pLuma, width: inW, height: inH)
+
+                    enc.setComputePipelineState(pDiffX)
+                    enc.setTexture(tLuma.texture, index: 0)
+                    enc.setTexture(tBlurX.texture, index: 1)
+                    dispatch2D(encoder: enc, pipeline: pDiffX, width: inW, height: inH)
+
+                    enc.setComputePipelineState(pDiffY)
+                    enc.setTexture(tBlurX.texture, index: 0)
+                    enc.setTexture(tLuma.texture, index: 1)
+                    enc.setTexture(tDiff.texture, index: 2)
+                    dispatch2D(encoder: enc, pipeline: pDiffY, width: inW, height: inH)
+
+                    enc.setComputePipelineState(pApply)
+                    enc.setTexture(source, index: 0)
+                    enc.setTexture(tDiff.texture, index: 1)
+                    enc.setTexture(destination, index: 2)
+                    enc.setBytes(&du, length: MemoryLayout<Anime4KDarkenUniforms>.stride, index: 0)
+                    dispatch2D(encoder: enc, pipeline: pApply, width: outW, height: outH)
+                    enc.endEncoding()
+                }
+            }
+
+        case .anime4kDenoiseBilateral:
+            struct Anime4KBilateralUniforms {
+                var intensitySigma: Float
+                var spatialSigma: Float
+                var mode: UInt32
+                var _pad0: UInt32 = 0
+            }
+            let modeStr = parameters.choice("mode", default: "mode")
+            let modeID: UInt32 = (modeStr == "mean") ? 1 : ((modeStr == "median") ? 2 : 0)
+            var bu = Anime4KBilateralUniforms(
+                intensitySigma: parameters.float32("intensitySigma", default: 0.15),
+                spatialSigma: parameters.float32("spatialSigma", default: 1.0),
+                mode: modeID
+            )
+            let pipe = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_bilateral_full", effectHint: .anime4kDenoiseBilateral)
             if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.label = "Anime4K_UpscaleCNN"
-                enc.setComputePipelineState(p1)
-                enc.setTexture(cnnInput, index: 0)
-                enc.setTexture(tex1.texture, index: 1)
-                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+                enc.label = "Anime4K_DenoiseBilateral"
+                enc.setComputePipelineState(pipe)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(destination, index: 1)
+                enc.setBytes(&bu, length: MemoryLayout<Anime4KBilateralUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: pipe, width: outW, height: outH)
+                enc.endEncoding()
+            }
 
-                enc.setComputePipelineState(p2)
-                enc.setTexture(tex1.texture, index: 0)
-                enc.setTexture(tex2.texture, index: 1)
-                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+        case .anime4kClampHighlights:
+            struct Anime4KClampUniforms {
+                var radius: UInt32
+                var strength: Float
+                var _pad0: UInt32 = 0
+                var _pad1: UInt32 = 0
+            }
+            var cu = Anime4KClampUniforms(
+                radius: UInt32(max(1, min(2, parameters.int("radius", default: 1)))),
+                strength: parameters.float32("strength", default: 1.0)
+            )
+            let pipe = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_clamp_highlights", effectHint: .anime4kClampHighlights)
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Anime4K_ClampHighlights"
+                enc.setComputePipelineState(pipe)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(destination, index: 1)
+                enc.setBytes(&cu, length: MemoryLayout<Anime4KClampUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: pipe, width: outW, height: outH)
+                enc.endEncoding()
+            }
 
-                enc.setComputePipelineState(p3)
-                enc.setTexture(tex2.texture, index: 0)
-                enc.setTexture(tex1.texture, index: 1)
-                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+        case .cunny:
+            let variant = parameters.choice("variant", default: "balanced")
+            let sharpness = parameters.float32("sharpness", default: 1.0)
+            try encodeCuNNy(
+                variant: variant,
+                sharpness: sharpness,
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
 
-                enc.setComputePipelineState(p4)
-                enc.setTexture(cnnInput, index: 0)
-                enc.setTexture(tex1.texture, index: 1)
-                enc.setTexture(destination, index: 2)
-                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+        case .fxaa:
+            struct FXAAUniforms {
+                var qualityPreset: UInt32
+                var edgeThreshold: Float
+                var subpixelQuality: Float
+                var _pad0: UInt32 = 0
+            }
+            let presetStr = parameters.choice("qualityPreset", default: "high")
+            let presetID: UInt32
+            switch presetStr {
+            case "low": presetID = 0
+            case "medium": presetID = 1
+            case "ultra": presetID = 3
+            default: presetID = 2
+            }
+            var fu = FXAAUniforms(
+                qualityPreset: presetID,
+                edgeThreshold: parameters.float32("edgeThreshold", default: 0.125),
+                subpixelQuality: parameters.float32("subpixelQuality", default: 0.75)
+            )
+            let pipe = try shaderManager.computePipeline(library: "FXAA", function: "fxaa", effectHint: .fxaa)
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "FXAA_311"
+                enc.setComputePipelineState(pipe)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(destination, index: 1)
+                enc.setBytes(&fu, length: MemoryLayout<FXAAUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: pipe, width: outW, height: outH)
+                enc.endEncoding()
+            }
+
+        case .jinc:
+            struct JincUniforms {
+                var windowSinc: Float
+                var sinc: Float
+                var antiRinging: Float
+                var _pad0: UInt32 = 0
+            }
+            var ju = JincUniforms(
+                windowSinc: parameters.float32("windowSinc", default: 0.5),
+                sinc: parameters.float32("sinc", default: 0.825),
+                antiRinging: parameters.float32("antiRinging", default: 0.5)
+            )
+            let pipe = try shaderManager.computePipeline(library: "Interpolation", function: "jinc", effectHint: .jinc)
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Jinc_EWA"
+                enc.setComputePipelineState(pipe)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(destination, index: 1)
+                enc.setBytes(&ju, length: MemoryLayout<JincUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: pipe, width: outW, height: outH)
                 enc.endEncoding()
             }
 
         case .fsrcnnx:
+            struct FSRCNNXOutputUniforms {
+                var sharpness: Float
+                var antiRinging: Float
+                var enhancedDetail: UInt32
+                var _pad0: UInt32 = 0
+            }
             let variant = parameters.choice("variant", default: "standard")
-            let prefix = (variant == "lineArt") ? "fsrcnnx_lineart" : "fsrcnnx_std"
+            let isEnhanced = (variant == "enhancedDetail")
+            let prefix = (variant == "lineArt" || isEnhanced) ? "fsrcnnx_lineart" : "fsrcnnx_std"
+            var outUniforms = FSRCNNXOutputUniforms(
+                sharpness: parameters.float32("sharpness", default: 1.0),
+                antiRinging: parameters.float32("antiRinging", default: 0.35),
+                enhancedDetail: isEnhanced ? 1 : 0
+            )
 
             let p1 = try shaderManager.computePipeline(library: "FSRCNNX", function: "\(prefix)_pass1", effectHint: .fsrcnnx)
             let p2 = try shaderManager.computePipeline(library: "FSRCNNX", function: "\(prefix)_pass2", effectHint: .fsrcnnx)
@@ -1175,14 +1394,12 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
 
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.label = "FSRCNNX_2x"
-                // Pass 1: 5x5 Feature Extraction
                 enc.setComputePipelineState(p1)
                 enc.setTexture(source, index: 0)
                 enc.setTexture(f1.texture, index: 1)
                 enc.setTexture(f2.texture, index: 2)
                 dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
 
-                // Pass 2: Mapping 1
                 enc.setComputePipelineState(p2)
                 enc.setTexture(f1.texture, index: 0)
                 enc.setTexture(f2.texture, index: 1)
@@ -1190,7 +1407,6 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 enc.setTexture(t2.texture, index: 3)
                 dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
 
-                // Pass 3: Mapping 2
                 enc.setComputePipelineState(p3)
                 enc.setTexture(t1.texture, index: 0)
                 enc.setTexture(t2.texture, index: 1)
@@ -1198,7 +1414,6 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 enc.setTexture(t4.texture, index: 3)
                 dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
 
-                // Pass 4: Mapping 3
                 enc.setComputePipelineState(p4)
                 enc.setTexture(t3.texture, index: 0)
                 enc.setTexture(t4.texture, index: 1)
@@ -1206,7 +1421,6 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 enc.setTexture(t2.texture, index: 3)
                 dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
 
-                // Pass 5: Mapping 4 + Skip Residual Add
                 enc.setComputePipelineState(p5)
                 enc.setTexture(t1.texture, index: 0)
                 enc.setTexture(t2.texture, index: 1)
@@ -1216,12 +1430,12 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 enc.setTexture(t4.texture, index: 5)
                 dispatch2D(encoder: enc, pipeline: p5, width: inW, height: inH)
 
-                // Pass 6: Sub-pixel 2x Shuffle + UV Chroma Combine
                 enc.setComputePipelineState(p6)
                 enc.setTexture(t3.texture, index: 0)
                 enc.setTexture(t4.texture, index: 1)
                 enc.setTexture(source, index: 2)
                 enc.setTexture(destination, index: 3)
+                enc.setBytes(&outUniforms, length: MemoryLayout<FSRCNNXOutputUniforms>.stride, index: 0)
                 dispatch2D(encoder: enc, pipeline: p6, width: inW, height: inH)
                 enc.endEncoding()
             }
@@ -1229,11 +1443,15 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         case .xbrzFreescale:
             struct XBRZUniforms {
                 var equalColorTolerance: Float
+                var edgeThreshold: Float
+                var dominantDirectionThreshold: Float
                 var _pad0: UInt32 = 0
-                var _pad1: UInt32 = 0
-                var _pad2: UInt32 = 0
             }
-            var u = XBRZUniforms(equalColorTolerance: parameters.float32("equalColorTolerance", default: 30.0))
+            var u = XBRZUniforms(
+                equalColorTolerance: parameters.float32("equalColorTolerance", default: 30.0),
+                edgeThreshold: parameters.float32("edgeThreshold", default: 2.2),
+                dominantDirectionThreshold: parameters.float32("dominantDirectionThreshold", default: 3.6)
+            )
             let p1 = try shaderManager.computePipeline(library: "PixelArt", function: "xbrz_pass1", effectHint: .xbrzFreescale)
             let p2 = try shaderManager.computePipeline(library: "PixelArt", function: "xbrz_pass2", effectHint: .xbrzFreescale)
             let blendTex = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba8Unorm, usage: rwUsage, storageMode: .private)
@@ -1265,7 +1483,20 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 var cornerSize: Float
                 var vignette: Float
                 var bloom: Float
+                var curvatureRadius: Float
+                var maskType: UInt32
+                var brightness: Float
+                var _pad0: UInt32 = 0
             }
+            let maskStr = parameters.choice("maskType", default: "apertureGrille")
+            let maskID: UInt32
+            switch maskStr {
+            case "shadowMask": maskID = 1
+            case "slotMask": maskID = 2
+            case "off": maskID = 3
+            default: maskID = 0
+            }
+            let halationVal = Float(parameters["halation"]?.floatValue ?? parameters["bloom"]?.floatValue ?? 0.15)
             var u = CRTGeomUniforms(
                 curvature: parameters.bool("curvature", default: false) ? 1 : 0,
                 crtGamma: parameters.float32("crtGamma", default: 2.4),
@@ -1274,7 +1505,10 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 dotMask: parameters.float32("dotMask", default: 0.3),
                 cornerSize: parameters.float32("cornerSize", default: 0.01),
                 vignette: parameters.float32("vignette", default: 0.15),
-                bloom: parameters.float32("bloom", default: 0.05)
+                bloom: halationVal,
+                curvatureRadius: parameters.float32("curvatureRadius", default: 2.0),
+                maskType: maskID,
+                brightness: parameters.float32("brightness", default: 1.05)
             )
             let pipe = try shaderManager.computePipeline(library: "PixelArt", function: "crt_geom", effectHint: .crtGeom)
             if let enc = commandBuffer.makeComputeCommandEncoder() {
@@ -1332,11 +1566,15 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         case .lanczos6:
             struct LanczosUniforms {
                 var arStrength: Float
+                var sharpness: Float
                 var _pad0: UInt32 = 0
                 var _pad1: UInt32 = 0
-                var _pad2: UInt32 = 0
             }
-            var u = LanczosUniforms(arStrength: parameters.float32("arStrength", default: 0.5))
+            let ar = Float(parameters["antiRinging"]?.floatValue ?? parameters["arStrength"]?.floatValue ?? 0.5)
+            var u = LanczosUniforms(
+                arStrength: ar,
+                sharpness: parameters.float32("sharpness", default: 1.0)
+            )
             let pH = try shaderManager.computePipeline(library: "Interpolation", function: "lanczos6_h", effectHint: .lanczos6)
             let pV = try shaderManager.computePipeline(library: "Interpolation", function: "lanczos6_v", effectHint: .lanczos6)
             let horiz = try texturePool.acquire(width: outW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
@@ -1583,6 +1821,794 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 enc.setTexture(destination, index: 1)
                 enc.setBytes(&u, length: MemoryLayout<ImageAdjustmentUniforms>.stride, index: 0)
                 dispatch2D(encoder: enc, pipeline: pipe, width: outW, height: outH)
+                enc.endEncoding()
+            }
+        }
+    }
+
+    // MARK: - Neural Multi-Pass Encoders (Anime4K v4.0.1 Suite & CuNNy)
+
+    private struct Anime4KNeuralUniforms {
+        var strength: Float
+        var clampHighlights: UInt32
+        var _pad0: UInt32 = 0
+        var _pad1: UInt32 = 0
+    }
+
+    private func encodeAnime4KRestore(
+        variant: String,
+        strength: Float,
+        clampHighlights: Bool,
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        commandBuffer: any MTLCommandBuffer,
+        frameLeases: inout [PooledTexture]
+    ) throws {
+        let inW = source.width
+        let inH = source.height
+        let rwUsage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+        var u = Anime4KNeuralUniforms(strength: strength, clampHighlights: clampHighlights ? 1 : 0)
+
+        switch variant {
+        case "S", "softS":
+            let isSoft = (variant == "softS")
+            let p1 = try shaderManager.computePipeline(library: "Anime4K", function: isSoft ? "a4k_restore_soft_s_p1" : "anime4k_restore_pass1", effectHint: .anime4kRestore)
+            let p2 = try shaderManager.computePipeline(library: "Anime4K", function: isSoft ? "a4k_restore_soft_s_p2" : "anime4k_restore_pass2", effectHint: .anime4kRestore)
+            let p3 = try shaderManager.computePipeline(library: "Anime4K", function: isSoft ? "a4k_restore_soft_s_p3" : "anime4k_restore_pass3", effectHint: .anime4kRestore)
+            let p4 = try shaderManager.computePipeline(library: "Anime4K", function: isSoft ? "a4k_restore_soft_s_p4" : "anime4k_restore_pass4", effectHint: .anime4kRestore)
+            let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            frameLeases.append(contentsOf: [t1, t2])
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = isSoft ? "Anime4K_Restore_SoftS" : "Anime4K_Restore_S"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t2.texture, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                enc.setTexture(destination, index: 2)
+                enc.setBytes(&u, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+                enc.endEncoding()
+            }
+
+        case "L", "softL":
+            let prefix = (variant == "softL") ? "a4k_restore_soft_l" : "a4k_restore_l"
+            let p1 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p1", effectHint: .anime4kRestore)
+            let p2 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p2", effectHint: .anime4kRestore)
+            let p3 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p3", effectHint: .anime4kRestore)
+            let p4 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p4", effectHint: .anime4kRestore)
+            let p5 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p5", effectHint: .anime4kRestore)
+            let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t3 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t4 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            frameLeases.append(contentsOf: [t1, t2, t3, t4])
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Anime4K_Restore_\(variant)"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                enc.setTexture(t2.texture, index: 2)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                enc.setTexture(t3.texture, index: 2)
+                enc.setTexture(t4.texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t3.texture, index: 0)
+                enc.setTexture(t4.texture, index: 1)
+                enc.setTexture(t1.texture, index: 2)
+                enc.setTexture(t2.texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                enc.setTexture(t3.texture, index: 2)
+                enc.setTexture(t4.texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+
+                enc.setComputePipelineState(p5)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t3.texture, index: 1)
+                enc.setTexture(t4.texture, index: 2)
+                enc.setTexture(destination, index: 3)
+                enc.setBytes(&u, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p5, width: inW, height: inH)
+                enc.endEncoding()
+            }
+
+        case "VL":
+            let p1 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p1", effectHint: .anime4kRestore)
+            let p2 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p2", effectHint: .anime4kRestore)
+            let p3 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p3", effectHint: .anime4kRestore)
+            let p4 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p4", effectHint: .anime4kRestore)
+            let p5 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p5", effectHint: .anime4kRestore)
+            let p6 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p6", effectHint: .anime4kRestore)
+            let p7 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p7", effectHint: .anime4kRestore)
+            let p8 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p8", effectHint: .anime4kRestore)
+            let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t3 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t4 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t5 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t6 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            frameLeases.append(contentsOf: [t1, t2, t3, t4, t5, t6])
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Anime4K_Restore_VL"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                enc.setTexture(t2.texture, index: 2)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                enc.setTexture(t3.texture, index: 2)
+                enc.setTexture(t4.texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t3.texture, index: 0)
+                enc.setTexture(t4.texture, index: 1)
+                enc.setTexture(t1.texture, index: 2)
+                enc.setTexture(t2.texture, index: 3)
+                enc.setTexture(t5.texture, index: 4)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                enc.setTexture(t5.texture, index: 2)
+                enc.setTexture(t3.texture, index: 3)
+                enc.setTexture(t4.texture, index: 4)
+                enc.setTexture(t6.texture, index: 5)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+
+                enc.setComputePipelineState(p5)
+                enc.setTexture(t3.texture, index: 0)
+                enc.setTexture(t4.texture, index: 1)
+                enc.setTexture(t6.texture, index: 2)
+                enc.setTexture(t1.texture, index: 3)
+                enc.setTexture(t2.texture, index: 4)
+                enc.setTexture(t5.texture, index: 5)
+                dispatch2D(encoder: enc, pipeline: p5, width: inW, height: inH)
+
+                enc.setComputePipelineState(p6)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                enc.setTexture(t5.texture, index: 2)
+                enc.setTexture(t3.texture, index: 3)
+                enc.setTexture(t4.texture, index: 4)
+                enc.setTexture(t6.texture, index: 5)
+                dispatch2D(encoder: enc, pipeline: p6, width: inW, height: inH)
+
+                enc.setComputePipelineState(p7)
+                enc.setTexture(t3.texture, index: 0)
+                enc.setTexture(t4.texture, index: 1)
+                enc.setTexture(t6.texture, index: 2)
+                enc.setTexture(t1.texture, index: 3)
+                enc.setTexture(t2.texture, index: 4)
+                enc.setTexture(t5.texture, index: 5)
+                dispatch2D(encoder: enc, pipeline: p7, width: inW, height: inH)
+
+                enc.setComputePipelineState(p8)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                enc.setTexture(t2.texture, index: 2)
+                enc.setTexture(t5.texture, index: 3)
+                enc.setTexture(destination, index: 4)
+                enc.setBytes(&u, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p8, width: inW, height: inH)
+                enc.endEncoding()
+            }
+
+        default: // "M" and "softM"
+            let prefix = (variant == "softM") ? "a4k_restore_soft_m" : "a4k_restore_m"
+            let p1 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p1", effectHint: .anime4kRestore)
+            let p2 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p2", effectHint: .anime4kRestore)
+            let p3 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p3", effectHint: .anime4kRestore)
+            let p4 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p4", effectHint: .anime4kRestore)
+            let p5 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p5", effectHint: .anime4kRestore)
+            let p6 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p6", effectHint: .anime4kRestore)
+            let p7 = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p7", effectHint: .anime4kRestore)
+            let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t3 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t4 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t5 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t6 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            frameLeases.append(contentsOf: [t1, t2, t3, t4, t5, t6])
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Anime4K_Restore_\(variant)"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t2.texture, index: 0)
+                enc.setTexture(t3.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(t3.texture, index: 0)
+                enc.setTexture(t4.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+
+                enc.setComputePipelineState(p5)
+                enc.setTexture(t4.texture, index: 0)
+                enc.setTexture(t5.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p5, width: inW, height: inH)
+
+                enc.setComputePipelineState(p6)
+                enc.setTexture(t5.texture, index: 0)
+                enc.setTexture(t6.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p6, width: inW, height: inH)
+
+                enc.setComputePipelineState(p7)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                enc.setTexture(t2.texture, index: 2)
+                enc.setTexture(t3.texture, index: 3)
+                enc.setTexture(t4.texture, index: 4)
+                enc.setTexture(t5.texture, index: 5)
+                enc.setTexture(t6.texture, index: 6)
+                enc.setTexture(destination, index: 7)
+                enc.setBytes(&u, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p7, width: inW, height: inH)
+                enc.endEncoding()
+            }
+        }
+    }
+
+    private func encodeAnime4KUpscale(
+        variant: String,
+        strength: Float,
+        clampHighlights: Bool,
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        commandBuffer: any MTLCommandBuffer,
+        frameLeases: inout [PooledTexture]
+    ) throws {
+        let inW = source.width
+        let inH = source.height
+        let outW = destination.width
+        let outH = destination.height
+        let rwUsage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+        var u = Anime4KNeuralUniforms(strength: strength, clampHighlights: clampHighlights ? 1 : 0)
+
+        switch variant {
+        case "S":
+            let p1 = try shaderManager.computePipeline(library: "Anime4K", function: "a4k_upscale_s_p1", effectHint: .anime4kUpscale)
+            let p2 = try shaderManager.computePipeline(library: "Anime4K", function: "a4k_upscale_s_p2", effectHint: .anime4kUpscale)
+            let p3 = try shaderManager.computePipeline(library: "Anime4K", function: "a4k_upscale_s_p3", effectHint: .anime4kUpscale)
+            let p4 = try shaderManager.computePipeline(library: "Anime4K", function: "a4k_upscale_s_p4", effectHint: .anime4kUpscale)
+            let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            frameLeases.append(contentsOf: [t1, t2])
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Anime4K_Upscale_S"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t2.texture, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                enc.setTexture(destination, index: 2)
+                enc.setBytes(&u, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+                enc.endEncoding()
+            }
+
+        case "M":
+            let p1 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_m_p1", effectHint: .anime4kUpscale)
+            let p2 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_m_p2", effectHint: .anime4kUpscale)
+            let p3 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_m_p3", effectHint: .anime4kUpscale)
+            let p4 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_m_p4", effectHint: .anime4kUpscale)
+            let p5 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_m_p5", effectHint: .anime4kUpscale)
+            let p6 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_m_p6", effectHint: .anime4kUpscale)
+            let p7 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_m_p7", effectHint: .anime4kUpscale)
+            var t: [PooledTexture] = []
+            t.reserveCapacity(8)
+            for _ in 0..<8 {
+                t.append(try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private))
+            }
+            frameLeases.append(contentsOf: t)
+            // t[0]=tex1 .. t[7]=tex8
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Anime4K_Upscale_M"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t[0].texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t[0].texture, index: 0)
+                enc.setTexture(t[2].texture, index: 1)
+                enc.setTexture(t[3].texture, index: 2)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t[3].texture, index: 0)
+                enc.setTexture(t[2].texture, index: 1)
+                enc.setTexture(t[1].texture, index: 2)
+                enc.setTexture(t[4].texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(t[4].texture, index: 0)
+                enc.setTexture(t[1].texture, index: 1)
+                enc.setTexture(t[2].texture, index: 2)
+                enc.setTexture(t[3].texture, index: 3)
+                enc.setTexture(t[5].texture, index: 4)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+
+                enc.setComputePipelineState(p5)
+                enc.setTexture(t[5].texture, index: 0)
+                enc.setTexture(t[2].texture, index: 1)
+                enc.setTexture(t[1].texture, index: 2)
+                enc.setTexture(t[3].texture, index: 3)
+                enc.setTexture(t[0].texture, index: 4)
+                enc.setTexture(t[4].texture, index: 5)
+                enc.setTexture(t[6].texture, index: 6)
+                dispatch2D(encoder: enc, pipeline: p5, width: inW, height: inH)
+
+                enc.setComputePipelineState(p6)
+                enc.setTexture(t[6].texture, index: 0)
+                enc.setTexture(t[0].texture, index: 1)
+                enc.setTexture(t[2].texture, index: 2)
+                enc.setTexture(t[1].texture, index: 3)
+                enc.setTexture(t[3].texture, index: 4)
+                enc.setTexture(t[4].texture, index: 5)
+                enc.setTexture(t[5].texture, index: 6)
+                enc.setTexture(t[7].texture, index: 7)
+                dispatch2D(encoder: enc, pipeline: p6, width: inW, height: inH)
+
+                enc.setComputePipelineState(p7)
+                enc.setTexture(t[5].texture, index: 0)
+                enc.setTexture(t[7].texture, index: 1)
+                enc.setTexture(source, index: 2)
+                enc.setTexture(destination, index: 3)
+                enc.setBytes(&u, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p7, width: outW, height: outH)
+                enc.endEncoding()
+            }
+
+        case "VL":
+            try encodeAnime4KVL2x(
+                prefix: "a4k_upscale_vl",
+                effectHint: .anime4kUpscale,
+                uniforms: &u,
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
+
+        default: // "L"
+            try encodeAnime4KL2x(
+                prefix: "a4k_upscale_l",
+                effectHint: .anime4kUpscale,
+                uniforms: &u,
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
+        }
+    }
+
+    private func encodeAnime4KUpscaleDenoise(
+        variant: String,
+        strength: Float,
+        clampHighlights: Bool,
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        commandBuffer: any MTLCommandBuffer,
+        frameLeases: inout [PooledTexture]
+    ) throws {
+        let inW = source.width
+        let inH = source.height
+        let rwUsage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+        var u = Anime4KNeuralUniforms(strength: strength, clampHighlights: clampHighlights ? 1 : 0)
+
+        switch variant {
+        case "S":
+            let p1 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass1", effectHint: .anime4kUpscaleDenoise)
+            let p2 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass2", effectHint: .anime4kUpscaleDenoise)
+            let p3 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass3", effectHint: .anime4kUpscaleDenoise)
+            let p4 = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass4", effectHint: .anime4kUpscaleDenoise)
+            let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            frameLeases.append(contentsOf: [t1, t2])
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Anime4K_UpscaleDenoise_S"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t1.texture, index: 0)
+                enc.setTexture(t2.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t2.texture, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                enc.setTexture(destination, index: 2)
+                enc.setBytes(&u, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+                enc.endEncoding()
+            }
+
+        case "M":
+            // Balanced 2-stage 4ch pipeline: Restore Soft S (1x) -> Upscale+Denoise S (2x)
+            let midTex = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            frameLeases.append(midTex)
+            try encodeAnime4KRestore(
+                variant: "softS",
+                strength: 1.0,
+                clampHighlights: clampHighlights,
+                source: source,
+                destination: midTex.texture,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
+            try encodeAnime4KUpscaleDenoise(
+                variant: "S",
+                strength: strength,
+                clampHighlights: clampHighlights,
+                source: midTex.texture,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
+
+        case "VL":
+            try encodeAnime4KVL2x(
+                prefix: "a4k_upden_vl",
+                effectHint: .anime4kUpscaleDenoise,
+                uniforms: &u,
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
+
+        default: // "L"
+            try encodeAnime4KL2x(
+                prefix: "a4k_upden_l",
+                effectHint: .anime4kUpscaleDenoise,
+                uniforms: &u,
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
+        }
+    }
+
+    private func encodeAnime4KL2x(
+        prefix: String,
+        effectHint: EffectID,
+        uniforms: inout Anime4KNeuralUniforms,
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        commandBuffer: any MTLCommandBuffer,
+        frameLeases: inout [PooledTexture]
+    ) throws {
+        let inW = source.width
+        let inH = source.height
+        let rwUsage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+        let p1 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p1", effectHint: effectHint)
+        let p2 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p2", effectHint: effectHint)
+        let p3 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p3", effectHint: effectHint)
+        let p4 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p4", effectHint: effectHint)
+        let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+        let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+        let t3 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+        let t4 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+        frameLeases.append(contentsOf: [t1, t2, t3, t4])
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.label = "Anime4K_\(prefix)"
+            enc.setComputePipelineState(p1)
+            enc.setTexture(source, index: 0)
+            enc.setTexture(t1.texture, index: 1)
+            enc.setTexture(t2.texture, index: 2)
+            dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+            enc.setComputePipelineState(p2)
+            enc.setTexture(t1.texture, index: 0)
+            enc.setTexture(t2.texture, index: 1)
+            enc.setTexture(t3.texture, index: 2)
+            enc.setTexture(t4.texture, index: 3)
+            dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+            enc.setComputePipelineState(p3)
+            enc.setTexture(t3.texture, index: 0)
+            enc.setTexture(t4.texture, index: 1)
+            enc.setTexture(t1.texture, index: 2)
+            enc.setTexture(t2.texture, index: 3)
+            dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+            enc.setComputePipelineState(p4)
+            enc.setTexture(source, index: 0)
+            enc.setTexture(t1.texture, index: 1)
+            enc.setTexture(t2.texture, index: 2)
+            enc.setTexture(destination, index: 3)
+            enc.setBytes(&uniforms, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+            dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+            enc.endEncoding()
+        }
+    }
+
+    private func encodeAnime4KVL2x(
+        prefix: String,
+        effectHint: EffectID,
+        uniforms: inout Anime4KNeuralUniforms,
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        commandBuffer: any MTLCommandBuffer,
+        frameLeases: inout [PooledTexture]
+    ) throws {
+        let inW = source.width
+        let inH = source.height
+        let rwUsage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+        let p1 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p1", effectHint: effectHint)
+        let p2 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p2", effectHint: effectHint)
+        let p3 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p3", effectHint: effectHint)
+        let p4 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p4", effectHint: effectHint)
+        let p5 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p5", effectHint: effectHint)
+        let p6 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p6", effectHint: effectHint)
+        let p7 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p7", effectHint: effectHint)
+        let p8 = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "\(prefix)_p8", effectHint: effectHint)
+
+        var c: [PooledTexture] = []
+        c.reserveCapacity(14)
+        for _ in 0..<14 {
+            c.append(try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private))
+        }
+        frameLeases.append(contentsOf: c)
+
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.label = "Anime4K_\(prefix)"
+            enc.setComputePipelineState(p1)
+            enc.setTexture(source, index: 0)
+            enc.setTexture(c[0].texture, index: 1)
+            enc.setTexture(c[1].texture, index: 2)
+            dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+            let midPipes = [p2, p3, p4, p5, p6, p7]
+            for (idx, pipe) in midPipes.enumerated() {
+                let inBase = idx * 2
+                let outBase = (idx + 1) * 2
+                enc.setComputePipelineState(pipe)
+                enc.setTexture(c[inBase].texture, index: 0)
+                enc.setTexture(c[inBase + 1].texture, index: 1)
+                enc.setTexture(c[outBase].texture, index: 2)
+                enc.setTexture(c[outBase + 1].texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: pipe, width: inW, height: inH)
+            }
+
+            enc.setComputePipelineState(p8)
+            enc.setTexture(source, index: 0)
+            for i in 0..<14 {
+                enc.setTexture(c[i].texture, index: i + 1)
+            }
+            enc.setTexture(destination, index: 15)
+            enc.setBytes(&uniforms, length: MemoryLayout<Anime4KNeuralUniforms>.stride, index: 0)
+            dispatch2D(encoder: enc, pipeline: p8, width: inW, height: inH)
+            enc.endEncoding()
+        }
+    }
+
+    private func encodeCuNNy(
+        variant: String,
+        sharpness: Float,
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        commandBuffer: any MTLCommandBuffer,
+        frameLeases: inout [PooledTexture]
+    ) throws {
+        struct CuNNyUniforms {
+            var sharpness: Float
+            var _pad0: UInt32 = 0
+            var _pad1: UInt32 = 0
+            var _pad2: UInt32 = 0
+        }
+        let inW = source.width
+        let inH = source.height
+        let rwUsage: MTLTextureUsage = [.shaderRead, .shaderWrite]
+        var u = CuNNyUniforms(sharpness: sharpness)
+
+        // Authentic CuNNy2 ReLU1 intermediate format (.rgba8Unorm clamps feature maps to [0, 1]).
+        switch variant {
+        case "fast":
+            let p1 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_fast_p1", effectHint: .cunny)
+            let p2 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_fast_p2", effectHint: .cunny)
+            let p3 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_fast_p3", effectHint: .cunny)
+            let p4 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_fast_p4", effectHint: .cunny)
+            let t0 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba8Unorm, usage: rwUsage, storageMode: .private)
+            let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba8Unorm, usage: rwUsage, storageMode: .private)
+            let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba8Unorm, usage: rwUsage, storageMode: .private)
+            let t3 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba8Unorm, usage: rwUsage, storageMode: .private)
+            frameLeases.append(contentsOf: [t0, t1, t2, t3])
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "CuNNy_Fast"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t0.texture, index: 1)
+                enc.setTexture(t1.texture, index: 2)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t0.texture, index: 0)
+                enc.setTexture(t1.texture, index: 1)
+                enc.setTexture(t2.texture, index: 2)
+                enc.setTexture(t3.texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t2.texture, index: 0)
+                enc.setTexture(t3.texture, index: 1)
+                enc.setTexture(t0.texture, index: 2)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t0.texture, index: 1)
+                enc.setTexture(destination, index: 2)
+                enc.setBytes(&u, length: MemoryLayout<CuNNyUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+                enc.endEncoding()
+            }
+
+        case "highQuality":
+            let p1 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_hq_p1", effectHint: .cunny)
+            let p2 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_hq_p2", effectHint: .cunny)
+            let p3 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_hq_p3", effectHint: .cunny)
+            let p4 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_hq_p4", effectHint: .cunny)
+            let p5 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_hq_p5", effectHint: .cunny)
+            var t: [PooledTexture] = []
+            t.reserveCapacity(6)
+            for _ in 0..<6 {
+                t.append(try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba8Unorm, usage: rwUsage, storageMode: .private))
+            }
+            frameLeases.append(contentsOf: t)
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "CuNNy_HighQuality"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t[0].texture, index: 1)
+                enc.setTexture(t[1].texture, index: 2)
+                enc.setTexture(t[2].texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t[0].texture, index: 0)
+                enc.setTexture(t[1].texture, index: 1)
+                enc.setTexture(t[2].texture, index: 2)
+                enc.setTexture(t[3].texture, index: 3)
+                enc.setTexture(t[4].texture, index: 4)
+                enc.setTexture(t[5].texture, index: 5)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t[3].texture, index: 0)
+                enc.setTexture(t[4].texture, index: 1)
+                enc.setTexture(t[5].texture, index: 2)
+                enc.setTexture(t[0].texture, index: 3)
+                enc.setTexture(t[1].texture, index: 4)
+                enc.setTexture(t[2].texture, index: 5)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(t[0].texture, index: 0)
+                enc.setTexture(t[1].texture, index: 1)
+                enc.setTexture(t[2].texture, index: 2)
+                enc.setTexture(t[3].texture, index: 3)
+                enc.setTexture(t[4].texture, index: 4)
+                enc.setTexture(t[5].texture, index: 5)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+
+                enc.setComputePipelineState(p5)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t[3].texture, index: 1)
+                enc.setTexture(t[4].texture, index: 2)
+                enc.setTexture(t[5].texture, index: 3)
+                enc.setTexture(destination, index: 4)
+                enc.setBytes(&u, length: MemoryLayout<CuNNyUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p5, width: inW, height: inH)
+                enc.endEncoding()
+            }
+
+        default: // "balanced"
+            let p1 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_bal_p1", effectHint: .cunny)
+            let p2 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_bal_p2", effectHint: .cunny)
+            let p3 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_bal_p3", effectHint: .cunny)
+            let p4 = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_bal_p4", effectHint: .cunny)
+            var t: [PooledTexture] = []
+            t.reserveCapacity(6)
+            for _ in 0..<6 {
+                t.append(try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba8Unorm, usage: rwUsage, storageMode: .private))
+            }
+            frameLeases.append(contentsOf: t)
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "CuNNy_Balanced"
+                enc.setComputePipelineState(p1)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t[0].texture, index: 1)
+                enc.setTexture(t[1].texture, index: 2)
+                enc.setTexture(t[2].texture, index: 3)
+                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+
+                enc.setComputePipelineState(p2)
+                enc.setTexture(t[0].texture, index: 0)
+                enc.setTexture(t[1].texture, index: 1)
+                enc.setTexture(t[2].texture, index: 2)
+                enc.setTexture(t[3].texture, index: 3)
+                enc.setTexture(t[4].texture, index: 4)
+                enc.setTexture(t[5].texture, index: 5)
+                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+
+                enc.setComputePipelineState(p3)
+                enc.setTexture(t[3].texture, index: 0)
+                enc.setTexture(t[4].texture, index: 1)
+                enc.setTexture(t[5].texture, index: 2)
+                enc.setTexture(t[0].texture, index: 3)
+                enc.setTexture(t[1].texture, index: 4)
+                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+
+                enc.setComputePipelineState(p4)
+                enc.setTexture(source, index: 0)
+                enc.setTexture(t[0].texture, index: 1)
+                enc.setTexture(t[1].texture, index: 2)
+                enc.setTexture(destination, index: 3)
+                enc.setBytes(&u, length: MemoryLayout<CuNNyUniforms>.stride, index: 0)
+                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
                 enc.endEncoding()
             }
         }
@@ -2004,19 +3030,119 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         case .sgsr:
             _ = try shaderManager.computePipeline(library: "SGSR", function: "sgsr_upscale")
         case .anime4kRestore:
-            for i in 1...4 {
-                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_restore_pass\(i)")
+            let variant = parameters.choice("variant", default: "M")
+            switch variant {
+            case "S":
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_restore_pass\(i)")
+                }
+            case "softS":
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "Anime4K", function: "a4k_restore_soft_s_p\(i)")
+                }
+            case "L", "softL":
+                let prefix = (variant == "softL") ? "a4k_restore_soft_l" : "a4k_restore_l"
+                for i in 1...5 {
+                    _ = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p\(i)")
+                }
+            case "VL":
+                for i in 1...8 {
+                    _ = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "a4k_restore_vl_p\(i)")
+                }
+            default: // "M", "softM"
+                let prefix = (variant == "softM") ? "a4k_restore_soft_m" : "a4k_restore_m"
+                for i in 1...7 {
+                    _ = try shaderManager.computePipeline(library: "Anime4KRestoreML", function: "\(prefix)_p\(i)")
+                }
+            }
+        case .anime4kUpscale:
+            let variant = parameters.choice("variant", default: "L")
+            switch variant {
+            case "S":
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "Anime4K", function: "a4k_upscale_s_p\(i)")
+                }
+            case "M":
+                for i in 1...7 {
+                    _ = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_m_p\(i)")
+                }
+            case "VL":
+                for i in 1...8 {
+                    _ = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_vl_p\(i)")
+                }
+            default: // "L"
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upscale_l_p\(i)")
+                }
             }
         case .anime4kUpscaleDenoise:
             _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_bilateral_mode")
-            _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_sobel")
-            _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_warp")
-            for i in 1...4 {
-                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass\(i)")
+            let variant = parameters.choice("variant", default: "L")
+            switch variant {
+            case "S":
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass\(i)")
+                }
+            case "M":
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "Anime4K", function: "a4k_restore_soft_s_p\(i)")
+                    _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_upscale_pass\(i)")
+                }
+            case "VL":
+                for i in 1...8 {
+                    _ = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upden_vl_p\(i)")
+                }
+            default: // "L"
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "Anime4KUpscaleML", function: "a4k_upden_l_p\(i)")
+                }
             }
+        case .anime4kThin:
+            _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_sobel")
+            if parameters.choice("quality", default: "hq") == "fast" {
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_warp")
+            } else {
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_gauss_x")
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_gauss_y")
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_kernel")
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_hq_warp")
+            }
+        case .anime4kDarken:
+            if parameters.choice("quality", default: "hq") == "fast" {
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_fast")
+            } else {
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_luma")
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_diff_x")
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_diff_y")
+                _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_darken_apply")
+            }
+        case .anime4kDenoiseBilateral:
+            _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_bilateral_full")
+        case .anime4kClampHighlights:
+            _ = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_clamp_highlights")
+        case .cunny:
+            let variant = parameters.choice("variant", default: "balanced")
+            switch variant {
+            case "fast":
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_fast_p\(i)")
+                }
+            case "highQuality":
+                for i in 1...5 {
+                    _ = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_hq_p\(i)")
+                }
+            default:
+                for i in 1...4 {
+                    _ = try shaderManager.computePipeline(library: "CuNNy", function: "cunny_bal_p\(i)")
+                }
+            }
+        case .fxaa:
+            _ = try shaderManager.computePipeline(library: "FXAA", function: "fxaa")
+        case .jinc:
+            _ = try shaderManager.computePipeline(library: "Interpolation", function: "jinc")
         case .fsrcnnx:
             let variant = parameters.choice("variant", default: "standard")
-            let prefix = (variant == "lineArt") ? "fsrcnnx_lineart" : "fsrcnnx_std"
+            let prefix = (variant == "lineArt" || variant == "enhancedDetail") ? "fsrcnnx_lineart" : "fsrcnnx_std"
             for i in 1...6 {
                 _ = try shaderManager.computePipeline(library: "FSRCNNX", function: "\(prefix)_pass\(i)")
             }
@@ -2215,22 +3341,28 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
 
     private static func costWeight(for effectID: EffectID) -> Double {
         switch effectID {
-        case .fsrcnnx:               return 6.0
-        case .anime4kUpscaleDenoise: return 4.5
-        case .anime4kRestore:        return 3.5
-        case .ssimDownscaler:        return 3.0
-        case .adaptiveSharpen:       return 2.0
-        case .xbrzFreescale:         return 2.0
-        case .crtLottes, .crtGeom:   return 1.8
-        case .lanczos6:              return 1.6
-        case .fsr1EASU:              return 1.4
-        case .vtSuperResolution:     return 1.5
-        case .metalFXSpatial:        return 1.2
-        case .sgsr, .deband:         return 1.1
-        case .bicubic:               return 1.0
-        case .fsr1RCAS, .cas:        return 0.8
+        case .fsrcnnx:                  return 6.0
+        case .anime4kUpscaleDenoise:    return 5.0
+        case .anime4kUpscale:           return 4.5
+        case .anime4kRestore:           return 4.0
+        case .cunny:                    return 3.5
+        case .ssimDownscaler:           return 3.0
+        case .jinc:                     return 2.2
+        case .adaptiveSharpen:          return 2.0
+        case .xbrzFreescale:            return 2.0
+        case .anime4kDenoiseBilateral:  return 1.9
+        case .crtLottes, .crtGeom:      return 1.8
+        case .anime4kThin, .anime4kDarken: return 1.6
+        case .lanczos6:                 return 1.6
+        case .vtSuperResolution:        return 1.5
+        case .fsr1EASU:                 return 1.4
+        case .fxaa:                     return 1.3
+        case .metalFXSpatial:           return 1.2
+        case .sgsr, .deband:            return 1.1
+        case .bicubic:                  return 1.0
+        case .fsr1RCAS, .cas, .anime4kClampHighlights: return 0.8
         case .sharpBilinear, .pixellate, .imageAdjustment: return 0.7
-        case .nearest, .bilinear:    return 0.5
+        case .nearest, .bilinear:       return 0.5
         }
     }
 }

@@ -196,6 +196,48 @@ public final class ConfigStore: Sendable {
     private static func normalize(_ config: AppConfig) -> AppConfig {
         var result = config
 
+        let builtInByID = Dictionary(uniqueKeysWithValues: ScalingMode.builtInPresets.map { ($0.id, $0) })
+
+        // Backfill missing bilingual metadata, scenario tags, and newly introduced default parameters
+        // on previously saved configs without overwriting any user-edited values.
+        for idx in result.scalingModes.indices {
+            if let builtIn = builtInByID[result.scalingModes[idx].id], result.scalingModes[idx].isBuiltIn {
+                if result.scalingModes[idx].nameZH.isEmpty {
+                    result.scalingModes[idx].nameZH = builtIn.nameZH
+                }
+                if result.scalingModes[idx].descriptionZH.isEmpty {
+                    result.scalingModes[idx].descriptionZH = builtIn.descriptionZH
+                }
+                if result.scalingModes[idx].scenario == .generalVideo && builtIn.scenario != .generalVideo {
+                    result.scalingModes[idx].scenario = builtIn.scenario
+                }
+            }
+
+            for effIdx in result.scalingModes[idx].effects.indices {
+                var eff = result.scalingModes[idx].effects[effIdx]
+                // Migrate legacy Lanczos parameter key `arStrength` -> `antiRinging` non-destructively.
+                if eff.effectID == .lanczos6,
+                   eff.parameters["antiRinging"] == nil,
+                   let legacyAR = eff.parameters["arStrength"]
+                {
+                    eff.parameters["antiRinging"] = legacyAR
+                }
+                // Migrate legacy CRT-Geom `bloom` -> `halation` non-destructively.
+                if eff.effectID == .crtGeom,
+                   eff.parameters["halation"] == nil,
+                   let legacyBloom = eff.parameters["bloom"]
+                {
+                    eff.parameters["halation"] = legacyBloom
+                }
+                // Ensure newly added parameters have sensible defaults so sliders/menus always show valid values.
+                let defaults = EffectCatalog.descriptor(for: eff.effectID).defaultParameters
+                for (key, value) in defaults.values where eff.parameters[key] == nil {
+                    eff.parameters[key] = value
+                }
+                result.scalingModes[idx].effects[effIdx] = eff
+            }
+        }
+
         // Ensure all built-in scaling modes are present (appending missing ones without clobbering user edits).
         let existingModeIDs = Set(result.scalingModes.map(\.id))
         for builtIn in ScalingMode.builtInPresets where !existingModeIDs.contains(builtIn.id) {

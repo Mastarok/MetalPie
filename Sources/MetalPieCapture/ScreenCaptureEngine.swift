@@ -762,9 +762,10 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
         let result: (
             emitBounds: Bool,
-            reconfig: (WindowDescriptor, Profile, ScalingMode)?
+            reconfig: (WindowDescriptor, Profile, ScalingMode)?,
+            checkCrossDisplay: (appliedDisplayID: CGDirectDisplayID, payload: (WindowDescriptor, Profile, ScalingMode))?
         ) = state.withLock { s in
-            guard s.isRunning, let applied = s.appliedConfig else { return (false, nil) }
+            guard s.isRunning, let applied = s.appliedConfig else { return (false, nil, nil) }
 
             let prev = s.lastReportedScreenRect
             let movedOrResized = abs(prev.origin.x - screenRect.origin.x) >= 1.0
@@ -774,9 +775,11 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
             if movedOrResized {
                 s.lastReportedScreenRect = screenRect
+                s.activeWindow?.cgBounds = screenRect
             }
 
             var reconfigPayload: (WindowDescriptor, Profile, ScalingMode)?
+            var crossDisplayCheck: (CGDirectDisplayID, (WindowDescriptor, Profile, ScalingMode))?
             if applied.captureMode == .window {
                 let expectedW = Self.clampedCaptureDimension(Double(screenRect.width) * scaleFactor)
                 let expectedH = Self.clampedCaptureDimension(Double(screenRect.height) * scaleFactor)
@@ -796,9 +799,17 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                         s.activeWindow = win
                         reconfigPayload = (win, prof, mode)
                     }
+                } else if movedOrResized,
+                          var win = s.activeWindow,
+                          let prof = s.activeProfile,
+                          let mode = s.activeScalingMode
+                {
+                    win.cgBounds = screenRect
+                    win.backingScaleFactor = scaleFactor
+                    crossDisplayCheck = (applied.displayID, (win, prof, mode))
                 }
             }
-            return (movedOrResized, reconfigPayload)
+            return (movedOrResized, reconfigPayload, crossDisplayCheck)
         }
 
         if result.emitBounds {
@@ -808,6 +819,14 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
         if let (win, prof, mode) = result.reconfig {
             scheduleDebouncedResizeReconfig(window: win, profile: prof, scalingMode: mode)
+        } else if let (appliedDisplayID, payload) = result.checkCrossDisplay {
+            // Check outside unfair lock if window moved onto a different display (e.g. Display P3 <-> sRGB).
+            let displays = WindowEnumerator.enumerateDisplays()
+            if let newDisplayID = ScreenGeometry.bestDisplay(forCGRect: screenRect, in: displays)?.id,
+               newDisplayID != appliedDisplayID
+            {
+                scheduleDebouncedResizeReconfig(window: payload.0, profile: payload.1, scalingMode: payload.2)
+            }
         }
     }
 

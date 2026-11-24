@@ -14,7 +14,6 @@ public enum AppTab: String, CaseIterable, Identifiable, Sendable {
     case home
     case effects
     case profiles
-    case capture
     case settings
     case diagnostics
 
@@ -25,7 +24,6 @@ public enum AppTab: String, CaseIterable, Identifiable, Sendable {
         case .home: return "play.display"
         case .effects: return "sparkles.rectangle.stack"
         case .profiles: return "app.badge.checkmark"
-        case .capture: return "video"
         case .settings: return "gearshape"
         case .diagnostics: return "gauge.with.dots.needle.67percent"
         }
@@ -33,12 +31,11 @@ public enum AppTab: String, CaseIterable, Identifiable, Sendable {
 
     public func title(_ l10n: L10n) -> String {
         switch self {
-        case .home: return l10n.tr("Scale", "缩放主页")
-        case .effects: return l10n.tr("Effect Chains", "着色器管线")
-        case .profiles: return l10n.tr("Profiles", "应用配置")
-        case .capture: return l10n.tr("Capture & Cursor", "捕获与光标")
-        case .settings: return l10n.tr("Settings", "通用设置")
-        case .diagnostics: return l10n.tr("Diagnostics", "诊断与基准")
+        case .home: return l10n.tr("Scale", "开始缩放")
+        case .effects: return l10n.tr("Scaling Modes", "缩放模式")
+        case .profiles: return l10n.tr("Profiles", "配置文件")
+        case .settings: return l10n.tr("Settings", "设置")
+        case .diagnostics: return l10n.tr("Benchmark", "显卡测速")
         }
     }
 }
@@ -85,6 +82,10 @@ public final class AppCoordinator {
     public var isWindowedClickThrough: Bool = true
     public var isProfilerHUDActive: Bool = false
     public var isToolbarVisibleOverride: Bool? = nil
+    public var cursorAlignmentMode: CursorAlignmentMode = .inactive
+    public var needsAccessibilityForScaledClicks: Bool {
+        cursorAlignmentMode == .accessibilityRequired
+    }
 
     public var countdownRemaining: Int? = nil
     public var countdownTargetMode: PresentationMode? = nil
@@ -128,7 +129,7 @@ public final class AppCoordinator {
     public var languageOverride: AppLanguage? = nil
     /// Optional automated visual snapshot path (`--snapshot-out <path.png>`).
     public let snapshotOutputPath: String?
-    /// Optional flag to run the 22-shader GPU benchmark before taking a snapshot (`--run-benchmark`).
+    /// Optional flag to run the 30-shader GPU benchmark before taking a snapshot (`--run-benchmark`).
     public let autoRunBenchmarkForSnapshot: Bool
     /// Set to `true` by `EffectChainEditorView` once the initial Metal GPU preview image finishes rendering.
     public var isPreviewReadyForSnapshot: Bool = false
@@ -179,6 +180,7 @@ public final class AppCoordinator {
     private var lastVRRHUDRenderTime: CFAbsoluteTime = 0
     private var vrrCursorRetryPending: Bool = false
     private var isStartingSession = false
+    private var didWarnAccessibilityForCurrentSession = false
 
     private static let vrrDefaultsKey = "com.metalpie.vrrDirectScanoutEnabled"
     private static let nonRetinaDefaultsKey = "com.metalpie.nonRetinaMode"
@@ -307,7 +309,12 @@ public final class AppCoordinator {
     }
 
     private static func parseInitialTabArgument() -> AppTab? {
-        parseStringArgument("--tab").flatMap { AppTab(rawValue: $0.lowercased()) }
+        guard let raw = parseStringArgument("--tab")?.lowercased() else { return nil }
+        // Keep legacy `--tab capture` working cleanly after merging Capture & Cursor into Settings.
+        if raw == "capture" {
+            return .settings
+        }
+        return AppTab(rawValue: raw)
     }
 
     // MARK: - Subsystem Wiring
@@ -322,19 +329,51 @@ public final class AppCoordinator {
             }
         }
 
-        // 2. Permissions live polling (never blindly prompts Accessibility on launch!)
+        // 2. Permissions live polling (also live-upgrades cursor alignment when Accessibility is granted!)
         permissionsManager.startPolling(intervalSeconds: 1.5, stopWhenAllGranted: false) { [weak self] status in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let wasScreenGranted = self.permissions.screenRecordingGranted
+                let wasAXGranted = self.permissions.accessibilityGranted
                 self.permissions = status
                 if !wasScreenGranted && status.screenRecordingGranted {
                     await self.refreshWindows(captureThumbnails: true)
                 }
+                if !wasAXGranted && status.accessibilityGranted && self.isScalingSessionOpen {
+                    await self.reconfigureActiveSession()
+                    self.showToast(
+                        icon: "checkmark.circle.fill",
+                        title: self.l10n.tr(
+                            "Accessibility Enabled — Clicks Aligned",
+                            "辅助功能已开启，缩放鼠标已自动对齐"
+                        ),
+                        subtitle: self.l10n.tr(
+                            "Scaled clicks are now aligned without restarting scaling.",
+                            "无需重启缩放，现在放大画面中的点击已精准对齐。"
+                        ),
+                        style: .success,
+                        durationSeconds: 3.2
+                    )
+                }
             }
         }
 
-        // 3. Toolbar actions
+        // 3. Cursor alignment mode observer (never fail silently when Accessibility is missing)
+        cursorController.setAlignmentModeHandler { [weak self] mode in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.cursorAlignmentMode = mode
+                self.windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(self.collectIgnoredOverlayWindowIDs())
+                if mode == .accessibilityRequired,
+                   self.isScalingSessionOpen,
+                   !self.didWarnAccessibilityForCurrentSession
+                {
+                    self.presentAccessibilityRequiredToast(anchorScreenFrame: self.lastOverlayMetrics?.cocoaFrame)
+                }
+            }
+        }
+
+        // 4. Toolbar actions & scaled-cursor top-edge hover provider
         toolbarPanel.configure(actions: OverlayToolbarActions(
             onToggleClickThrough: { [weak self] in self?.toggleWindowedClickThrough() },
             onToggleProfilerHUD: { [weak self] in self?.toggleProfilerHUD() },
@@ -349,6 +388,13 @@ public final class AppCoordinator {
                 Task { await self?.stopScaling(isManual: true, showToast: true) }
             }
         ))
+        toolbarPanel.scaledCursorCocoaProvider = { [weak self] in
+            guard let self, self.cursorAlignmentMode == .scaledConfinedEventTap else {
+                return nil
+            }
+            let scaledCG = self.cursorController.currentState.scaledCGPosition
+            return ScreenGeometry.cgToCocoa(point: scaledCG, displays: self.displays)
+        }
 
         // 4. Overlay geometry & interactive windowed resize callbacks
         overlayWindowController?.isVRRDirectScanoutEnabled = vrrDirectScanoutEnabled
@@ -501,6 +547,17 @@ public final class AppCoordinator {
         config.profiles.firstIndex(where: \.isDefault) ?? 0
     }
 
+    /// Returns built-in scaling modes for `scenario` sorted in canonical `ScalingMode.builtInPresets` order,
+    /// keeping the 6 official Anime4K modes (`A`, `B`, `C`, `A+A`, `B+B`, `C+A`) cleanly grouped even on upgraded v1.0 configs.
+    public func orderedBuiltInModes(for scenario: ScenarioTag) -> [ScalingMode] {
+        let rankByID = Dictionary(
+            uniqueKeysWithValues: ScalingMode.builtInPresets.enumerated().map { ($0.element.id, $0.offset) }
+        )
+        return config.scalingModes
+            .filter { $0.isBuiltIn && $0.scenario == scenario }
+            .sorted { (rankByID[$0.id] ?? Int.max) < (rankByID[$1.id] ?? Int.max) }
+    }
+
     public func updateDefaultProfile(_ mutate: (inout Profile) -> Void) {
         let idx = defaultProfileBindingIndex
         guard config.profiles.indices.contains(idx) else { return }
@@ -628,7 +685,7 @@ public final class AppCoordinator {
         let newMode = ScalingMode(
             id: UUID(),
             name: l10n.tr("Custom Scaling Mode", "自定义缩放模式"),
-            localizedDescription: l10n.tr("Custom multi-pass GPU effect chain.", "自定义多通道 GPU 着色器管线。"),
+            localizedDescription: l10n.tr("Custom multi-pass GPU effect chain.", "自由组合滤镜与超分效果的自定义模式。"),
             effects: [
                 EffectInstance(effectID: .fsr1EASU, scalingType: .fit),
                 EffectInstance(effectID: .cas, scalingType: .normal, parameters: ["sharpness": .float(0.35)])
@@ -771,8 +828,11 @@ public final class AppCoordinator {
         telemetry.state = .countingDown
 
         let modeLabel = mode.isFullscreen
-            ? l10n.tr("Fullscreen", "全屏缩放")
-            : l10n.tr("Windowed", "窗口缩放")
+            ? l10n.tr("Fullscreen", "全屏放大")
+            : l10n.tr("Windowed", "窗口放大")
+        let targetAnchor = specificWindow.flatMap {
+            ScreenGeometry.bestDisplay(forCGRect: $0.cgBounds, in: self.displays)?.cocoaFrame
+        }
 
         countdownTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -783,12 +843,13 @@ public final class AppCoordinator {
                     icon: "timer",
                     title: self.l10n.tr(
                         "Scaling (\(modeLabel)) in \(remaining)s…",
-                        "\(remaining) 秒后启动\(modeLabel)…"
+                        "\(remaining) 秒后\(modeLabel)…"
                     ),
                     subtitle: specificWindow?.displayName
-                        ?? self.l10n.tr("Switch to your game/app window now", "请立即切换到目标游戏或应用窗口"),
+                        ?? self.l10n.tr("Switch to your game/app window now", "现在请切换到你想放大的游戏或视频窗口"),
                     style: .countdown,
-                    durationSeconds: nil
+                    durationSeconds: nil,
+                    anchorScreenFrame: targetAnchor
                 )
                 try? await Task.sleep(for: .seconds(1))
             }
@@ -914,15 +975,19 @@ public final class AppCoordinator {
         isWindowedClickThrough = true
         isProfilerHUDActive = resolvedProfile.showProfilerHUD
         isToolbarVisibleOverride = nil
+        didWarnAccessibilityForCurrentSession = false
         telemetry.state = .starting
         telemetry.targetWindowName = window.displayName
 
-        // Activate target application smoothly so it receives keyboard/mouse events immediately.
-        if let targetApp = NSRunningApplication(processIdentifier: window.pid),
-           targetApp.processIdentifier != ProcessInfo.processInfo.processIdentifier
-        {
-            targetApp.activate()
-        }
+        // Cooperatively yield focus, order back MetalPie's main window, and raise the exact target
+        // window BEFORE starting WindowLifecycleWatcher or revealing the overlay so clicking the
+        // scaled target never hits MetalPie underneath and never falsely exits scaling!
+        await WindowLifecycleWatcher.activateAndRaiseTargetWindow(
+            windowID: window.windowID,
+            pid: window.pid,
+            orderBackOwnMainWindows: true,
+            timeoutMilliseconds: 300
+        )
 
         // Prewarm pipelines before opening overlay.
         try await renderer.prewarm(scalingMode: resolvedMode)
@@ -999,6 +1064,10 @@ public final class AppCoordinator {
         autoScaleController.setCurrentlyScaling(window: window)
         watchdog.setScalingActive(true)
 
+        if cursorAlignmentMode == .accessibilityRequired && !didWarnAccessibilityForCurrentSession {
+            presentAccessibilityRequiredToast(anchorScreenFrame: metrics.cocoaFrame)
+        }
+
         PipelineLog.shared.info(
             .app,
             "Started scaling session for '\(window.displayName)' using '\(resolvedMode.name)' (\(resolvedPresentation.isFullscreen ? "fullscreen" : "windowed"))."
@@ -1011,10 +1080,13 @@ public final class AppCoordinator {
         toastOverride: String? = nil
     ) async {
         let stoppedWindowID = activeWindow?.windowID
+        let lastAnchor = lastOverlayMetrics?.cocoaFrame
 
         watchdog.setScalingActive(false)
         windowLifecycleWatcher.stopObserving()
         cursorController.stop()
+        cursorAlignmentMode = .inactive
+        didWarnAccessibilityForCurrentSession = false
         toolbarPanel.hide()
         profilerHUDPanel.hide()
 
@@ -1043,8 +1115,9 @@ public final class AppCoordinator {
         if showToast {
             self.showToast(
                 icon: "stop.circle.fill",
-                title: toastOverride ?? l10n.tr("Scaling Stopped", "已停止缩放"),
-                style: .info
+                title: toastOverride ?? l10n.tr("Scaling Stopped", "已退出缩放"),
+                style: .info,
+                anchorScreenFrame: lastAnchor
             )
         }
     }
@@ -1091,8 +1164,8 @@ public final class AppCoordinator {
         showToast(
             icon: nextMode.isFullscreen ? "arrow.up.left.and.arrow.down.right" : "macwindow",
             title: nextMode.isFullscreen
-                ? l10n.tr("Switched to Fullscreen Scaling", "已切换至全屏缩放")
-                : l10n.tr("Switched to Windowed Scaling", "已切换至窗口缩放"),
+                ? l10n.tr("Switched to Fullscreen Scaling", "已切换为全屏放大")
+                : l10n.tr("Switched to Windowed Scaling", "已切换为窗口放大"),
             style: .info
         )
     }
@@ -1100,12 +1173,19 @@ public final class AppCoordinator {
     public func toggleWindowedClickThrough() {
         isWindowedClickThrough.toggle()
         overlayWindowController?.isWindowedClickThrough = isWindowedClickThrough
+        if isWindowedClickThrough {
+            cursorController.resume()
+        } else {
+            // Suspend cursor confinement while unlocked so the user can freely drag/resize overlay edges.
+            cursorController.suspend()
+        }
+        cursorAlignmentMode = cursorController.alignmentMode
         syncToolbarState()
         showToast(
             icon: isWindowedClickThrough ? "lock.fill" : "hand.draw.fill",
             title: isWindowedClickThrough
-                ? l10n.tr("Window Locked (Click-Through)", "窗口已锁定（鼠标穿透）")
-                : l10n.tr("Window Unlocked (Drag Edges to Resize)", "窗口已解锁（拖拽边缘调整大小）"),
+                ? l10n.tr("Window Locked (Click-Through)", "窗口已锁定（鼠标可正常点选）")
+                : l10n.tr("Window Unlocked (Drag Edges to Resize)", "窗口已解锁（拖动边缘可调整大小）"),
             style: .info
         )
     }
@@ -1393,15 +1473,35 @@ public final class AppCoordinator {
         icon: String,
         title: String,
         subtitle: String? = nil,
-        style: ToastStyle = .info
+        style: ToastStyle = .info,
+        durationSeconds: TimeInterval = 2.6,
+        anchorScreenFrame: CGRect? = nil
     ) {
         toastPanel.show(
             icon: icon,
             title: title,
             subtitle: subtitle,
             style: style,
-            durationSeconds: 2.6,
-            anchorScreenFrame: lastOverlayMetrics?.cocoaFrame
+            durationSeconds: durationSeconds,
+            anchorScreenFrame: anchorScreenFrame ?? lastOverlayMetrics?.cocoaFrame
+        )
+    }
+
+    private func presentAccessibilityRequiredToast(anchorScreenFrame: CGRect?) {
+        didWarnAccessibilityForCurrentSession = true
+        showToast(
+            icon: "hand.point.up.left.and.text.fill",
+            title: l10n.tr(
+                "Accessibility Required for Scaled Clicks",
+                "需要开启辅助功能，缩放后点击才能对齐"
+            ),
+            subtitle: l10n.tr(
+                "Enable Accessibility in System Settings so clicks align with buttons and don't exit scaling.",
+                "未开启时点击按钮会错位或误点桌面退出；开启后会自动对齐，无需重启缩放。"
+            ),
+            style: .warning,
+            durationSeconds: 5.0,
+            anchorScreenFrame: anchorScreenFrame
         )
     }
 
@@ -1414,7 +1514,7 @@ public final class AppCoordinator {
             await stopScaling(
                 isManual: true,
                 showToast: true,
-                toastOverride: l10n.tr("Emergency Panic Stop (⌃⌥⌘⎋)", "已触发紧急熔断停止 (⌃⌥⌘⎋)")
+                toastOverride: l10n.tr("Force Exited Scaling (⌃⌥⌘⎋)", "已强制退出缩放 (⌃⌥⌘⎋)")
             )
         case .toggleFullscreen:
             if countdownRemaining != nil {
@@ -1501,6 +1601,8 @@ public final class AppCoordinator {
             layout: layout
         )
         cursorController.update(configuration: cursorConfig)
+        cursorAlignmentMode = cursorController.alignmentMode
+        windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(collectIgnoredOverlayWindowIDs())
     }
 
     private func handleOverlayMetricsChanged(_ metrics: OverlayDrawableMetrics) {
@@ -1525,6 +1627,7 @@ public final class AppCoordinator {
             metrics: metrics,
             layout: lastLayout
         ))
+        cursorAlignmentMode = cursorController.alignmentMode
         syncVRRCursorSnapshotIfNeeded()
         updateChromePanelFrames(for: metrics.cocoaFrame)
         syncOverlayChromeVisibility(profile: effectiveProfile, metrics: metrics)
@@ -1555,7 +1658,7 @@ public final class AppCoordinator {
                 await stopScaling(
                     isManual: false,
                     showToast: true,
-                    toastOverride: reason.map { l10n.tr("Capture Ended: \($0)", "捕获已结束：\($0)") }
+                    toastOverride: reason.map { l10n.tr("Capture Ended: \($0)", "画面采集已结束：\($0)") }
                 )
             }
         default:
@@ -1669,7 +1772,7 @@ public final class AppCoordinator {
                 showToast: true,
                 toastOverride: l10n.tr(
                     "3D Game Mode Stopped (Overlapped by \(overlapping.appName))",
-                    "3D 游戏模式已安全停止（检测到 \(overlapping.appName) 窗口遮挡）"
+                    "3D 游戏模式已自动退出（检测到 \(overlapping.appName) 窗口遮挡）"
                 )
             )
 
@@ -1735,10 +1838,15 @@ public final class AppCoordinator {
         } else {
             try? cursorController.start(configuration: cursorConfig) { [weak self] _ in
                 Task { @MainActor [weak self] in
-                    self?.syncVRRCursorSnapshotIfNeeded()
+                    guard let self else { return }
+                    self.syncVRRCursorSnapshotIfNeeded()
+                    self.windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(self.collectIgnoredOverlayWindowIDs())
                 }
             }
         }
+
+        cursorAlignmentMode = cursorController.alignmentMode
+        windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(collectIgnoredOverlayWindowIDs())
 
         if !isVRR {
             renderLoopController?.updateGPUCursorSprite(nil)

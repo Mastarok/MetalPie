@@ -3,10 +3,7 @@ import MetalPieCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Master-detail editor for MetalPie's Default Profile and Per-Application Profiles.
-///
-/// Every edit persists immediately via `ConfigStore.save(...)` AND live-reconfigures any running
-/// scaling session (completely fixing MetalDuck's silently-dropped profile edit bugs!).
+/// Master-detail editor for MetalPie's Default Profile and Per-Application Rules (`配置文件` / `Profiles`).
 struct ProfilesView: View {
     @Bindable var coordinator: AppCoordinator
 
@@ -46,13 +43,13 @@ struct ProfilesView: View {
     private func profilesSidebar(l10n: L10n) -> some View {
         VStack(spacing: 0) {
             HStack {
-                Text(l10n.tr("Profiles", "应用配置"))
+                Text(l10n.tr("Profiles", "配置文件"))
                     .font(.system(size: 13.5, weight: .semibold))
                 Spacer()
                 Menu {
-                    Menu(l10n.tr("Add from Running Window", "从运行中窗口创建")) {
+                    Menu(l10n.tr("Add from Open Window", "从已打开窗口创建")) {
                         if coordinator.windows.isEmpty {
-                            Text(l10n.tr("No running windows found", "未检测到运行中窗口"))
+                            Text(l10n.tr("No open windows found", "暂未检测到打开的窗口"))
                         } else {
                             ForEach(coordinator.windows) { win in
                                 Button(win.displayName) {
@@ -61,7 +58,7 @@ struct ProfilesView: View {
                             }
                         }
                     }
-                    Button(l10n.tr("Add Application (.app)…", "选择应用程序 (.app)…")) {
+                    Button(l10n.tr("Choose Application (.app)…", "选择应用程序 (.app)…")) {
                         pickApplicationForProfile()
                     }
                 } label: {
@@ -70,7 +67,7 @@ struct ProfilesView: View {
                 .menuStyle(.borderedButton)
                 .controlSize(.small)
                 .fixedSize()
-                .help(l10n.tr("Add Per-App Profile", "新建应用专属配置"))
+                .help(l10n.tr("Add App Rule", "为单个游戏或应用新建规则"))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -93,7 +90,7 @@ struct ProfilesView: View {
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                             } else if profile.isDefault {
-                                Text(l10n.tr("Fallback for all apps", "所有未单独配置应用的默认值"))
+                                Text(l10n.tr("Used for all apps without custom rules", "未单独设置的应用默认使用此项"))
                                     .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
                             }
@@ -132,7 +129,7 @@ struct ProfilesView: View {
                 .controlSize(.small)
                 .buttonStyle(.bordered)
                 .disabled(selectedProfile == nil)
-                .help(l10n.tr("Duplicate Selected Profile", "复制所选配置"))
+                .help(l10n.tr("Duplicate Profile", "复制此配置"))
 
                 Spacer()
 
@@ -146,7 +143,7 @@ struct ProfilesView: View {
                 .controlSize(.small)
                 .buttonStyle(.bordered)
                 .disabled(selectedProfile?.isDefault ?? true)
-                .help(l10n.tr("Delete Selected Profile", "删除所选配置"))
+                .help(l10n.tr("Delete Profile", "删除此配置"))
             }
             .padding(10)
         }
@@ -160,9 +157,12 @@ struct ProfilesView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(l10n.tr("Default Profile", "全局默认配置"))
                         .font(.system(size: 20, weight: .bold))
-                    Text(l10n.tr("Applied automatically whenever no per-app profile matches the target window.", "当目标窗口未命中任何应用专属规则时自动使用此配置。"))
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+                    Text(l10n.tr(
+                        "Applies to any window that doesn't have its own per-app rule. Changes save immediately.",
+                        "没有单独设置规则的游戏或软件都会使用这里的效果，修改后自动保存并立即生效。"
+                    ))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
                 }
             } else {
                 TextField(
@@ -177,20 +177,31 @@ struct ProfilesView: View {
             if profile.threeDGameMode {
                 StatusBadge(l10n.tr("3D Game Mode", "3D 游戏模式"), color: .purple, symbol: "gamecontroller.fill")
             }
+            Button {
+                coordinator.selectedProfileID = profile.id
+                coordinator.selectedTab = .settings
+            } label: {
+                Label(l10n.tr("Mouse & Frame Gen…", "调鼠标与补帧…"), systemImage: "slider.horizontal.3")
+            }
+            .controlSize(.small)
+            .buttonStyle(.bordered)
         }
     }
 
     private func matchRulesCard(profile: Profile, l10n: L10n) -> some View {
         SectionCard(
-            title: l10n.tr("Window Match Rules", "窗口匹配规则"),
-            subtitle: l10n.tr("More specific rules (Bundle ID + Title Regex) take precedence over broader rules.", "规则越精确（Bundle ID + 窗口标题正则），优先级越高。"),
+            title: l10n.tr("App Matching Rules", "匹配目标应用"),
+            subtitle: l10n.tr(
+                "MetalPie automatically picks this profile when a window matches these fields.",
+                "当窗口符合以下条件时，自动套用这套专属缩放设置。"
+            ),
             symbol: "scope"
         ) {
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
                 GridRow {
-                    Text("Bundle ID")
+                    Text(l10n.tr("Bundle ID", "应用标识 (Bundle ID)"))
                         .font(.system(size: 12, weight: .medium))
-                        .frame(width: 130, alignment: .leading)
+                        .frame(width: 145, alignment: .leading)
                     TextField(
                         "com.example.game",
                         text: optionalStringBinding(profile.id, \.bundleIdentifier)
@@ -199,7 +210,7 @@ struct ProfilesView: View {
                     .font(.system(size: 12, design: .monospaced))
                 }
                 GridRow {
-                    Text(l10n.tr("App Path", "应用程序路径"))
+                    Text(l10n.tr("App Location", "应用路径"))
                         .font(.system(size: 12, weight: .medium))
                     TextField(
                         "/Applications/Game.app",
@@ -209,10 +220,10 @@ struct ProfilesView: View {
                     .font(.system(size: 12, design: .monospaced))
                 }
                 GridRow {
-                    Text(l10n.tr("Window Title Regex", "窗口标题正则"))
+                    Text(l10n.tr("Window Title Filter", "窗口标题匹配（可选）"))
                         .font(.system(size: 12, weight: .medium))
                     TextField(
-                        l10n.tr("Optional regex (e.g. ^Hollow Knight.*)", "可选正则（如 ^Hollow Knight.*）"),
+                        l10n.tr("Optional regex (e.g. ^Hollow Knight.*)", "可留空；填关键词或正则可仅匹配特定窗口"),
                         text: optionalStringBinding(profile.id, \.windowTitlePattern)
                     )
                     .textFieldStyle(.roundedBorder)
@@ -232,25 +243,40 @@ struct ProfilesView: View {
         }()
 
         return SectionCard(
-            title: l10n.tr("Scaling & Presentation", "超分与显示模式"),
+            title: l10n.tr("Scaling Mode & Display", "放大方式与显示器"),
             symbol: "display"
         ) {
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
                 GridRow {
-                    Text(l10n.tr("Scaling Mode", "超分预设"))
+                    Text(l10n.tr("Scaling Mode", "缩放模式"))
                         .font(.system(size: 12, weight: .medium))
                         .frame(width: 150, alignment: .leading)
                     Picker("", selection: binding(profile.id, \.scalingModeID)) {
-                        ForEach(coordinator.config.scalingModes) { mode in
-                            Text(l10n.builtInModeName(mode)).tag(mode.id)
+                        ForEach(ScenarioTag.allCases) { tag in
+                            let group = coordinator.orderedBuiltInModes(for: tag)
+                            if !group.isEmpty {
+                                Section(l10n.scenarioTag(tag)) {
+                                    ForEach(group) { mode in
+                                        Text(l10n.builtInModeName(mode)).tag(mode.id)
+                                    }
+                                }
+                            }
+                        }
+                        let custom = coordinator.config.scalingModes.filter { !$0.isBuiltIn }
+                        if !custom.isEmpty {
+                            Section(l10n.tr("Custom Modes", "自定义模式")) {
+                                ForEach(custom) { mode in
+                                    Text(l10n.builtInModeName(mode)).tag(mode.id)
+                                }
+                            }
                         }
                     }
                     .labelsHidden()
-                    .frame(maxWidth: 260)
+                    .frame(maxWidth: 280)
                 }
 
                 GridRow {
-                    Text(l10n.tr("Presentation", "呈现方式"))
+                    Text(l10n.tr("Display Style", "放大形态"))
                         .font(.system(size: 12, weight: .medium))
                     Picker("", selection: Binding<Int>(
                         get: { isWindowed ? 1 : 0 },
@@ -264,8 +290,8 @@ struct ProfilesView: View {
                             }
                         }
                     )) {
-                        Text(l10n.tr("Fullscreen Overlay", "全屏覆盖缩放")).tag(0)
-                        Text(l10n.tr("Resizable Windowed", "可调节窗口缩放")).tag(1)
+                        Text(l10n.tr("Fullscreen", "全屏放大")).tag(0)
+                        Text(l10n.tr("Resizable Window", "窗口放大（可调大小）")).tag(1)
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
@@ -275,7 +301,7 @@ struct ProfilesView: View {
 
                 if isWindowed {
                     GridRow {
-                        Text(l10n.tr("Initial Window Scale", "初始窗口倍率"))
+                        Text(l10n.tr("Initial Window Scale", "初始放大倍数"))
                             .font(.system(size: 12, weight: .medium))
                         HStack(spacing: 10) {
                             Slider(
@@ -300,7 +326,7 @@ struct ProfilesView: View {
                 }
 
                 GridRow {
-                    Text(l10n.tr("Multi-Monitor Target", "多显示器策略"))
+                    Text(l10n.tr("Multi-Monitor Target", "多显示器目标"))
                         .font(.system(size: 12, weight: .medium))
                     Picker("", selection: binding(profile.id, \.multiMonitorMode)) {
                         ForEach(MultiMonitorMode.allCases) { m in
@@ -308,7 +334,7 @@ struct ProfilesView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(maxWidth: 260)
+                    .frame(maxWidth: 280)
                 }
             }
         }
@@ -319,12 +345,12 @@ struct ProfilesView: View {
         let cropValid = profile.crop.isValid(for: sampleSource)
 
         return SectionCard(
-            title: l10n.tr("Output Alignment & Pixel Cropping", "画面对齐与边缘裁切"),
+            title: l10n.tr("Screen Position & Edge Cropping", "画面位置与去黑边裁切"),
             symbol: "crop"
         ) {
             HStack(alignment: .top, spacing: 24) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(l10n.tr("9-Point Alignment", "九宫格画面对齐"))
+                    Text(l10n.tr("Screen Alignment", "画面对齐位置"))
                         .font(.system(size: 12, weight: .semibold))
                     OutputAlignmentGridPicker(
                         selection: binding(profile.id, \.outputAlignment),
@@ -337,7 +363,7 @@ struct ProfilesView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Toggle(
-                            l10n.tr("Enable Source Pixel Cropping", "启用源画面像素裁切 (去除黑边/窗口边框)"),
+                            l10n.tr("Crop Window Edges (Remove Black Bars / Borders)", "裁切多余边缘（去除视频黑边或窗口白边）"),
                             isOn: binding(profile.id, \.crop.enabled)
                         )
                         .font(.system(size: 12, weight: .semibold))
@@ -345,8 +371,8 @@ struct ProfilesView: View {
                         if profile.crop.enabled {
                             StatusBadge(
                                 cropValid
-                                    ? l10n.tr("Valid (>=64px)", "有效 (>=64px)")
-                                    : l10n.tr("Exceeds min 64px", "超出最小 64px 保护"),
+                                    ? l10n.tr("Valid", "裁切有效")
+                                    : l10n.tr("Too Large (Min 64px)", "裁切过大（需保留≥64px）"),
                                 color: cropValid ? .green : .red
                             )
                         }
@@ -354,14 +380,14 @@ struct ProfilesView: View {
 
                     if profile.crop.enabled {
                         HStack(spacing: 10) {
-                            cropField(label: l10n.tr("Left", "左"), value: binding(profile.id, \.crop.left))
-                            cropField(label: l10n.tr("Top", "上"), value: binding(profile.id, \.crop.top))
-                            cropField(label: l10n.tr("Right", "右"), value: binding(profile.id, \.crop.right))
-                            cropField(label: l10n.tr("Bottom", "下"), value: binding(profile.id, \.crop.bottom))
+                            cropField(label: l10n.tr("Left", "左 (px)"), value: binding(profile.id, \.crop.left))
+                            cropField(label: l10n.tr("Top", "上 (px)"), value: binding(profile.id, \.crop.top))
+                            cropField(label: l10n.tr("Right", "右 (px)"), value: binding(profile.id, \.crop.right))
+                            cropField(label: l10n.tr("Bottom", "下 (px)"), value: binding(profile.id, \.crop.bottom))
                         }
                         Text(l10n.tr(
-                            "MetalPie enforces a 64px minimum remaining width/height safety guard automatically.",
-                            "MetalPie 会自动强制保留至少 64×64 有效像素区域，防止非法裁切崩溃。"
+                            "MetalPie automatically keeps at least 64×64 pixels of visible content.",
+                            "系统会自动保护至少保留 64×64 像素画面，不必担心填错导致异常。"
                         ))
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
@@ -380,19 +406,19 @@ struct ProfilesView: View {
             TextField("0", value: value, format: .number)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 12, design: .monospaced))
-                .frame(width: 64)
+                .frame(width: 66)
         }
     }
 
     private func autoScaleAndGameModeCard(profile: Profile, l10n: L10n) -> some View {
         SectionCard(
-            title: l10n.tr("Auto-Scale & 3D Game Mode", "自动缩放与 3D 游戏模式"),
+            title: l10n.tr("Auto-Scale & 3D Game Mode", "自动放大与 3D 游戏模式"),
             symbol: "gamecontroller.fill",
             accent: .purple
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 12) {
-                    Text(l10n.tr("Auto-Scale on Focus", "获焦自动缩放"))
+                    Text(l10n.tr("Auto-Scale on Focus", "自动放大"))
                         .font(.system(size: 12, weight: .medium))
                         .frame(width: 150, alignment: .leading)
                     Picker("", selection: binding(profile.id, \.autoScaleMode)) {
@@ -401,12 +427,12 @@ struct ProfilesView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(maxWidth: 220)
+                    .frame(maxWidth: 260)
                 }
 
                 if profile.autoScaleMode != .disabled {
                     HStack(spacing: 12) {
-                        Text(l10n.tr("Activation Delay", "触发防抖延迟"))
+                        Text(l10n.tr("Wait Before Scaling", "切换等待时间"))
                             .font(.system(size: 12, weight: .medium))
                             .frame(width: 150, alignment: .leading)
                         Slider(
@@ -415,10 +441,13 @@ struct ProfilesView: View {
                             step: 0.1
                         )
                         .frame(maxWidth: 200)
-                        Text(String(format: "%.1f s", profile.autoScaleDelaySeconds))
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                            .monospacedDigit()
-                            .frame(width: 48, alignment: .trailing)
+                        Text(l10n.tr(
+                            String(format: "%.1fs", profile.autoScaleDelaySeconds),
+                            String(format: "%.1f 秒", profile.autoScaleDelaySeconds)
+                        ))
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                        .frame(width: 52, alignment: .trailing)
                     }
                 }
 
@@ -426,11 +455,11 @@ struct ProfilesView: View {
 
                 Toggle(isOn: binding(profile.id, \.threeDGameMode)) {
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(l10n.tr("3D Game Mode (FPS / Action Safeguards)", "3D 游戏模式（FPS / 动作游戏专属优化）"))
+                        Text(l10n.tr("3D Game Mode (FPS / Action Games)", "3D 游戏模式（FPS / 动作游戏专用）"))
                             .font(.system(size: 12.5, weight: .semibold))
                         Text(l10n.tr(
-                            "Forces fullscreen, hides toolbar, disables duplicate-frame check, enforces strict cursor lock, and safely stops if a foreign window overlaps >= 8 pt.",
-                            "强制全屏、隐藏工具栏、关闭重复帧检测、启用严格光标锁定，并在其他窗口遮挡 >=8pt 时安全退出。"
+                            "Forces fullscreen, hides toolbar, locks cursor inside the game, and safely exits if another app pops up on top.",
+                            "强制全屏并隐藏工具栏、锁定游戏鼠标，有其他弹窗遮挡时自动安全退出缩放。"
                         ))
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
@@ -442,17 +471,17 @@ struct ProfilesView: View {
 
     private func chromeAndCaptureCard(profile: Profile, l10n: L10n) -> some View {
         SectionCard(
-            title: l10n.tr("Window Capture & Overlay Chrome", "窗口捕获与悬浮组件"),
+            title: l10n.tr("Window Borders & Overlay Bar", "窗口边框与顶部工具栏"),
             symbol: "macwindow"
         ) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 24) {
                     Toggle(
-                        l10n.tr("Capture Window Title Bar", "包含窗口标题栏"),
+                        l10n.tr("Include Window Title Bar", "保留窗口顶部标题栏"),
                         isOn: binding(profile.id, \.capture.captureTitleBar)
                     )
                     Toggle(
-                        l10n.tr("Ignore Window Drop Shadows", "忽略窗口阴影（推荐）"),
+                        l10n.tr("Exclude Window Shadows (Recommended)", "去除窗口外阴影（推荐）"),
                         isOn: binding(profile.id, \.capture.ignoreShadows)
                     )
                 }
@@ -461,7 +490,7 @@ struct ProfilesView: View {
                 Divider()
 
                 HStack(spacing: 12) {
-                    Text(l10n.tr("Floating Toolbar", "顶部悬浮工具栏"))
+                    Text(l10n.tr("Top Floating Toolbar", "顶部悬浮工具栏"))
                         .font(.system(size: 12, weight: .medium))
                         .frame(width: 150, alignment: .leading)
                     Picker("", selection: binding(profile.id, \.toolbarMode)) {
@@ -470,11 +499,11 @@ struct ProfilesView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(maxWidth: 250)
+                    .frame(maxWidth: 270)
                 }
 
                 Toggle(
-                    l10n.tr("Show Real-Time Profiler HUD by Default", "启动时默认显示性能监视 HUD"),
+                    l10n.tr("Show Live FPS Overlay Automatically", "开始放大时自动显示左上角帧率信息"),
                     isOn: binding(profile.id, \.showProfilerHUD)
                 )
                 .font(.system(size: 12.5))
