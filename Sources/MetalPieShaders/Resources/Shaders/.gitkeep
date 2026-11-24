@@ -1,0 +1,2 @@
+// Placeholder directory marker for runtime-compiled .metal shaders.
+// Shader files placed in this directory are copied verbatim into the module resource bundle.

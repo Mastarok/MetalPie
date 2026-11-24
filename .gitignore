@@ -1,0 +1,19 @@
+# SwiftPM build outputs & caches
+.build/
+.swiftpm/
+Package.resolved
+
+# Distribution & packaging outputs
+dist/
+*.dmg
+*.app/
+
+# macOS & IDE artifacts
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
