@@ -463,23 +463,56 @@ public final class MetalOverlayView: NSView {
         case .move:
             newFrame.origin.x += dx
             newFrame.origin.y += dy
+            if let visible = Self.bestHostVisibleFrame(for: newFrame, fallbackScreen: win.screen),
+               newFrame.height <= visible.height,
+               newFrame.maxY > visible.maxY
+            {
+                newFrame.origin.y = (visible.maxY - newFrame.height).rounded()
+            }
 
         case .resize(let edges):
-            let hostScreenSize = win.screen?.frame.size ?? NSScreen.main?.frame.size
+            let hostVisible = Self.bestHostVisibleFrame(for: dragStartWindowFrame, fallbackScreen: win.screen)
+            let hostScreenSize = hostVisible?.size ?? win.screen?.frame.size ?? NSScreen.main?.frame.size
+            var clampedDY = dy
+            if edges.contains(.top), let visible = hostVisible {
+                clampedDY = min(clampedDY, visible.maxY - dragStartWindowFrame.maxY)
+            }
             newFrame = Self.computeInteractiveResizeFrame(
                 startFrame: dragStartWindowFrame,
                 edges: edges,
-                delta: CGVector(dx: dx, dy: dy),
+                delta: CGVector(dx: dx, dy: clampedDY),
                 aspectRatio: lockedAspectRatio,
                 minWidth: minimumWindowedWidth,
                 minHeight: minimumWindowedHeight,
                 maxSize: hostScreenSize
             )
+            if let visible = hostVisible, newFrame.maxY > visible.maxY {
+                if newFrame.height <= visible.height {
+                    newFrame.origin.y = (visible.maxY - newFrame.height).rounded()
+                } else {
+                    newFrame.size.height = visible.height.rounded()
+                    newFrame.origin.y = visible.minY.rounded()
+                }
+            }
         }
 
         win.setFrame(newFrame, display: true, animate: false)
         syncDrawableGeometry()
         onInteractiveFrameUpdate?(win.frame)
+    }
+
+    private static func bestHostVisibleFrame(for cocoaFrame: CGRect, fallbackScreen: NSScreen?) -> CGRect? {
+        let bestScreen = NSScreen.screens.max { lhs, rhs in
+            let lInter = lhs.frame.intersection(cocoaFrame)
+            let rInter = rhs.frame.intersection(cocoaFrame)
+            let lArea = (lInter.isNull || lInter.isEmpty) ? 0 : (lInter.width * lInter.height)
+            let rArea = (rInter.isNull || rInter.isEmpty) ? 0 : (rInter.width * rInter.height)
+            return lArea < rArea
+        }
+        if let bestScreen, bestScreen.frame.intersects(cocoaFrame) {
+            return bestScreen.visibleFrame
+        }
+        return fallbackScreen?.visibleFrame ?? NSScreen.main?.visibleFrame
     }
 
     /// Pure, unit-testable aspect-locked 8-direction interactive resize solver supporting BOTH
@@ -709,21 +742,315 @@ public enum OverlayChromeGeometry: Sendable {
     }
 }
 
+// MARK: - OverlayToolbarAutoHideState (Idempotent Show & Dual-Pointer Hover State Machine)
+
+/// Pure, unit-testable state machine driving `OverlayToolbarPanel`'s `Off` / `AutoHide` / `AlwaysShow`
+/// lifecycle, idempotent repeated `show(...)` calls (zero hover-reset flicker), dual-pointer
+/// (physical `NSEvent.mouseLocation` + scaled cursor) hover tracking with hysteresis, and
+/// `0.5pt`-deduplicated interactive-frame change notifications.
+public struct OverlayToolbarAutoHideState: Sendable {
+    public static let fittsTopStripHeight: CGFloat = 28
+    public static let hoverHysteresisDX: CGFloat = 24
+    public static let hoverHysteresisDY: CGFloat = 18
+    public static let hideDelaySeconds: TimeInterval = 0.85
+    public static let frameChangeTolerance: CGFloat = 0.5
+
+    public struct ShowTransition: Equatable, Sendable {
+        public var shouldHide: Bool
+        public var isIdempotentUpdate: Bool
+        public var shouldResetAutoHideHidden: Bool
+        public var shouldStartHoverTimer: Bool
+        public var shouldStopHoverTimer: Bool
+        public var shouldRevealAlwaysShow: Bool
+        public var interactiveFrameChanged: Bool
+    }
+
+    public enum HoverAction: Equatable, Sendable {
+        case none
+        case reveal
+        case hide
+    }
+
+    public struct HoverEvaluation: Equatable, Sendable {
+        public var action: HoverAction
+        public var isHovering: Bool
+        public var interactiveFrameChanged: Bool
+    }
+
+    public private(set) var mode: ToolbarMode = .autoHide
+    public private(set) var isShown: Bool = false
+    public private(set) var isRevealedByHover: Bool = false
+    public private(set) var lastHoverLeaveTime: TimeInterval = 0
+    public private(set) var anchorOverlayFrame: CGRect = .zero
+    public private(set) var visibleToolbarFrame: CGRect = .zero
+    public private(set) var lastReportedInteractiveFrame: CGRect? = nil
+
+    public init() {}
+
+    /// Exact visible interactive Cocoa frame when the toolbar is currently accepting clicks,
+    /// or `nil` when hidden or auto-hidden.
+    public var visibleInteractiveCocoaFrame: CGRect? {
+        guard isShown, !visibleToolbarFrame.isEmpty else { return nil }
+        guard mode == .alwaysShow || isRevealedByHover else { return nil }
+        return visibleToolbarFrame
+    }
+
+    /// Computes the Fitts's-law top-edge trigger strip in global AppKit (Cocoa Y-up) coordinates.
+    /// Extends smoothly from inside `visibleToolbarRect` up past `anchorOverlayFrame.maxY` so there
+    /// is ZERO dead gap between the screen/overlay top edge and the toolbar pill (including below a notch).
+    public static func computeAutoHideTopStrip(
+        anchorOverlayFrame: CGRect,
+        visibleToolbarRect: CGRect
+    ) -> CGRect {
+        let stripWidth = max(visibleToolbarRect.width, OverlayChromeGeometry.defaultToolbarSize.width) * 1.3
+        let stripX = (visibleToolbarRect.midX - stripWidth * 0.5).rounded()
+        let stripMinY = min(visibleToolbarRect.maxY - fittsTopStripHeight, visibleToolbarRect.maxY - 12)
+        let stripMaxY = max(
+            anchorOverlayFrame.maxY + 4,
+            visibleToolbarRect.maxY + OverlayChromeGeometry.notchSafeTopMargin + 6
+        )
+        return CGRect(
+            x: stripX,
+            y: stripMinY,
+            width: stripWidth,
+            height: max(fittsTopStripHeight, stripMaxY - stripMinY)
+        )
+    }
+
+    /// Returns `true` when two optional rects differ by at least `tolerance` points on any edge/size.
+    public static func framesDiffer(
+        _ lhs: CGRect?,
+        _ rhs: CGRect?,
+        tolerance: CGFloat = frameChangeTolerance
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return false
+        case (nil, .some), (.some, nil):
+            return true
+        case let (.some(a), .some(b)):
+            return abs(a.origin.x - b.origin.x) >= tolerance
+                || abs(a.origin.y - b.origin.y) >= tolerance
+                || abs(a.size.width - b.size.width) >= tolerance
+                || abs(a.size.height - b.size.height) >= tolerance
+        }
+    }
+
+    /// Applies a `show(mode:overlayCocoaFrame:...)` call idempotently: when already shown in the
+    /// same `mode`, preserves `isRevealedByHover`, `lastHoverLeaveTime`, and the hover timer so
+    /// repeated metric/chrome syncs NEVER cause hover flicker.
+    public mutating func beginShow(
+        mode: ToolbarMode,
+        overlayCocoaFrame: CGRect,
+        visibleToolbarFrame: CGRect
+    ) -> ShowTransition {
+        if mode == .off || overlayCocoaFrame.isEmpty || visibleToolbarFrame.isEmpty {
+            let changed = hide()
+            self.mode = mode
+            self.anchorOverlayFrame = overlayCocoaFrame
+            return ShowTransition(
+                shouldHide: true,
+                isIdempotentUpdate: false,
+                shouldResetAutoHideHidden: false,
+                shouldStartHoverTimer: false,
+                shouldStopHoverTimer: true,
+                shouldRevealAlwaysShow: false,
+                interactiveFrameChanged: changed
+            )
+        }
+
+        let wasShownInSameMode = isShown && self.mode == mode
+        self.mode = mode
+        self.anchorOverlayFrame = overlayCocoaFrame
+        self.visibleToolbarFrame = visibleToolbarFrame
+        self.isShown = true
+
+        if wasShownInSameMode {
+            let changed = consumeInteractiveFrameChangeIfNeeded()
+            return ShowTransition(
+                shouldHide: false,
+                isIdempotentUpdate: true,
+                shouldResetAutoHideHidden: false,
+                shouldStartHoverTimer: false,
+                shouldStopHoverTimer: false,
+                shouldRevealAlwaysShow: false,
+                interactiveFrameChanged: changed
+            )
+        }
+
+        switch mode {
+        case .off:
+            let changed = hide()
+            return ShowTransition(
+                shouldHide: true,
+                isIdempotentUpdate: false,
+                shouldResetAutoHideHidden: false,
+                shouldStartHoverTimer: false,
+                shouldStopHoverTimer: true,
+                shouldRevealAlwaysShow: false,
+                interactiveFrameChanged: changed
+            )
+        case .alwaysShow:
+            isRevealedByHover = false
+            lastHoverLeaveTime = 0
+            let changed = consumeInteractiveFrameChangeIfNeeded()
+            return ShowTransition(
+                shouldHide: false,
+                isIdempotentUpdate: false,
+                shouldResetAutoHideHidden: false,
+                shouldStartHoverTimer: false,
+                shouldStopHoverTimer: true,
+                shouldRevealAlwaysShow: true,
+                interactiveFrameChanged: changed
+            )
+        case .autoHide:
+            isRevealedByHover = false
+            lastHoverLeaveTime = 0
+            let changed = consumeInteractiveFrameChangeIfNeeded()
+            return ShowTransition(
+                shouldHide: false,
+                isIdempotentUpdate: false,
+                shouldResetAutoHideHidden: true,
+                shouldStartHoverTimer: true,
+                shouldStopHoverTimer: false,
+                shouldRevealAlwaysShow: false,
+                interactiveFrameChanged: changed
+            )
+        }
+    }
+
+    /// Updates the overlay anchor and visible pill frame without ever resetting hover state.
+    /// Returns `true` ONLY if `visibleInteractiveCocoaFrame` actually changed by `>= 0.5pt`.
+    public mutating func updateOverlayFrame(
+        _ overlayCocoaFrame: CGRect,
+        visibleToolbarFrame: CGRect
+    ) -> Bool {
+        self.anchorOverlayFrame = overlayCocoaFrame
+        if isShown && !overlayCocoaFrame.isEmpty && !visibleToolbarFrame.isEmpty {
+            self.visibleToolbarFrame = visibleToolbarFrame
+        }
+        return consumeInteractiveFrameChangeIfNeeded()
+    }
+
+    /// Hides the toolbar and returns `true` ONLY if an interactive frame was previously reported.
+    @discardableResult
+    public mutating func hide() -> Bool {
+        isShown = false
+        isRevealedByHover = false
+        lastHoverLeaveTime = 0
+        return consumeInteractiveFrameChangeIfNeeded()
+    }
+
+    /// Returns `true` when `point` (global AppKit Cocoa Y-up) lies inside the top trigger strip
+    /// OR (when already revealed) inside `visibleToolbarFrame` expanded by `(±24pt, ±18pt)`.
+    public func isPointHovering(_ point: CGPoint) -> Bool {
+        guard isShown, !visibleToolbarFrame.isEmpty else { return false }
+        let topStrip = Self.computeAutoHideTopStrip(
+            anchorOverlayFrame: anchorOverlayFrame,
+            visibleToolbarRect: visibleToolbarFrame
+        )
+        if topStrip.contains(point) {
+            return true
+        }
+        if isRevealedByHover {
+            let expandedToolbar = visibleToolbarFrame.insetBy(
+                dx: -Self.hoverHysteresisDX,
+                dy: -Self.hoverHysteresisDY
+            )
+            if expandedToolbar.contains(point) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Evaluates hover against BOTH the physical OS cursor (`NSEvent.mouseLocation`) AND the
+    /// scaled cursor position so switching into/out of `.directChrome` NEVER drops hover.
+    public func isHovering(
+        physicalCocoaPoint: CGPoint,
+        scaledCocoaPoint: CGPoint?
+    ) -> Bool {
+        if isPointHovering(physicalCocoaPoint) {
+            return true
+        }
+        if let scaled = scaledCocoaPoint, isPointHovering(scaled) {
+            return true
+        }
+        return false
+    }
+
+    /// Advances the auto-hide hover state machine for one timer tick.
+    public mutating func evaluateAutoHideHover(
+        physicalCocoaPoint: CGPoint,
+        scaledCocoaPoint: CGPoint?,
+        now: TimeInterval
+    ) -> HoverEvaluation {
+        guard isShown, mode == .autoHide, !visibleToolbarFrame.isEmpty else {
+            return HoverEvaluation(action: .none, isHovering: false, interactiveFrameChanged: false)
+        }
+
+        let hovering = isHovering(
+            physicalCocoaPoint: physicalCocoaPoint,
+            scaledCocoaPoint: scaledCocoaPoint
+        )
+
+        if hovering {
+            lastHoverLeaveTime = 0
+            if !isRevealedByHover {
+                isRevealedByHover = true
+                let changed = consumeInteractiveFrameChangeIfNeeded()
+                return HoverEvaluation(action: .reveal, isHovering: true, interactiveFrameChanged: changed)
+            }
+            return HoverEvaluation(action: .none, isHovering: true, interactiveFrameChanged: false)
+        }
+
+        if isRevealedByHover {
+            if lastHoverLeaveTime == 0 {
+                lastHoverLeaveTime = now
+            } else if now - lastHoverLeaveTime >= Self.hideDelaySeconds {
+                isRevealedByHover = false
+                lastHoverLeaveTime = 0
+                let changed = consumeInteractiveFrameChangeIfNeeded()
+                return HoverEvaluation(action: .hide, isHovering: false, interactiveFrameChanged: changed)
+            }
+        }
+
+        return HoverEvaluation(action: .none, isHovering: false, interactiveFrameChanged: false)
+    }
+
+    private mutating func consumeInteractiveFrameChangeIfNeeded() -> Bool {
+        let current = visibleInteractiveCocoaFrame
+        guard Self.framesDiffer(lastReportedInteractiveFrame, current, tolerance: Self.frameChangeTolerance) else {
+            return false
+        }
+        lastReportedInteractiveFrame = current
+        return true
+    }
+}
+
 // MARK: - OverlayWindowController
 
 /// Manages the lifecycle, window level, multi-monitor geometry, color space/EDR, windowed resize state,
 /// VRR direct-scanout mode, and reveal-on-first-frame gating of MetalPie's scaling overlay panel.
 @MainActor
 public final class OverlayWindowController {
-    /// Normal overlay window level: 3 below `mainMenuWindow` (level 21 — strictly above normal apps `0`,
-    /// floating palettes `3`, modal panels `8`, and Dock `20`, while keeping overlay `21`, cursor `22`,
-    /// and toolbar/HUD `23` ALL strictly below the macOS Menu Bar `24` and Status Bar `25`!).
-    public static let normalOverlayLevel = NSWindow.Level(
-        rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) - 3
+    /// Fullscreen (non-native-FS) overlay window level: 3 below `popUpMenuWindow` (level 98 — strictly
+    /// ABOVE macOS Menu Bar `24` and Status Bar `25` so fullscreen scaling never overlaps/bleeds behind
+    /// the translucent top Menu Bar, while keeping overlay `98`, cursor `99`, and toolbar/HUD `100`
+    /// ALL strictly below `popUpMenuWindow` `101`!).
+    public static let fullscreenOverlayLevel = NSWindow.Level(
+        rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) - 3
     )
 
-    /// Windowed overlay window level (same menu-bar-safe level `21`).
-    public static let windowedOverlayLevel = normalOverlayLevel
+    /// Alias to `fullscreenOverlayLevel` (`98`) preserved for existing callers and tests.
+    public static let normalOverlayLevel = fullscreenOverlayLevel
+
+    /// Windowed overlay window level: 3 below `mainMenuWindow` (level 21 — strictly above normal apps `0`,
+    /// floating palettes `3`, modal panels `8`, and Dock `20`, while keeping windowed overlay `21`,
+    /// cursor `22`, and toolbar/HUD `23` ALL strictly below macOS Menu Bar `24` and Status Bar `25`!).
+    public static let windowedOverlayLevel = NSWindow.Level(
+        rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) - 3
+    )
 
     /// Native macOS Full-Screen Space overlay level: level 19 (above full-screen app, below auto-hiding Dock/Menu Bar).
     public static let nativeFullscreenOverlayLevel = NSWindow.Level(rawValue: 19)
@@ -1102,8 +1429,9 @@ public final class OverlayWindowController {
                 || abs(panel.frame.size.width - targetCocoaRect.size.width) >= 0.5
                 || abs(panel.frame.size.height - targetCocoaRect.size.height) >= 0.5
             let displayChanged = targetDisplay != nil && targetDisplay?.id != activeDisplayID
+            let nativeFSChanged = (nativeFS != isCoveringNativeFullscreenSpace)
 
-            if frameChanged || displayChanged {
+            if frameChanged || displayChanged || nativeFSChanged {
                 panel.setFrame(targetCocoaRect, display: isRevealed && !isSuspended, animate: false)
                 applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: nativeFS)
                 applyOcclusionAndShadowState()
@@ -1114,9 +1442,11 @@ public final class OverlayWindowController {
         }
 
         // Windowed mode: keep the overlay locked over the source window on external move/resize so
-        // the source window never drifts out from behind the scaled overlay.
+        // the source window never drifts out from behind the scaled overlay, while staying strictly
+        // inside the host screen's menu-bar-safe visible frame.
         guard repositionWindowedOverlay else { return }
 
+        let visibleCocoa = hostVisibleCocoaFrame(for: currentSourceCGRect, displays: displays)
         let sizeChanged = abs(previousSourceCGRect.width - currentSourceCGRect.width) >= 1.0
             || abs(previousSourceCGRect.height - currentSourceCGRect.height) >= 1.0
         let targetCocoaRect: CGRect
@@ -1125,15 +1455,17 @@ public final class OverlayWindowController {
                 previousSourceCGRect: previousSourceCGRect,
                 newSourceCGRect: currentSourceCGRect,
                 currentOverlayCocoaFrame: panel.frame,
-                displays: displays
+                displays: displays,
+                hostVisibleCocoaFrame: visibleCocoa
             )
             lastWindowedWidth = targetCocoaRect.width
         } else {
             let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: currentSourceCGRect, in: displays)
                 ?? ScreenGeometry.primaryDisplay(in: displays)
-            let screenCocoa = hostDisplay?.cocoaFrame
-                ?? NSScreen.main?.visibleFrame
-                ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+            let screenCocoa = Self.resolvedWindowedHostCocoaFrame(
+                hostDisplay: hostDisplay,
+                hostVisibleCocoaFrame: visibleCocoa
+            )
             let sourceCocoa = ScreenGeometry.cgToCocoa(rect: currentSourceCGRect, displays: displays).standardized
             let currentSize = panel.frame.size
             let width = min(screenCocoa.width, max(currentSize.width, ceil(sourceCocoa.width)))
@@ -1168,16 +1500,31 @@ public final class OverlayWindowController {
     }
 
     /// Programmatically adjusts the windowed overlay frame (for example, to remain flush over a
-    /// menu-bar-clamped or immovable source window) and synchronizes Metal drawable metrics.
+    /// menu-bar-clamped or immovable source window), clamping strictly below the macOS Menu Bar
+    /// and synchronizing Metal drawable metrics.
     public func setWindowedOverlayCocoaFrame(_ newCocoaFrame: CGRect) {
         guard isSessionOpen, currentPresentationMode.isWindowed, let panel else { return }
-        let frameChanged = abs(panel.frame.origin.x - newCocoaFrame.origin.x) >= 0.5
-            || abs(panel.frame.origin.y - newCocoaFrame.origin.y) >= 0.5
-            || abs(panel.frame.size.width - newCocoaFrame.size.width) >= 0.5
-            || abs(panel.frame.size.height - newCocoaFrame.size.height) >= 0.5
+        var clampedFrame = newCocoaFrame.standardized
+        let displays = WindowEnumerator.enumerateDisplaysOnMain()
+        let hostDisplay = ScreenGeometry.bestDisplay(forCocoaRect: clampedFrame, in: displays)
+            ?? ScreenGeometry.primaryDisplay(in: displays)
+        if let visible = hostDisplay.flatMap({ WindowEnumerator.nsScreen(for: $0.id)?.visibleFrame }) ?? NSScreen.main?.visibleFrame,
+           clampedFrame.maxY > visible.maxY
+        {
+            if clampedFrame.height <= visible.height {
+                clampedFrame.origin.y = (visible.maxY - clampedFrame.height).rounded()
+            } else {
+                clampedFrame.size.height = visible.height.rounded()
+                clampedFrame.origin.y = visible.minY.rounded()
+            }
+        }
+        let frameChanged = abs(panel.frame.origin.x - clampedFrame.origin.x) >= 0.5
+            || abs(panel.frame.origin.y - clampedFrame.origin.y) >= 0.5
+            || abs(panel.frame.size.width - clampedFrame.size.width) >= 0.5
+            || abs(panel.frame.size.height - clampedFrame.size.height) >= 0.5
         guard frameChanged else { return }
-        panel.setFrame(newCocoaFrame, display: isRevealed && !isSuspended, animate: false)
-        lastWindowedWidth = newCocoaFrame.width
+        panel.setFrame(clampedFrame, display: isRevealed && !isSuspended, animate: false)
+        lastWindowedWidth = clampedFrame.width
         refreshScreenCapabilitiesAndColorSpace()
         emitCurrentMetrics()
     }
@@ -1350,6 +1697,8 @@ public final class OverlayWindowController {
     }
 
     /// Pure, unit-testable multi-monitor overlay frame solver returning global AppKit (Y-up) coordinates.
+    /// When `hostVisibleCocoaFrame` is supplied in `.windowed` mode, clamps the windowed overlay strictly
+    /// inside the menu-bar-safe visible frame (`frame.maxY <= hostVisibleCocoaFrame.maxY`).
     public static func computeOverlayCocoaFrame(
         sourceCGRect: CGRect,
         presentationMode: PresentationMode,
@@ -1357,7 +1706,8 @@ public final class OverlayWindowController {
         displays: [DisplayDescriptor],
         aspectRatio: CGFloat,
         lastWindowedWidth: CGFloat? = nil,
-        applyAntiOcclusion: Bool = true
+        applyAntiOcclusion: Bool = true,
+        hostVisibleCocoaFrame: CGRect? = nil
     ) -> CGRect {
         switch presentationMode {
         case .fullscreen:
@@ -1375,9 +1725,10 @@ public final class OverlayWindowController {
         case .windowed(let initialScale, let explicitWidth):
             let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: sourceCGRect, in: displays)
                 ?? ScreenGeometry.primaryDisplay(in: displays)
-            let screenCocoa = hostDisplay?.cocoaFrame
-                ?? NSScreen.main?.visibleFrame
-                ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+            let screenCocoa = resolvedWindowedHostCocoaFrame(
+                hostDisplay: hostDisplay,
+                hostVisibleCocoaFrame: hostVisibleCocoaFrame
+            )
             let sourceCocoa = ScreenGeometry.cgToCocoa(rect: sourceCGRect, displays: displays).standardized
             let safeAspect = max(0.1, aspectRatio)
 
@@ -1437,14 +1788,17 @@ public final class OverlayWindowController {
         previousSourceCGRect: CGRect,
         newSourceCGRect: CGRect,
         currentOverlayCocoaFrame: CGRect,
-        displays: [DisplayDescriptor]
+        displays: [DisplayDescriptor],
+        hostVisibleCocoaFrame: CGRect? = nil
     ) -> CGRect {
         let prevSource = previousSourceCGRect.standardized
         let newSource = newSourceCGRect.standardized
         let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: newSource, in: displays)
             ?? ScreenGeometry.primaryDisplay(in: displays)
-        let screenCocoa = hostDisplay?.cocoaFrame
-            ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let screenCocoa = resolvedWindowedHostCocoaFrame(
+            hostDisplay: hostDisplay,
+            hostVisibleCocoaFrame: hostVisibleCocoaFrame
+        )
         let sourceCocoa = ScreenGeometry.cgToCocoa(rect: newSource, displays: displays).standardized
 
         let safeAspect: CGFloat = newSource.height > 0
@@ -1729,6 +2083,37 @@ public final class OverlayWindowController {
         return true
     }
 
+    private static func resolvedWindowedHostCocoaFrame(
+        hostDisplay: DisplayDescriptor?,
+        hostVisibleCocoaFrame: CGRect?
+    ) -> CGRect {
+        let fallback = hostDisplay?.cocoaFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        guard let visible = hostVisibleCocoaFrame?.standardized, !visible.isEmpty else {
+            return fallback
+        }
+        if let hostFull = hostDisplay?.cocoaFrame.standardized, !hostFull.isEmpty {
+            let clipped = hostFull.intersection(visible)
+            if !clipped.isNull && !clipped.isEmpty {
+                return clipped
+            }
+        }
+        return visible
+    }
+
+    private func hostVisibleCocoaFrame(
+        for sourceCGRect: CGRect,
+        displays: [DisplayDescriptor]
+    ) -> CGRect? {
+        guard let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: sourceCGRect, in: displays)
+            ?? ScreenGeometry.primaryDisplay(in: displays)
+        else {
+            return NSScreen.main?.visibleFrame
+        }
+        return WindowEnumerator.nsScreen(for: hostDisplay.id)?.visibleFrame
+    }
+
     private func computeOverlayCocoaFrame(
         sourceCGRect: CGRect,
         presentationMode: PresentationMode,
@@ -1737,20 +2122,25 @@ public final class OverlayWindowController {
         aspectRatio: CGFloat,
         applyAntiOcclusion: Bool
     ) -> CGRect {
-        Self.computeOverlayCocoaFrame(
+        let visibleCocoa = presentationMode.isWindowed
+            ? hostVisibleCocoaFrame(for: sourceCGRect, displays: displays)
+            : nil
+        return Self.computeOverlayCocoaFrame(
             sourceCGRect: sourceCGRect,
             presentationMode: presentationMode,
             multiMonitorMode: multiMonitorMode,
             displays: displays,
             aspectRatio: aspectRatio,
             lastWindowedWidth: lastWindowedWidth,
-            applyAntiOcclusion: applyAntiOcclusion
+            applyAntiOcclusion: applyAntiOcclusion,
+            hostVisibleCocoaFrame: visibleCocoa
         )
     }
 
     private func applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: Bool) {
         guard let panel else { return }
-        isCoveringNativeFullscreenSpace = nativeFullscreenSpace
+        let effectiveNativeFS = nativeFullscreenSpace && currentPresentationMode.isFullscreen
+        isCoveringNativeFullscreenSpace = effectiveNativeFS
 
         let app = NSApplication.shared
         let previousLevel = panel.level
@@ -1758,31 +2148,24 @@ public final class OverlayWindowController {
 
         if isPopupMenuLevelBoostActive && !isEffectiveVRRDirectScanout() {
             targetLevel = Self.popupMenuBoostOverlayLevel
-            if nativeFullscreenSpace {
-                if savedActivationPolicy == nil {
-                    savedActivationPolicy = app.activationPolicy()
-                }
-                if app.activationPolicy() != .accessory {
-                    app.setActivationPolicy(.accessory)
-                }
-            } else {
-                restoreActivationPolicyIfNeeded()
-            }
-        } else if nativeFullscreenSpace {
+        } else if isEffectiveVRRDirectScanout() {
+            targetLevel = Self.vrrFullscreenOverlayLevel
+        } else if effectiveNativeFS {
             targetLevel = Self.nativeFullscreenOverlayLevel
+        } else if currentPresentationMode.isFullscreen {
+            targetLevel = Self.fullscreenOverlayLevel
+        } else {
+            targetLevel = Self.windowedOverlayLevel
+        }
+
+        if effectiveNativeFS {
             if savedActivationPolicy == nil {
                 savedActivationPolicy = app.activationPolicy()
             }
             if app.activationPolicy() != .accessory {
                 app.setActivationPolicy(.accessory)
             }
-        } else if isEffectiveVRRDirectScanout() {
-            targetLevel = Self.vrrFullscreenOverlayLevel
-            restoreActivationPolicyIfNeeded()
         } else {
-            targetLevel = currentPresentationMode.isWindowed
-                ? Self.windowedOverlayLevel
-                : Self.normalOverlayLevel
             restoreActivationPolicyIfNeeded()
         }
 
@@ -1838,8 +2221,9 @@ public final class OverlayWindowController {
         let normalized = sourceCGRect.standardized
         let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: normalized, in: displays)
             ?? ScreenGeometry.primaryDisplay(in: displays)
-        let maxW = hostDisplay?.cocoaFrame.width ?? max(Self.absoluteMinimumWindowedWidth, normalized.width)
-        let maxH = hostDisplay?.cocoaFrame.height ?? max(Self.absoluteMinimumWindowedHeight, normalized.height)
+        let visibleFrame = hostDisplay.flatMap { WindowEnumerator.nsScreen(for: $0.id)?.visibleFrame }
+        let maxW = visibleFrame?.width ?? hostDisplay?.cocoaFrame.width ?? max(Self.absoluteMinimumWindowedWidth, normalized.width)
+        let maxH = visibleFrame?.height ?? hostDisplay?.cocoaFrame.height ?? max(Self.absoluteMinimumWindowedHeight, normalized.height)
         view.minimumWindowedWidth = min(maxW, max(Self.absoluteMinimumWindowedWidth, ceil(normalized.width)))
         view.minimumWindowedHeight = min(maxH, max(Self.absoluteMinimumWindowedHeight, ceil(normalized.height)))
     }

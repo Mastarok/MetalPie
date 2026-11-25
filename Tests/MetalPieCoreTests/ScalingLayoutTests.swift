@@ -244,4 +244,211 @@ struct ScalingLayoutTests {
         #expect(abs(roundTrip.x - sample.x) < 1e-6)
         #expect(abs(roundTrip.y - sample.y) < 1e-6)
     }
+
+    @Test("SCStreamFrameInfo.contentRect point-to-pixel conversion and active sub-rect detection")
+    func sckContentRectConversionAndSubRect() {
+        // Case A: Wider Retina 2x buffer (1200x600) containing 400x300pt window -> active pixels (0, 0, 800, 600)
+        let widerPx = ScalingLayoutCalculator.convertSCKContentRectToPixels(
+            pointRect: CGRect(x: 0, y: 0, width: 400, height: 300),
+            scaleFactor: 2.0,
+            textureSize: PixelSize(width: 1200, height: 600)
+        )
+        #expect(widerPx == CGRect(x: 0, y: 0, width: 800, height: 600))
+        let widerSub = ScalingLayoutCalculator.activeContentSubRect(
+            contentPixelRect: widerPx,
+            textureSize: PixelSize(width: 1200, height: 600)
+        )
+        #expect(widerSub == PixelRect(x: 0, y: 0, width: 800, height: 600))
+
+        // Case B: Downscaled Retina 2x stream (contentScale=0.5 already folded into 200x150pt contentRect)
+        let downscaledPx = ScalingLayoutCalculator.convertSCKContentRectToPixels(
+            pointRect: CGRect(x: 0, y: 0, width: 200, height: 150),
+            scaleFactor: 2.0,
+            textureSize: PixelSize(width: 700, height: 300)
+        )
+        #expect(downscaledPx == CGRect(x: 0, y: 0, width: 400, height: 300))
+
+        // Case C: Bilibili padded IOSurface (3024x1898 with active 1352.5x882pt @2x -> 2705x1764px)
+        let bilibiliPx = ScalingLayoutCalculator.convertSCKContentRectToPixels(
+            pointRect: CGRect(x: 0, y: 0, width: 1352.5, height: 882.0),
+            scaleFactor: 2.0,
+            textureSize: PixelSize(width: 3024, height: 1898)
+        )
+        #expect(bilibiliPx == CGRect(x: 0, y: 0, width: 2705, height: 1764))
+        let bilibiliSub = ScalingLayoutCalculator.activeContentSubRect(
+            contentPixelRect: bilibiliPx,
+            textureSize: PixelSize(width: 3024, height: 1898)
+        )
+        #expect(bilibiliSub == PixelRect(x: 0, y: 0, width: 2705, height: 1764))
+
+        // Case D: Exact match (within 1px rounding) returns nil so unpadded path stays zero-copy
+        let exactPx = ScalingLayoutCalculator.convertSCKContentRectToPixels(
+            pointRect: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            scaleFactor: 2.0,
+            textureSize: PixelSize(width: 3024, height: 1964)
+        )
+        #expect(exactPx == CGRect(x: 0, y: 0, width: 3024, height: 1964))
+        #expect(ScalingLayoutCalculator.activeContentSubRect(
+            contentPixelRect: exactPx,
+            textureSize: PixelSize(width: 3024, height: 1964)
+        ) == nil)
+        #expect(ScalingLayoutCalculator.activeContentSubRect(
+            contentPixelRect: CGRect(x: 0, y: 0, width: 3023, height: 1963),
+            textureSize: PixelSize(width: 3024, height: 1964)
+        ) == nil)
+
+        // Case E: Nil pointRect falls back cleanly to full texture pixel bounds
+        let fallbackPx = ScalingLayoutCalculator.convertSCKContentRectToPixels(
+            pointRect: nil,
+            scaleFactor: 2.0,
+            textureSize: PixelSize(width: 1920, height: 1080)
+        )
+        #expect(fallbackPx == CGRect(x: 0, y: 0, width: 1920, height: 1080))
+    }
+
+    @Test("Pre-downscale gating requires fullscreen && coversTarget and never blurs normal Retina webpages")
+    func fullscreenVideoPreDownscaleGating() {
+        let retinaWebpage = PixelSize(width: 3024, height: 1898)
+        let retinaDisplay = PixelSize(width: 3024, height: 1964)
+
+        // 1. Normal maximized Retina Chrome webpage (isNativeFullscreenSource=false, demagnifyActive=false) -> NO blur!
+        let webpageAuto = ScalingLayoutCalculator.resolveEffectiveSourceSize(
+            rawSourceSize: retinaWebpage,
+            targetPixelSize: retinaDisplay,
+            presentationMode: .fullscreen,
+            fullscreenVideoInput: .auto,
+            demagnifyActive: false,
+            isNativeFullscreenSource: false
+        )
+        #expect(webpageAuto.videoPreDownscaleSize == nil)
+        #expect(webpageAuto.effectiveSize == retinaWebpage)
+
+        // 2. Windowed mode covering >=85% of target -> NEVER pre-downscales (fixes `||` -> `&&` bug!)
+        for mode in [FullscreenVideoInputMode.auto, .p720, .p1080, .native] {
+            let windowed = ScalingLayoutCalculator.computeFullscreenVideoPreDownscaleSize(
+                rawSourceSize: retinaDisplay,
+                targetPixelSize: retinaDisplay,
+                presentationMode: .windowed(initialScale: 1.0, width: 1512),
+                mode: mode,
+                isNativeFullscreenSource: true,
+                demagnifyActive: true
+            )
+            #expect(windowed == nil, "Windowed mode must never trigger fullscreen video pre-downscale for \(mode)")
+        }
+
+        // 3. Small 720p window in fullscreen presentation -> coversTarget is false -> NEVER pre-downscales!
+        let small720p = ScalingLayoutCalculator.computeFullscreenVideoPreDownscaleSize(
+            rawSourceSize: PixelSize(width: 1280, height: 720),
+            targetPixelSize: retinaDisplay,
+            presentationMode: .fullscreen,
+            mode: .p720,
+            isNativeFullscreenSource: true,
+            demagnifyActive: false
+        )
+        #expect(small720p == nil)
+
+        // 4. True HTML5/IINA/VLC native fullscreen video (.auto + isNativeFullscreenSource=true) -> 50% pre-downscale
+        let nativeVideoAuto = ScalingLayoutCalculator.resolveEffectiveSourceSize(
+            rawSourceSize: retinaDisplay,
+            targetPixelSize: retinaDisplay,
+            presentationMode: .fullscreen,
+            fullscreenVideoInput: .auto,
+            demagnifyActive: false,
+            isNativeFullscreenSource: true
+        )
+        #expect(nativeVideoAuto.videoPreDownscaleSize == PixelSize(width: 1512, height: 982))
+        #expect(nativeVideoAuto.effectiveSize == PixelSize(width: 1512, height: 982))
+
+        // 5. Explicit .p720 / .p1080 on fullscreen target-covering window works even when isNativeFullscreenSource=false
+        let explicit720 = ScalingLayoutCalculator.computeFullscreenVideoPreDownscaleSize(
+            rawSourceSize: retinaDisplay,
+            targetPixelSize: retinaDisplay,
+            presentationMode: .fullscreen,
+            mode: .p720,
+            isNativeFullscreenSource: false,
+            demagnifyActive: false
+        )
+        #expect(explicit720 == PixelSize(width: 1109, height: 720))
+
+        let explicit1080 = ScalingLayoutCalculator.computeFullscreenVideoPreDownscaleSize(
+            rawSourceSize: retinaDisplay,
+            targetPixelSize: retinaDisplay,
+            presentationMode: .fullscreen,
+            mode: .p1080,
+            isNativeFullscreenSource: false,
+            demagnifyActive: false
+        )
+        #expect(explicit1080 == PixelSize(width: 1663, height: 1080))
+    }
+
+    @Test("DirectPresentPacer caps 150-240Hz bursts strictly to display refresh rate while passing jittered native frames immediately")
+    func directPresentPacerCapsOverSubmission() {
+        // 1. Default CaptureSettings.lowLatencyPresent is false (smooth CAMetalDisplayLink VSync default).
+        #expect(CaptureSettings().lowLatencyPresent == false)
+
+        // 2. Simulate 240Hz capture burst on 120Hz ProMotion over 1.0 second -> submissions <= 121 (never 150+!).
+        var pacer120 = DirectPresentPacer()
+        var submitted120 = 0
+        var nextScheduledWake: Double? = nil
+        var t = 100.0
+        let end = 101.0
+        while t < end {
+            if let wake = nextScheduledWake, t >= wake {
+                if case .submitNow = pacer120.evaluate(now: wake, displayRefreshHz: 120.0) {
+                    pacer120.recordSubmitted(at: wake)
+                    submitted120 += 1
+                    nextScheduledWake = nil
+                }
+            }
+            switch pacer120.evaluate(now: t, displayRefreshHz: 120.0) {
+            case .submitNow:
+                pacer120.recordSubmitted(at: t)
+                submitted120 += 1
+                nextScheduledWake = nil
+            case .coalesceUntil(let wakeTime):
+                if nextScheduledWake == nil {
+                    nextScheduledWake = wakeTime
+                }
+            }
+            t += 1.0 / 240.0
+        }
+        #expect(submitted120 >= 115 && submitted120 <= 122, "Expected ~120Hz paced submissions under 240Hz burst, got \(submitted120)")
+
+        // 3. Simulate 150Hz capture burst on 60Hz display over 1.0 second -> submissions <= 62.
+        var pacer60 = DirectPresentPacer()
+        var submitted60 = 0
+        nextScheduledWake = nil
+        t = 200.0
+        while t < 201.0 {
+            if let wake = nextScheduledWake, t >= wake {
+                if case .submitNow = pacer60.evaluate(now: wake, displayRefreshHz: 60.0) {
+                    pacer60.recordSubmitted(at: wake)
+                    submitted60 += 1
+                    nextScheduledWake = nil
+                }
+            }
+            switch pacer60.evaluate(now: t, displayRefreshHz: 60.0) {
+            case .submitNow:
+                pacer60.recordSubmitted(at: t)
+                submitted60 += 1
+                nextScheduledWake = nil
+            case .coalesceUntil(let wakeTime):
+                if nextScheduledWake == nil {
+                    nextScheduledWake = wakeTime
+                }
+            }
+            t += 1.0 / 150.0
+        }
+        #expect(submitted60 >= 58 && submitted60 <= 62, "Expected ~60Hz paced submissions under 150Hz burst, got \(submitted60)")
+
+        // 4. Normal jittered 120Hz frame arriving at 0.90 * displayInterval submits immediately without coalescing delay.
+        var jitterPacer = DirectPresentPacer()
+        jitterPacer.recordSubmitted(at: 10.0)
+        #expect(jitterPacer.evaluate(now: 10.0 + (1.0 / 120.0) * 0.90, displayRefreshHz: 120.0) == .submitNow)
+        if case .coalesceUntil(let wake) = jitterPacer.evaluate(now: 10.0 + (1.0 / 120.0) * 0.50, displayRefreshHz: 120.0) {
+            #expect(abs(wake - (10.0 + 1.0 / 120.0)) < 1e-6)
+        } else {
+            Issue.record("Expected 0.50x interval burst to coalesce until next display refresh slot")
+        }
+    }
 }

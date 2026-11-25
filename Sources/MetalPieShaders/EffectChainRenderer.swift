@@ -135,8 +135,11 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
     private struct RendererState {
         var demagnifyMode: DemagnifyMode = .none
         var fullscreenVideoPreDownscaleSize: PixelSize? = nil
+        var sourceContentPixelRect: PixelRect? = nil
         var presentOverlayOptions: PresentOverlayOptions?
         var enableCursorFreeScreenshotCache: Bool = true
+        var usesExternalOutputCache: Bool = false
+        var outputSnapshotBlitCount: UInt64 = 0
         var duplicate = DuplicateDetectorState()
         var lastCursorFreeOutput: (any MTLTexture)?
         /// Smoothed real GPU milliseconds per pass identifier, updated on `commandBuffer.addCompletedHandler`.
@@ -221,6 +224,13 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
         set { state.withLockUnchecked { $0.fullscreenVideoPreDownscaleSize = newValue } }
     }
 
+    /// Optional active SCStream content sub-rectangle in raw source texture pixels (cropped BEFORE
+    /// pre-downscaling and user `CropInsets` when ScreenCaptureKit pads an IOSurface with black margins).
+    public var sourceContentPixelRect: PixelRect? {
+        get { state.withLockUnchecked { $0.sourceContentPixelRect } }
+        set { state.withLockUnchecked { $0.sourceContentPixelRect = newValue } }
+    }
+
     /// Optional in-pass VRR cursor & HUD compositing configuration applied during the Present pass.
     public var presentOverlayOptions: PresentOverlayOptions? {
         get { state.withLockUnchecked { $0.presentOverlayOptions } }
@@ -232,6 +242,18 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
     public var enableCursorFreeScreenshotCache: Bool {
         get { state.withLockUnchecked { $0.enableCursorFreeScreenshotCache } }
         set { state.withLockUnchecked { $0.enableCursorFreeScreenshotCache = newValue } }
+    }
+
+    /// When `true`, the caller (`RenderLoopController`) manages cursor-free screenshots and
+    /// duplicate-frame output retention externally, skipping redundant full-frame GPU snapshot blits.
+    public var usesExternalOutputCache: Bool {
+        get { state.withLockUnchecked { $0.usesExternalOutputCache } }
+        set { state.withLockUnchecked { $0.usesExternalOutputCache = newValue } }
+    }
+
+    /// Total number of full-frame `cacheFinalOutputTexture` GPU blits encoded by this renderer.
+    public var outputSnapshotBlitCount: UInt64 {
+        state.withLockUnchecked { $0.outputSnapshotBlitCount }
     }
 
     /// Most recent pass timings measured after actual GPU command buffer completion.
@@ -300,32 +322,44 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
         // - ScreenCaptureKit already drops `.idle` frames via `SCFrameStatus != .complete`, so `.dynamic`
         //   never performs blocking GPU readbacks or redundant per-frame source blits.
         // - Explicit `.always` additionally schedules a non-blocking GPU `duplicateFrameCheck` inside `cb`.
-        let (activeDemag, activePreDownscale): (DemagnifyMode, PixelSize?) = allowLiveStateMutation
-            ? state.withLockUnchecked { ($0.demagnifyMode, $0.fullscreenVideoPreDownscaleSize) }
-            : (.none, nil)
+        let (activeDemag, activePreDownscale, activeSourceContentRect, externalOutputCache): (
+            DemagnifyMode,
+            PixelSize?,
+            PixelRect?,
+            Bool
+        ) = allowLiveStateMutation
+            ? state.withLockUnchecked {
+                ($0.demagnifyMode, $0.fullscreenVideoPreDownscaleSize, $0.sourceContentPixelRect, $0.usesExternalOutputCache)
+            }
+            : (.none, nil, nil, false)
         let modeSignature = makeModeSignature(
             scalingMode: scalingMode,
             layout: layout,
             isHDR: context.isHDR,
             demagnify: activeDemag,
-            preDownscale: activePreDownscale
+            preDownscale: activePreDownscale,
+            sourceContentRect: activeSourceContentRect
         )
         if allowLiveStateMutation,
            context.duplicateFrameMode != .never,
            let cachedOutput = checkDuplicateFrameZeroStall(
                currentSource: context.sourceTexture,
-               signature: modeSignature
+               signature: modeSignature,
+               externalOutputCache: externalOutputCache
            )
         {
-            // Skip entire shader chain and write cached upscaled texture (1:1 for intermediate buffer or full TBDR present).
-            try encodeOutputOrPresent(
-                contentTexture: cachedOutput.texture,
-                destinationTexture: context.destinationTexture,
-                layout: layout,
-                isHDR: context.isHDR,
-                allowOverlays: true,
-                commandBuffer: cb
-            )
+            // Skip entire shader chain! When caller manages output cache externally (`RenderLoopController`
+            // reuses `lastValidUpscaledTexture` directly), avoid redundant output blit/present too.
+            if let cachedTex = cachedOutput.texture {
+                try encodeOutputOrPresent(
+                    contentTexture: cachedTex,
+                    destinationTexture: context.destinationTexture,
+                    layout: layout,
+                    isHDR: context.isHDR,
+                    allowOverlays: true,
+                    commandBuffer: cb
+                )
+            }
             let timing = PassTiming(
                 id: "duplicate_skip",
                 name: "Duplicate Skip + Present",
@@ -354,8 +388,64 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
             }
         }
 
-        // 1. Optional Coalesced Pre-Downscale / 1x Non-Retina Demagnification (NEVER double-halves!)
+        // 0.5 Optional SCStream Active-Content Sub-Rect Crop (removes SCK black right/bottom padding BEFORE
+        // pre-downscaling and user CropInsets so black margins NEVER bleed into Catmull-Rom or output!).
         var currentTex: any MTLTexture = context.sourceTexture
+        if let rawContentRect = activeSourceContentRect,
+           let subRect = ScalingLayoutCalculator.activeContentSubRect(
+               contentPixelRect: CGRect(
+                   x: rawContentRect.x,
+                   y: rawContentRect.y,
+                   width: rawContentRect.width,
+                   height: rawContentRect.height
+               ),
+               textureSize: PixelSize(width: currentTex.width, height: currentTex.height)
+           )
+        {
+            let contentLease = try texturePool.acquire(
+                width: subRect.width,
+                height: subRect.height,
+                pixelFormat: workingFormat,
+                usage: [.shaderRead, .shaderWrite],
+                storageMode: .private,
+                label: "MetalPie_ContentRectCrop_\(subRect.width)x\(subRect.height)"
+            )
+            frameLeases.append(contentLease)
+            if currentTex.pixelFormat == workingFormat,
+               let blit = cb.makeBlitCommandEncoder()
+            {
+                blit.label = "ContentRectCropBlit"
+                blit.copy(
+                    from: currentTex,
+                    sourceSlice: 0,
+                    sourceLevel: 0,
+                    sourceOrigin: MTLOrigin(x: subRect.x, y: subRect.y, z: 0),
+                    sourceSize: MTLSize(width: subRect.width, height: subRect.height, depth: 1),
+                    to: contentLease.texture,
+                    destinationSlice: 0,
+                    destinationLevel: 0,
+                    destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+                )
+                blit.endEncoding()
+            } else {
+                try encodeCropPass(
+                    source: currentTex,
+                    destination: contentLease.texture,
+                    origin: SIMD2<UInt32>(UInt32(subRect.x), UInt32(subRect.y)),
+                    size: SIMD2<UInt32>(UInt32(subRect.width), UInt32(subRect.height)),
+                    commandBuffer: cb
+                )
+            }
+            currentTex = contentLease.texture
+            passRecords.append((
+                id: "content_rect_crop",
+                name: "Content Crop (\(subRect.width)x\(subRect.height))",
+                colorHex: "#FFD60A",
+                weight: Double(subRect.width * subRect.height) * 0.15
+            ))
+        }
+
+        // 1. Optional Coalesced Pre-Downscale / 1x Non-Retina Demagnification (NEVER double-halves!)
         let preScaleStep: (
             size: PixelSize,
             id: String,
@@ -377,8 +467,8 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
                         name: "Video Pre-Scale (\(clamped.width)x\(clamped.height))",
                         mode: .nearest
                     )
-                } else if isExactHalf && !context.isHDR {
-                    // Exact 2x inverse bilinear demagnify recovers sharp edges from player/WindowServer 2x stretch.
+                } else if isExactHalf && activeDemag == .bilinear && !context.isHDR {
+                    // Use exact 2x inverse bilinear demagnify ONLY when GPU probe confirmed WindowServer 2x bilinear stretch.
                     return (
                         size: clamped,
                         id: "video_prescale",
@@ -386,6 +476,7 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
                         mode: .bilinear
                     )
                 } else {
+                    // Crisp Catmull-Rom / Bicubic (B=0, C=0.5) preserves maximum fine detail before SR upscaling!
                     return (
                         size: clamped,
                         id: "video_prescale",
@@ -595,9 +686,10 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
 
         let finalSize = PixelSize(width: currentTex.width, height: currentTex.height)
 
-        // 5. Save Cursor-Free Output Snapshot (for live PNG screenshots & duplicate-frame skip reuse).
-        // Skipped for preview/benchmark calls so live session caches are never clobbered.
-        let shouldCacheSnapshot = allowLiveStateMutation && (
+        // 5. Save Cursor-Free Output Snapshot (for standalone PNG screenshots & duplicate-frame skip reuse).
+        // Skipped for preview/benchmark calls AND whenever caller (`RenderLoopController`) manages
+        // screenshots and output retention externally (saves ~23 MB/frame GPU blit at 3K 120Hz!).
+        let shouldCacheSnapshot = allowLiveStateMutation && !externalOutputCache && (
             state.withLockUnchecked { $0.enableCursorFreeScreenshotCache } || context.duplicateFrameMode != .never
         )
         if shouldCacheSnapshot {
@@ -607,6 +699,11 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
                 signature: modeSignature,
                 commandBuffer: cb
             )
+        } else if allowLiveStateMutation && externalOutputCache {
+            state.withLockUnchecked { s in
+                s.duplicate.cachedOutputSize = finalSize
+                s.duplicate.cachedSignature = modeSignature
+            }
         }
 
         // 6. Output Copy (1:1 when destination is an intermediate upscaled buffer) or Single-Pass TBDR Present.
@@ -651,6 +748,7 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
         texturePool.reset()
         state.withLockUnchecked { s in
             s.fullscreenVideoPreDownscaleSize = nil
+            s.sourceContentPixelRect = nil
             s.duplicate = DuplicateDetectorState()
             s.lastCursorFreeOutput = nil
             s.passGPUEmaMs.removeAll()
@@ -3123,8 +3221,9 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
     /// Zero GPU stalls, zero `waitUntilCompleted()`, zero extra command buffers.
     private func checkDuplicateFrameZeroStall(
         currentSource: any MTLTexture,
-        signature: String
-    ) -> (texture: any MTLTexture, size: PixelSize)? {
+        signature: String,
+        externalOutputCache: Bool
+    ) -> (texture: (any MTLTexture)?, size: PixelSize)? {
         guard let surface = currentSource.iosurface else {
             return nil
         }
@@ -3134,7 +3233,7 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
 
         return state.withLockUnchecked { s in
             guard s.duplicate.cachedSignature == signature,
-                  let cachedOut = s.duplicate.cachedFinalOutputTexture,
+                  s.duplicate.cachedOutputSize.isValid,
                   s.duplicate.lastSourceSurfaceID == surfaceID,
                   s.duplicate.lastSourceSurfaceSeed == surfaceSeed,
                   s.duplicate.lastSourceWidth == currentSource.width,
@@ -3143,8 +3242,11 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
             else {
                 return nil
             }
+            if !externalOutputCache && s.duplicate.cachedFinalOutputTexture == nil {
+                return nil
+            }
             s.duplicate.lastAsyncDuplicateDetected = true
-            return (cachedOut, s.duplicate.cachedOutputSize)
+            return (externalOutputCache ? nil : s.duplicate.cachedFinalOutputTexture, s.duplicate.cachedOutputSize)
         }
     }
 
@@ -3315,6 +3417,7 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
         }
 
         guard let dest, let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+        state.withLockUnchecked { $0.outputSnapshotBlitCount &+= 1 }
         let copyW = min(finalTex.width, dest.width)
         let copyH = min(finalTex.height, dest.height)
         blit.label = "CacheCursorFreeOutput"
@@ -3515,7 +3618,8 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
         layout: ScalingLayoutResult,
         isHDR: Bool,
         demagnify: DemagnifyMode,
-        preDownscale: PixelSize?
+        preDownscale: PixelSize?,
+        sourceContentRect: PixelRect?
     ) -> String {
         var hasher = Hasher()
         hasher.combine(scalingMode)
@@ -3524,6 +3628,7 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
         hasher.combine(isHDR)
         hasher.combine(demagnify)
         hasher.combine(preDownscale)
+        hasher.combine(sourceContentRect)
         return String(hasher.finalize())
     }
 

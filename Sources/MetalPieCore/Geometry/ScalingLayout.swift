@@ -44,13 +44,71 @@ public func sanitizedComputeTextureFormat(_ format: MTLPixelFormat) -> MTLPixelF
     }
 }
 
-/// Optional capability adopted by effect renderers that perform GPU 1x demagnification and/or
-/// fullscreen video super-resolution pre-downscaling before the effect chain.
+/// Optional capability adopted by effect renderers that perform GPU 1x demagnification,
+/// SCStream active-content sub-rect cropping, and/or fullscreen video super-resolution pre-downscaling
+/// before the effect chain.
 public protocol EffectPreScaleConfigurable: AnyObject, Sendable {
     /// True when 1x Non-Retina demagnification (nearest or bilinear) is active.
     var isDemagnifyActive: Bool { get }
     /// Target pixel dimensions for fullscreen video super-resolution pre-downscaling (`nil` = disabled).
     var fullscreenVideoPreDownscaleSize: PixelSize? { get set }
+    /// Optional active SCStream content sub-rectangle in raw source texture pixels (cropped BEFORE
+    /// pre-downscaling and user `CropInsets` when ScreenCaptureKit pads an IOSurface with black margins).
+    var sourceContentPixelRect: PixelRect? { get set }
+    /// When `true`, the caller manages cursor-free screenshots and duplicate-frame output retention
+    /// externally, eliminating redundant per-frame full-frame snapshot GPU blits.
+    var usesExternalOutputCache: Bool { get set }
+}
+
+public extension EffectPreScaleConfigurable {
+    var sourceContentPixelRect: PixelRect? {
+        get { nil }
+        set {}
+    }
+
+    var usesExternalOutputCache: Bool {
+        get { false }
+        set {}
+    }
+}
+
+/// Pure display-refresh pacer for `.directPresent` mode that prevents bursty capture streams
+/// (e.g. 150-240Hz browser hover animations) from over-submitting beyond the display's refresh rate
+/// and exhausting `CAMetalLayer`'s 3-drawable pool.
+public struct DirectPresentPacer: Sendable {
+    public enum Decision: Equatable, Sendable {
+        /// Submit immediately (first frame, or elapsed >= `displayInterval * jitterAllowance`).
+        case submitNow
+        /// Coalesce incoming frames in the mailbox and wake at `wakeTime` (exact display interval).
+        case coalesceUntil(wakeTime: Double)
+    }
+
+    /// Fraction of one display interval allowed for normal capture jitter before coalescing kicks in.
+    public static let jitterAllowanceRatio: Double = 0.85
+
+    public private(set) var lastSubmitTime: Double = 0
+
+    public init() {}
+
+    public mutating func reset() {
+        lastSubmitTime = 0
+    }
+
+    public mutating func recordSubmitted(at time: Double) {
+        lastSubmitTime = time
+    }
+
+    /// Evaluates whether a `.directPresent` submission at `now` should proceed immediately or coalesce
+    /// until the next display-refresh slot (`lastSubmitTime + displayInterval`).
+    public func evaluate(now: Double, displayRefreshHz: Double) -> Decision {
+        guard lastSubmitTime > 0 else { return .submitNow }
+        let displayInterval = 1.0 / max(30.0, displayRefreshHz)
+        let elapsed = now - lastSubmitTime
+        if elapsed >= displayInterval * Self.jitterAllowanceRatio {
+            return .submitNow
+        }
+        return .coalesceUntil(wakeTime: lastSubmitTime + displayInterval)
+    }
 }
 
 /// Scaling geometry mode controlling how an effect computes its target pixel dimensions.
@@ -417,14 +475,95 @@ public enum ScalingLayoutCalculator: Sendable {
         return PixelSize(width: clampedW, height: clampedH)
     }
 
+    /// Converts `SCStreamFrameInfo.contentRect` (reported in surface points, already incorporating
+    /// `contentScale`) into clamped texture pixel coordinates inside `(0, 0, textureSize.width, textureSize.height)`.
+    public static func convertSCKContentRectToPixels(
+        pointRect: CGRect?,
+        scaleFactor: Double,
+        textureSize: PixelSize
+    ) -> CGRect {
+        guard textureSize.isValid else { return .zero }
+        let fullRect = CGRect(x: 0, y: 0, width: Double(textureSize.width), height: Double(textureSize.height))
+        guard let raw = pointRect else { return fullRect }
+        let std = raw.standardized
+        guard std.width.isFinite, std.height.isFinite,
+              std.origin.x.isFinite, std.origin.y.isFinite,
+              std.width > 0, std.height > 0
+        else {
+            return fullRect
+        }
+
+        let safeScale = max(1.0, scaleFactor.isFinite ? scaleFactor : 1.0)
+        let maxW = Double(textureSize.width)
+        let maxH = Double(textureSize.height)
+
+        let rawX = (std.origin.x * safeScale).rounded()
+        let rawY = (std.origin.y * safeScale).rounded()
+        let rawW = (std.size.width * safeScale).rounded()
+        let rawH = (std.size.height * safeScale).rounded()
+
+        let clampedX = min(max(0.0, rawX), max(0.0, maxW - 1.0))
+        let clampedY = min(max(0.0, rawY), max(0.0, maxH - 1.0))
+        let clampedW = min(max(0.0, rawW), maxW - clampedX)
+        let clampedH = min(max(0.0, rawH), maxH - clampedY)
+        guard clampedW >= 1.0, clampedH >= 1.0 else {
+            return fullRect
+        }
+        return CGRect(x: clampedX, y: clampedY, width: clampedW, height: clampedH)
+    }
+
+    /// Returns a valid proper sub-rectangle in texture pixels when `SCStream` padded any edge of the
+    /// backing IOSurface by `>= 2 px` (leaving active width >= 64 and height >= 64), or `nil` when
+    /// active content already fills the full texture.
+    public static func activeContentSubRect(
+        contentPixelRect: CGRect,
+        textureSize: PixelSize
+    ) -> PixelRect? {
+        guard textureSize.width >= CropInsets.minimumRemainingDimension,
+              textureSize.height >= CropInsets.minimumRemainingDimension
+        else {
+            return nil
+        }
+        let std = contentPixelRect.standardized
+        guard std.width.isFinite, std.height.isFinite,
+              std.origin.x.isFinite, std.origin.y.isFinite,
+              std.width > 0, std.height > 0
+        else {
+            return nil
+        }
+
+        let x = max(0, min(textureSize.width - 1, Int(std.origin.x.rounded())))
+        let y = max(0, min(textureSize.height - 1, Int(std.origin.y.rounded())))
+        let w = max(0, min(textureSize.width - x, Int(std.size.width.rounded())))
+        let h = max(0, min(textureSize.height - y, Int(std.size.height.rounded())))
+
+        guard w >= CropInsets.minimumRemainingDimension,
+              h >= CropInsets.minimumRemainingDimension
+        else {
+            return nil
+        }
+
+        let leftMargin = x
+        let topMargin = y
+        let rightMargin = textureSize.width - (x + w)
+        let bottomMargin = textureSize.height - (y + h)
+        guard leftMargin >= 2 || topMargin >= 2 || rightMargin >= 2 || bottomMargin >= 2 else {
+            return nil
+        }
+        return PixelRect(x: x, y: y, width: w, height: h)
+    }
+
     /// Computes an optional GPU pre-downscale target size for fullscreen / display-filling video windows
     /// so upscalers (Anime4K, MetalFX, FSR 1.0, CuNNy, FSRCNNX, Lanczos, Jinc) perform genuine ~2x
-    /// super-resolution instead of 1:1 no-op passthrough on bilinearly stretched fullscreen video.
+    /// super-resolution instead of 1:1 no-op passthrough on bilinearly stretched fullscreen video,
+    /// while NEVER accidentally pre-downscaling sharp native Retina desktop webpages or windowed apps.
     public static func computeFullscreenVideoPreDownscaleSize(
         rawSourceSize: PixelSize,
         targetPixelSize: PixelSize,
         presentationMode: PresentationMode,
-        mode: FullscreenVideoInputMode
+        mode: FullscreenVideoInputMode,
+        isNativeFullscreenSource: Bool = false,
+        demagnifyActive: Bool = false
     ) -> PixelSize? {
         guard rawSourceSize.isValid, targetPixelSize.isValid, mode != .native else {
             return nil
@@ -432,7 +571,7 @@ public enum ScalingLayoutCalculator: Sendable {
 
         let coversTarget = Double(rawSourceSize.width) >= Double(targetPixelSize.width) * 0.85
             && Double(rawSourceSize.height) >= Double(targetPixelSize.height) * 0.85
-        guard presentationMode.isFullscreen || coversTarget else {
+        guard presentationMode.isFullscreen && coversTarget else {
             return nil
         }
 
@@ -444,6 +583,9 @@ public enum ScalingLayoutCalculator: Sendable {
             return nil
 
         case .auto:
+            // Only auto pre-downscale genuine fullscreen video spaces (HTML5 fullscreen, IINA, VLC, QuickTime)
+            // or sources already identified as 2x magnified non-Retina content — NEVER sharp Retina webpages!
+            guard isNativeFullscreenSource || demagnifyActive else { return nil }
             // Retina 2.5K / 3K / 4K fullscreen window -> exact 50% per axis (inverse of 2x bilinear stretch).
             guard srcW >= 2200 || srcH >= 1300 else { return nil }
             let outW = min(srcW, max(640, srcW / 2))
@@ -475,7 +617,8 @@ public enum ScalingLayoutCalculator: Sendable {
         targetPixelSize: PixelSize,
         presentationMode: PresentationMode,
         fullscreenVideoInput: FullscreenVideoInputMode,
-        demagnifyActive: Bool
+        demagnifyActive: Bool,
+        isNativeFullscreenSource: Bool = false
     ) -> (effectiveSize: PixelSize, videoPreDownscaleSize: PixelSize?) {
         guard rawSourceSize.isValid else { return (rawSourceSize, nil) }
         let clampedRaw = clampAspectPreserving(rawSourceSize)
@@ -484,7 +627,9 @@ public enum ScalingLayoutCalculator: Sendable {
             rawSourceSize: clampedRaw,
             targetPixelSize: targetPixelSize,
             presentationMode: presentationMode,
-            mode: fullscreenVideoInput
+            mode: fullscreenVideoInput,
+            isNativeFullscreenSource: isNativeFullscreenSource,
+            demagnifyActive: demagnifyActive
         ) {
             return (effectiveSize: videoSize, videoPreDownscaleSize: videoSize)
         }

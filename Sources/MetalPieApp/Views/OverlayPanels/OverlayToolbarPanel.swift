@@ -80,20 +80,17 @@ public final class OverlayToolbarPanel {
     private var panel: NonActivatingChromePanel?
     private let state = OverlayToolbarState()
     private var actions: OverlayToolbarActions?
-    private var mode: ToolbarMode = .autoHide
-    private var anchorOverlayFrame: CGRect = .zero
+    private var autoHideState = OverlayToolbarAutoHideState()
     private var hoverTimer: Timer?
-    private var isShown = false
-    private var isRevealedByHover = false
-    private var lastHoverLeaveTime: CFAbsoluteTime = 0
-    private var currentLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) + 1)
+    private var currentLevel = NSWindow.Level(
+        rawValue: OverlayWindowController.fullscreenOverlayLevel.rawValue + 2
+    )
 
     public static let toolbarSize = OverlayChromeGeometry.defaultToolbarSize
     /// Transparent outer padding reserved for SwiftUI drop shadow bleed (prevents rectangular clipping).
     public static let shadowPadding: CGFloat = OverlayChromeGeometry.defaultShadowPadding
     private static let topMargin: CGFloat = OverlayChromeGeometry.defaultTopMargin
     private static let notchSafeTopMargin: CGFloat = OverlayChromeGeometry.notchSafeTopMargin
-    private static let fittsTopStripHeight: CGFloat = 28
 
     /// Optional provider returning the active scaled cursor position in global Cocoa coordinates
     /// when `CGEventTap` confines the physical pointer inside the source window.
@@ -111,12 +108,14 @@ public final class OverlayToolbarPanel {
 
     public var nsWindow: NSWindow? { panel }
 
+    public var isShown: Bool { autoHideState.isShown }
+    public var isRevealedByHover: Bool { autoHideState.isRevealedByHover }
+
     /// Exact visible pill rect in global AppKit (Cocoa Y-up) coordinates excluding transparent
     /// shadow bleed padding, or `nil` when hidden / auto-hidden.
     public var visibleInteractiveCocoaFrame: CGRect? {
-        guard isShown, let panel else { return nil }
-        guard mode == .alwaysShow || isRevealedByHover else { return nil }
-        return Self.visibleFrame(fromPanelFrame: panel.frame)
+        guard panel != nil else { return nil }
+        return autoHideState.visibleInteractiveCocoaFrame
     }
 
     /// Strips the transparent shadow bleed margin from a panel frame to recover the visible pill frame.
@@ -148,13 +147,19 @@ public final class OverlayToolbarPanel {
         self.actions = actions
     }
 
+    /// Updates ONLY the panel's window level without modifying visibility, hover state, or frame.
+    public func setLevel(_ level: NSWindow.Level) {
+        currentLevel = level
+        if let panel, panel.level != level {
+            panel.level = level
+        }
+    }
+
     public func show(
         mode: ToolbarMode,
         overlayCocoaFrame: CGRect,
         level: NSWindow.Level
     ) {
-        self.mode = mode
-        self.anchorOverlayFrame = overlayCocoaFrame
         self.currentLevel = level
 
         guard mode != .off, !overlayCocoaFrame.isEmpty else {
@@ -162,41 +167,71 @@ public final class OverlayToolbarPanel {
             return
         }
 
-        let targetFrame = computeToolbarFrame(for: overlayCocoaFrame)
+        let visiblePill = Self.computeVisibleToolbarCocoaFrame(
+            for: overlayCocoaFrame,
+            hostScreenVisibleFrame: hostScreenVisibleFrame(for: overlayCocoaFrame)
+        )
+        let targetFrame = Self.panelFrame(fromVisibleFrame: visiblePill)
         let activePanel = ensurePanel(frame: targetFrame)
-        activePanel.level = level
-        activePanel.setFrame(targetFrame, display: false, animate: false)
-        isShown = true
+        let transition = autoHideState.beginShow(
+            mode: mode,
+            overlayCocoaFrame: overlayCocoaFrame,
+            visibleToolbarFrame: visiblePill
+        )
 
-        switch mode {
-        case .off:
+        if transition.shouldHide {
             hide()
-        case .alwaysShow:
-            stopHoverTimer()
-            activePanel.ignoresMouseEvents = false
-            activePanel.alphaValue = 1.0
-            activePanel.orderFrontRegardless()
-            onInteractiveFrameChanged?()
-        case .autoHide:
-            isRevealedByHover = false
-            activePanel.ignoresMouseEvents = true
-            activePanel.alphaValue = 0.0
-            activePanel.orderFrontRegardless()
-            startHoverTimer()
+            return
+        }
+
+        if activePanel.level != level {
+            activePanel.level = level
+        }
+        if OverlayToolbarAutoHideState.framesDiffer(activePanel.frame, targetFrame) {
+            activePanel.setFrame(targetFrame, display: false, animate: false)
+        }
+
+        if !transition.isIdempotentUpdate {
+            if transition.shouldStopHoverTimer {
+                stopHoverTimer()
+            }
+            if transition.shouldRevealAlwaysShow {
+                activePanel.ignoresMouseEvents = false
+                activePanel.alphaValue = 1.0
+                activePanel.orderFrontRegardless()
+            } else if transition.shouldResetAutoHideHidden {
+                activePanel.ignoresMouseEvents = true
+                activePanel.alphaValue = 0.0
+                activePanel.orderFrontRegardless()
+            }
+            if transition.shouldStartHoverTimer {
+                startHoverTimer()
+            }
+        }
+
+        if transition.interactiveFrameChanged {
             onInteractiveFrameChanged?()
         }
     }
 
     public func updateOverlayFrame(_ overlayCocoaFrame: CGRect, level: NSWindow.Level? = nil) {
-        anchorOverlayFrame = overlayCocoaFrame
         if let level {
-            currentLevel = level
-            panel?.level = level
+            setLevel(level)
         }
-        guard isShown, let panel, !overlayCocoaFrame.isEmpty else { return }
-        let frame = computeToolbarFrame(for: overlayCocoaFrame)
-        if panel.frame != frame {
+        guard autoHideState.isShown, let panel, !overlayCocoaFrame.isEmpty else { return }
+        let visiblePill = Self.computeVisibleToolbarCocoaFrame(
+            for: overlayCocoaFrame,
+            hostScreenVisibleFrame: hostScreenVisibleFrame(for: overlayCocoaFrame)
+        )
+        let frame = Self.panelFrame(fromVisibleFrame: visiblePill)
+        let interactiveChanged = autoHideState.updateOverlayFrame(
+            overlayCocoaFrame,
+            visibleToolbarFrame: visiblePill
+        )
+        if OverlayToolbarAutoHideState.framesDiffer(panel.frame, frame) {
             panel.setFrame(frame, display: false, animate: false)
+        }
+        if interactiveChanged {
             onInteractiveFrameChanged?()
         }
     }
@@ -223,12 +258,10 @@ public final class OverlayToolbarPanel {
     }
 
     public func hide() {
-        let wasShown = isShown || isRevealedByHover
-        isShown = false
-        isRevealedByHover = false
+        let interactiveChanged = autoHideState.hide()
         stopHoverTimer()
         panel?.orderOut(nil)
-        if wasShown {
+        if interactiveChanged {
             onInteractiveFrameChanged?()
         }
     }
@@ -269,14 +302,6 @@ public final class OverlayToolbarPanel {
         return NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame
     }
 
-    private func computeToolbarFrame(for overlayFrame: CGRect) -> CGRect {
-        let visiblePill = Self.computeVisibleToolbarCocoaFrame(
-            for: overlayFrame,
-            hostScreenVisibleFrame: hostScreenVisibleFrame(for: overlayFrame)
-        )
-        return Self.panelFrame(fromVisibleFrame: visiblePill)
-    }
-
     private func startHoverTimer() {
         stopHoverTimer()
         let timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
@@ -294,43 +319,30 @@ public final class OverlayToolbarPanel {
     }
 
     private func evaluateAutoHideHover() {
-        guard isShown, mode == .autoHide, let panel else { return }
-        let mouse = scaledCursorCocoaProvider?() ?? NSEvent.mouseLocation
-        let visibleRect = Self.visibleFrame(fromPanelFrame: panel.frame)
-        let topStrip = CGRect(
-            x: anchorOverlayFrame.midX - Self.toolbarSize.width * 0.65,
-            y: visibleRect.maxY - Self.fittsTopStripHeight,
-            width: Self.toolbarSize.width * 1.3,
-            height: Self.fittsTopStripHeight + Self.notchSafeTopMargin + 6
+        guard let panel else { return }
+        let eval = autoHideState.evaluateAutoHideHover(
+            physicalCocoaPoint: NSEvent.mouseLocation,
+            scaledCocoaPoint: scaledCursorCocoaProvider?(),
+            now: CFAbsoluteTimeGetCurrent()
         )
-        let expandedToolbar = visibleRect.insetBy(dx: -16, dy: -12)
-        let hovering = topStrip.contains(mouse) || (isRevealedByHover && expandedToolbar.contains(mouse))
-
-        if hovering {
-            lastHoverLeaveTime = 0
-            if !isRevealedByHover {
-                isRevealedByHover = true
-                panel.ignoresMouseEvents = false
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.16
-                    panel.animator().alphaValue = 1.0
-                }
-                onInteractiveFrameChanged?()
+        switch eval.action {
+        case .none:
+            break
+        case .reveal:
+            panel.ignoresMouseEvents = false
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.16
+                panel.animator().alphaValue = 1.0
             }
-        } else if isRevealedByHover {
-            let now = CFAbsoluteTimeGetCurrent()
-            if lastHoverLeaveTime == 0 {
-                lastHoverLeaveTime = now
-            } else if now - lastHoverLeaveTime >= 0.85 {
-                isRevealedByHover = false
-                lastHoverLeaveTime = 0
-                panel.ignoresMouseEvents = true
-                NSAnimationContext.runAnimationGroup { ctx in
-                    ctx.duration = 0.22
-                    panel.animator().alphaValue = 0.0
-                }
-                onInteractiveFrameChanged?()
+        case .hide:
+            panel.ignoresMouseEvents = true
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.22
+                panel.animator().alphaValue = 0.0
             }
+        }
+        if eval.interactiveFrameChanged {
+            onInteractiveFrameChanged?()
         }
     }
 }

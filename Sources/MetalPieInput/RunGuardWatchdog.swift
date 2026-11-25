@@ -238,11 +238,37 @@ public final class RunGuardWatchdog: @unchecked Sendable {
         Self.forceRestoreSystemCursor()
     }
 
-    /// Unconditionally restores system cursor visibility.
-    /// First unwinds every balanced hide acquired by `SystemCursorHider`, then queries `CGCursorIsVisible`
-    /// dynamically (when available) as a belt-and-suspenders guard. Safe from background threads & exit hooks.
+    /// Unconditionally restores system cursor visibility and mouse-cursor association.
+    /// First reassociates the hardware mouse, unwinds every balanced hide acquired by `SystemCursorHider`,
+    /// and if CoreGraphics still reports the cursor hidden, invokes `NSCursor.unhide()` on the main thread.
+    /// Safe from background threads & exit hooks (never blocks on MainActor).
     public static func forceRestoreSystemCursor() {
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
         SystemCursorHider.emergencyRestoreAll()
+
+        if SystemCursorHider.querySystemCursorVisible() == false {
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    var attempts = 0
+                    while SystemCursorHider.querySystemCursorVisible() == false && attempts < 16 {
+                        NSCursor.unhide()
+                        CGDisplayShowCursor(CGMainDisplayID())
+                        attempts += 1
+                    }
+                }
+            } else {
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        var attempts = 0
+                        while SystemCursorHider.querySystemCursorVisible() == false && attempts < 16 {
+                            NSCursor.unhide()
+                            CGDisplayShowCursor(CGMainDisplayID())
+                            attempts += 1
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Process Exit & Signal Cleanup Hooks
@@ -345,7 +371,12 @@ public final class RunGuardWatchdog: @unchecked Sendable {
             object: nil,
             queue: nil
         ) { [weak self] _ in
-            self?.recordHeartbeat()
+            guard let self else { return }
+            self.recordHeartbeat()
+            // After macOS sleep/wake, guarantee the OS cursor is visible whenever scaling is not active.
+            if !self.isScalingActive {
+                Self.forceRestoreSystemCursor()
+            }
         }
 
         let keep = state.withLockUnchecked { s -> Bool in

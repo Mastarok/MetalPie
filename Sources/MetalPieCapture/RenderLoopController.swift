@@ -64,19 +64,22 @@ public struct RenderSessionConfiguration: Sendable {
     public var scalingMode: ScalingMode
     public var overlayMetrics: OverlayDrawableMetrics
     public var vrrDirectScanout: Bool
+    public var isNativeFullscreenSource: Bool
 
     public init(
         targetWindowName: String,
         profile: Profile,
         scalingMode: ScalingMode,
         overlayMetrics: OverlayDrawableMetrics,
-        vrrDirectScanout: Bool = false
+        vrrDirectScanout: Bool = false,
+        isNativeFullscreenSource: Bool = false
     ) {
         self.targetWindowName = targetWindowName
         self.profile = profile
         self.scalingMode = scalingMode
         self.overlayMetrics = overlayMetrics
         self.vrrDirectScanout = vrrDirectScanout
+        self.isNativeFullscreenSource = isNativeFullscreenSource
     }
 }
 
@@ -205,6 +208,8 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         var outputFPS: Double = 0
         var presentedFPS: Double = 0
         var frameTimeMs: Double = 0
+        var hasPublishedNonZeroFPS: Bool = false
+        var hasPublishedNonZeroFrameTime: Bool = false
     }
 
     private let lock = OSAllocatedUnfairLock(initialState: State())
@@ -376,10 +381,23 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         }
     }
 
-    /// Returns a telemetry snapshot if at least `minInterval` seconds (default 0.2 s = 5 Hz) have elapsed.
+    /// Returns a telemetry snapshot if at least `minInterval` seconds (default 0.2 s = 5 Hz) have elapsed,
+    /// OR immediately during startup as soon as the first real non-zero FPS / GPU frame time arrives so
+    /// the HUD never lingers at `0.0 fps / 0.00 ms`.
     func snapshotIfDue(now: Double, minInterval: Double = 0.2) -> SessionTelemetry? {
         lock.withLock { s in
-            guard now - s.lastPublishTime >= minInterval else { return nil }
+            let hasFreshFPS = !s.hasPublishedNonZeroFPS
+                && (s.telemetry.sourceFPS > 0 || s.telemetry.outputFPS > 0 || s.telemetry.presentedFPS > 0)
+            let hasFreshFrameTime = !s.hasPublishedNonZeroFrameTime && s.telemetry.frameTimeMs > 0
+            guard hasFreshFPS || hasFreshFrameTime || (now - s.lastPublishTime >= minInterval) else {
+                return nil
+            }
+            if s.telemetry.sourceFPS > 0 || s.telemetry.outputFPS > 0 || s.telemetry.presentedFPS > 0 {
+                s.hasPublishedNonZeroFPS = true
+            }
+            if s.telemetry.frameTimeMs > 0 {
+                s.hasPublishedNonZeroFrameTime = true
+            }
             s.lastPublishTime = now
             var copy = s.telemetry
             if s.lastSourceTime > 0 && (now - s.lastSourceTime) > 1.5 {
@@ -893,6 +911,8 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private struct SharedControlState: Sendable {
         var isRunning: Bool = false
         var isPaused: Bool = false
+        var sessionGeneration: UInt64 = 0
+        var inFlightCommandBuffers: Int = 0
         var configuration: RenderSessionConfiguration?
         var latestLayout: ScalingLayoutResult?
         var gpuCursorSprite: GPUCursorSpriteSnapshot?
@@ -923,16 +943,21 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private var displayLink: CAMetalDisplayLink?
     private var driverMode: DriverMode = .stopped
     private var directWakeupPending = false
+    private var directPresentPacer = DirectPresentPacer()
+    private var directPaceTimer: CFRunLoopTimer?
     private var vrrBeatTimer: CFRunLoopTimer?
 
     // Pooled GPU resources owned exclusively by `renderThread` (zero per-frame allocations).
     private var upscaledRing: [any MTLTexture] = []
     private var upscaledRingIndex: Int = 0
+    private var contentCropRing: [any MTLTexture] = []
+    private var contentCropRingIndex: Int = 0
     private var lastValidUpscaledTexture: (any MTLTexture)?
     private var lastValidLayout: ScalingLayoutResult?
-    /// Private GPU copy of the latest raw captured source frame so mid-session `updateConfiguration`
-    /// changes (scaling mode, crop, alignment, resize, HDR) re-run effects immediately even on static windows.
+    /// Private GPU copy of the latest raw captured source frame (already cropped to active `contentRect`)
+    /// so mid-session `updateConfiguration` changes re-run effects immediately even on static windows.
     private var lastRawSourceTexture: (any MTLTexture)?
+    private var lastRawContentPixelRect: PixelRect = .zero
     private var lastRawSourceIsHDR: Bool = false
     private var frameIndex: UInt64 = 0
 
@@ -949,6 +974,8 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private var fgPreparedSettings: FrameGenSettings?
     private var fgPendingBeats: [ScheduledFGBeat] = []
     private var fgHysteresisSuppressedByHighFPS = false
+    private var fgConsecutiveDisplayRateBursts: Int = 0
+    private var fgBurstCooldownUntil: Double = 0
     private var fgLastNewFrameArrivalTime: Double = 0
     private var fgLastPassTiming: PassTiming?
     private var cadenceTracker = CadenceTracker()
@@ -970,6 +997,13 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         self.effectRenderer = effectRenderer
         self.frameInterpolator = frameInterpolator
         self.presentPass = try PresentPassRenderer(device: resolvedDevice)
+
+        // RenderLoopController manages both cursor-free screenshots (`presentPass.encodeScreenshotReadback`)
+        // and duplicate-frame output retention (`lastValidUpscaledTexture`) externally -> eliminate the
+        // redundant ~23 MB/frame GPU snapshot blit inside `EffectChainRenderer`!
+        if let preScaleConfigurable = effectRenderer as? any EffectPreScaleConfigurable {
+            preScaleConfigurable.usesExternalOutputCache = true
+        }
 
         super.init()
         self.renderThread.startAndWait()
@@ -1045,6 +1079,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         control.withLock { s in
             s.isRunning = true
             s.isPaused = false
+            s.sessionGeneration &+= 1
             s.configuration = configuration
             s.hasEmittedFirstFrame = false
             s.needsGraphicsRedraw = false
@@ -1058,9 +1093,14 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             guard let self else { return }
             self.metalLayer = layerBox.value
             self.frameIndex = 0
+            self.directPresentPacer.reset()
+            self.cancelDirectPaceTimerOnRenderThread()
+            self.contentCropRing.removeAll()
+            self.contentCropRingIndex = 0
             self.lastValidUpscaledTexture = nil
             self.lastValidLayout = nil
             self.lastRawSourceTexture = nil
+            self.lastRawContentPixelRect = .zero
             self.lastRawSourceIsHDR = false
             self.resetFrameGenStateOnRenderThread()
             self.reconfigureDriverOnRenderThread()
@@ -1109,6 +1149,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             if paused {
                 self.mailbox.clear()
                 self.fgPendingBeats.removeAll(keepingCapacity: true)
+                self.cancelDirectPaceTimerOnRenderThread()
                 self.cancelVRRBeatTimerOnRenderThread()
                 self.displayLink?.isPaused = true
             } else {
@@ -1130,6 +1171,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         let pendingShots: [@Sendable (Result<CGImage, Error>) -> Void] = control.withLock { s in
             s.isRunning = false
             s.isPaused = false
+            s.sessionGeneration &+= 1
             s.configuration = nil
             s.latestLayout = nil
             s.gpuCursorSprite = nil
@@ -1154,13 +1196,18 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         renderThread.performSync {
             let controller = unretainedBox.value.takeUnretainedValue()
             controller.detachDisplayLinkOnRenderThread()
+            controller.cancelDirectPaceTimerOnRenderThread()
             controller.cancelVRRBeatTimerOnRenderThread()
+            controller.directPresentPacer.reset()
             controller.driverMode = .stopped
             controller.metalLayer = nil
             controller.upscaledRing.removeAll()
+            controller.contentCropRing.removeAll()
+            controller.contentCropRingIndex = 0
             controller.lastValidUpscaledTexture = nil
             controller.lastValidLayout = nil
             controller.lastRawSourceTexture = nil
+            controller.lastRawContentPixelRect = .zero
             controller.lastRawSourceIsHDR = false
             controller.resetFrameGenStateOnRenderThread()
             controller.effectRenderer.reset()
@@ -1296,6 +1343,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         switch targetMode {
         case .displayLink:
+            cancelDirectPaceTimerOnRenderThread()
             cancelVRRBeatTimerOnRenderThread()
             if displayLink == nil {
                 // Always mark the overlay layer as display-link-attached on EVERY creation (including
@@ -1330,10 +1378,12 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         case .vrrDirectScanout:
             detachDisplayLinkOnRenderThread()
+            cancelDirectPaceTimerOnRenderThread()
             driverMode = .vrrDirectScanout
 
         case .stopped:
             detachDisplayLinkOnRenderThread()
+            cancelDirectPaceTimerOnRenderThread()
             cancelVRRBeatTimerOnRenderThread()
             driverMode = .stopped
         }
@@ -1348,6 +1398,23 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
     private func scheduleDirectOrVRRWakeupIfNeeded() {
         guard driverMode == .directPresent || driverMode == .vrrDirectScanout else { return }
+
+        if driverMode == .directPresent {
+            let displayHz = control.withLock { $0.configuration?.overlayMetrics.screenMaxFPS ?? 60.0 }
+            let now = CACurrentMediaTime()
+            switch directPresentPacer.evaluate(now: now, displayRefreshHz: displayHz) {
+            case .submitNow:
+                cancelDirectPaceTimerOnRenderThread()
+            case .coalesceUntil(let wakeTime):
+                // Coalesce bursty capture frames into the single-slot mailbox so `.directPresent`
+                // NEVER over-submits past display Hz and exhausts CAMetalLayer's 3-drawable pool.
+                if directPaceTimer == nil {
+                    scheduleDirectPaceTimerOnRenderThread(at: wakeTime)
+                }
+                return
+            }
+        }
+
         guard !directWakeupPending else { return }
         directWakeupPending = true
 
@@ -1355,6 +1422,27 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             guard let self else { return }
             self.directWakeupPending = false
             self.renderDirectOrVRRTickOnRenderThread()
+        }
+    }
+
+    private func scheduleDirectPaceTimerOnRenderThread(at targetTime: Double) {
+        cancelDirectPaceTimerOnRenderThread()
+        let delay = max(0.0005, targetTime - CACurrentMediaTime())
+        let fireDate = CFAbsoluteTimeGetCurrent() + delay
+        let timer = CFRunLoopTimerCreateWithHandler(kCFAllocatorDefault, fireDate, 0, 0, 0) { [weak self] _ in
+            self?.directPaceTimer = nil
+            self?.renderDirectOrVRRTickOnRenderThread()
+        }
+        if let timer {
+            directPaceTimer = timer
+            CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, .commonModes)
+        }
+    }
+
+    private func cancelDirectPaceTimerOnRenderThread() {
+        if let timer = directPaceTimer {
+            CFRunLoopTimerInvalidate(timer)
+            directPaceTimer = nil
         }
     }
 
@@ -1384,6 +1472,16 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private func renderDirectOrVRRTickOnRenderThread() {
         guard let layer = metalLayer else { return }
         let now = CACurrentMediaTime()
+
+        if driverMode == .directPresent {
+            let displayHz = control.withLock { $0.configuration?.overlayMetrics.screenMaxFPS ?? 60.0 }
+            if case .coalesceUntil(let wakeTime) = directPresentPacer.evaluate(now: now, displayRefreshHz: displayHz) {
+                if directPaceTimer == nil {
+                    scheduleDirectPaceTimerOnRenderThread(at: wakeTime)
+                }
+                return
+            }
+        }
 
         executeRenderStepOnRenderThread(
             now: now,
@@ -1458,8 +1556,19 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         // In timer-driven VRR mode, keep a tight 2 ms tolerance.
         let beatTolerance = vsyncPeriod.map { $0 * 0.45 } ?? 0.002
         var dueBeat: ScheduledFGBeat?
-        if newFrame == nil && fgActive, let head = fgPendingBeats.first, now >= head.targetTime - beatTolerance {
-            dueBeat = fgPendingBeats.removeFirst()
+        if newFrame == nil && fgActive && now >= fgBurstCooldownUntil {
+            // Drop any stale intermediate beat that fell >1.5 refreshes behind; preserve the real-frame beat (1.0).
+            while let head = fgPendingBeats.first,
+                  head.factor < 0.999,
+                  now > head.targetTime + displayInterval * 1.5
+            {
+                fgPendingBeats.removeFirst()
+            }
+            if let head = fgPendingBeats.first, now >= head.targetTime - beatTolerance {
+                dueBeat = fgPendingBeats.removeFirst()
+            }
+        } else if now < fgBurstCooldownUntil {
+            fgPendingBeats.removeAll(keepingCapacity: true)
         }
 
         let screenshots = drainPendingScreenshots()
@@ -1560,10 +1669,32 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             cadenceTracker.recordFrame(timestamp: frame.timestampSeconds > 0 ? frame.timestampSeconds : now)
             sourceIsHDR = frame.isHDR
 
-            // Retain a private GPU copy of the latest raw source frame (zero IOSurface hoarding) so
+            // Crop out any SCStream black right/bottom padding (`frame.contentRect`) BEFORE pre-downscaling,
+            // FG history staging, and `ScalingLayoutCalculator.calculate` so padded IOSurfaces NEVER produce
+            // black side strips or distort `PointerMapping.effectiveSourceCGRect`!
+            let activeContentSubRect = ScalingLayoutCalculator.activeContentSubRect(
+                contentPixelRect: frame.contentRect,
+                textureSize: PixelSize(width: frame.texture.width, height: frame.texture.height)
+            )
+            lastRawContentPixelRect = activeContentSubRect
+                ?? PixelRect(x: 0, y: 0, width: frame.texture.width, height: frame.texture.height)
+            let activeFrameTexture: any MTLTexture
+            if let subRect = activeContentSubRect,
+               let croppedTex = cropActiveContentSubRect(
+                   from: frame.texture,
+                   subRect: subRect,
+                   commandBuffer: commandBuffer
+               )
+            {
+                activeFrameTexture = croppedTex
+            } else {
+                activeFrameTexture = frame.texture
+            }
+
+            // Retain a private GPU copy of the latest clean raw source frame (zero IOSurface hoarding) so
             // mid-session `updateConfiguration` changes can immediately re-run effects on static windows.
             stageLastRawSourceTexture(
-                sourceTexture: frame.texture,
+                sourceTexture: activeFrameTexture,
                 isHDR: frame.isHDR,
                 commandBuffer: commandBuffer
             )
@@ -1580,20 +1711,36 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                 fgLastNewFrameArrivalTime = now
 
                 stageFrameIntoFGHistory(
-                    sourceTexture: frame.texture,
+                    sourceTexture: activeFrameTexture,
                     commandBuffer: commandBuffer
                 )
 
-                // Burst safeguard: if a brand-new real frame arrived within ~1 display refresh while
-                // the previous real-frame beat wasn't even presented yet, present this real frame
-                // directly so we NEVER starve real frames or lower FPS below FG-OFF!
-                let isBurstAtDisplayRate = hadUnrenderedRealBeat && arrivalDelta < displayInterval * 1.15
+                // Burst & hover-spike safeguard (e.g. Bilibili progress-bar hover jumping 30fps -> 120fps -> 30fps):
+                // When frames arrive at or near display refresh rate (`arrivalDelta < displayInterval * 1.35`),
+                // there is no spare VSync slot for an interpolated beat. Bypass interpolation consistently across
+                // consecutive display-rate frames (avoiding alternating real/synth/real/synth motion stutter!) and
+                // hold a short smooth cooldown until source cadence genuinely settles back below display rate.
+                if arrivalDelta < displayInterval * 1.35 {
+                    fgConsecutiveDisplayRateBursts &+= 1
+                    if (hadUnrenderedRealBeat && arrivalDelta < displayInterval * 1.15)
+                        || fgConsecutiveDisplayRateBursts >= 2
+                        || now < fgBurstCooldownUntil
+                    {
+                        fgBurstCooldownUntil = max(fgBurstCooldownUntil, now + max(0.18, displayInterval * 12.0))
+                    }
+                } else if arrivalDelta >= displayInterval * 1.45 {
+                    fgConsecutiveDisplayRateBursts = 0
+                }
+
+                let isBurstAtDisplayRate = (hadUnrenderedRealBeat && arrivalDelta < displayInterval * 1.15)
+                    || fgConsecutiveDisplayRateBursts >= 2
+                    || now < fgBurstCooldownUntil
 
                 if !isBurstAtDisplayRate,
                    let prevIdx = fgPreviousIndex,
                    prevIdx < fgHistoryTextures.count,
-                   fgHistoryTextures[prevIdx].width == frame.texture.width,
-                   fgHistoryTextures[prevIdx].height == frame.texture.height
+                   fgHistoryTextures[prevIdx].width == activeFrameTexture.width,
+                   fgHistoryTextures[prevIdx].height == activeFrameTexture.height
                 {
                     let firstFactor = scheduleFGBeatsForNextInterval(
                         arrivalTime: now,
@@ -1603,7 +1750,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                     let (tex, synth, timing) = encodeInterpolatedOrRealFrame(
                         factor: firstFactor,
                         prevTex: fgHistoryTextures[prevIdx],
-                        currTex: frame.texture,
+                        currTex: activeFrameTexture,
                         commandBuffer: commandBuffer,
                         config: config
                     )
@@ -1612,12 +1759,14 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                     if let timing { extraPassTimings.append(timing) }
                 } else {
                     fgPendingBeats.removeAll(keepingCapacity: true)
-                    sourceTextureForEffects = frame.texture
+                    sourceTextureForEffects = activeFrameTexture
                 }
             } else {
                 fgPendingBeats.removeAll(keepingCapacity: true)
+                fgConsecutiveDisplayRateBursts = 0
+                fgBurstCooldownUntil = 0
                 fgLastNewFrameArrivalTime = now
-                sourceTextureForEffects = frame.texture
+                sourceTextureForEffects = activeFrameTexture
             }
         } else if let beat = dueBeat,
                   fgActive,
@@ -1665,8 +1814,11 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                     targetPixelSize: targetPixelSize,
                     presentationMode: config.profile.presentationMode,
                     fullscreenVideoInput: config.profile.capture.fullscreenVideoInput,
-                    demagnifyActive: preScaleConfigurable.isDemagnifyActive
+                    demagnifyActive: preScaleConfigurable.isDemagnifyActive,
+                    isNativeFullscreenSource: config.isNativeFullscreenSource
                 )
+                // Active SCStream contentRect was already cropped into `srcTex` above, so clear sub-rect on renderer.
+                preScaleConfigurable.sourceContentPixelRect = nil
                 preScaleConfigurable.fullscreenVideoPreDownscaleSize = resolved.videoPreDownscaleSize
                 resolvedInput = resolved
             } else {
@@ -1705,7 +1857,10 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                 pixelFormat: upscaledFormat
             ) {
                 let effectiveDupMode: DuplicateFrameMode = (
-                    config.profile.threeDGameMode || isSynthesizedFrame || forceBypassDuplicateCheck
+                    config.profile.threeDGameMode
+                        || isSynthesizedFrame
+                        || forceBypassDuplicateCheck
+                        || lastValidUpscaledTexture == nil
                 )
                     ? .never
                     : config.profile.capture.duplicateFrameMode
@@ -1784,14 +1939,20 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                 ? presentedDrawable.presentedTime
                 : CACurrentMediaTime()
             self.telemetry.recordPresented(presentedTime: t)
+            self.publishTelemetryIfDue(now: CACurrentMediaTime())
         }
 
         let encodeWallStart = now
         let retainedBox = UncheckedBox(value: retainedObjects)
         let stagingBox = UncheckedBox(value: screenshotStaging)
         let screenshotCallbacks = screenshots
+        let submittedGeneration = control.withLock { s -> UInt64 in
+            s.inFlightCommandBuffers += 1
+            return s.sessionGeneration
+        }
 
-        // Retain `CapturedFrame.backingObject` until GPU finishes + capture GPU duration & resolve screenshots!
+        // Retain `CapturedFrame.backingObject` until GPU finishes + capture GPU duration, resolve screenshots,
+        // and drain any textures recycled back into `TexturePool` after `stop()` so VRAM returns to ~0 MB!
         commandBuffer.addCompletedHandler { [weak self] cb in
             _ = retainedBox.value
             if let self {
@@ -1801,6 +1962,26 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                 } else {
                     let wallMs = (CACurrentMediaTime() - encodeWallStart) * 1000.0
                     self.telemetry.recordGPUFrameTimeMs(wallMs)
+                }
+
+                let (isStillRunning, shouldDrainStoppedVRAM) = self.control.withLock { s -> (Bool, Bool) in
+                    s.inFlightCommandBuffers = max(0, s.inFlightCommandBuffers - 1)
+                    let drain = !s.isRunning && s.inFlightCommandBuffers == 0 && s.sessionGeneration != submittedGeneration
+                    return (s.isRunning, drain)
+                }
+                if isStillRunning {
+                    self.publishTelemetryIfDue(now: CACurrentMediaTime())
+                } else if shouldDrainStoppedVRAM {
+                    // Final in-flight GPU frame finished after `stop()`: drain any textures just returned
+                    // by `TexturePool.recycleOnCompletion` so idle VRAM returns cleanly to ~0 MB.
+                    self.renderThread.perform { [weak self] in
+                        guard let self else { return }
+                        let stillStopped = self.control.withLock { !$0.isRunning && $0.inFlightCommandBuffers == 0 }
+                        if stillStopped {
+                            self.effectRenderer.reset()
+                            self.frameInterpolator?.reset()
+                        }
+                    }
                 }
             }
 
@@ -1822,6 +2003,9 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         presentDrawable(commandBuffer, drawable, scheduledPresentationTime)
         commandBuffer.commit()
+        if driverMode == .directPresent {
+            directPresentPacer.recordSubmitted(at: now)
+        }
         telemetry.recordRenderConsumed(now: now)
 
         // Reveal overlay after the first upscaled frame is committed/presented (zero startup black flash!).
@@ -1890,6 +2074,79 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         }
 
         return (!fgHysteresisSuppressedByHighFPS, requestedM)
+    }
+
+    private func cropActiveContentSubRect(
+        from sourceTexture: any MTLTexture,
+        subRect: PixelRect,
+        commandBuffer: any MTLCommandBuffer
+    ) -> (any MTLTexture)? {
+        guard subRect.width > 0 && subRect.height > 0,
+              subRect.x >= 0 && subRect.y >= 0,
+              subRect.x + subRect.width <= sourceTexture.width,
+              subRect.y + subRect.height <= sourceTexture.height,
+              sourceTexture.pixelFormat != .invalid
+        else {
+            return nil
+        }
+
+        let safeW = clampMetalTextureDimension(subRect.width)
+        let safeH = clampMetalTextureDimension(subRect.height)
+        let safeFormat = sanitizedComputeTextureFormat(sourceTexture.pixelFormat)
+
+        let needsRebuild = contentCropRing.count != 3
+            || contentCropRing[0].width != safeW
+            || contentCropRing[0].height != safeH
+            || contentCropRing[0].pixelFormat != safeFormat
+
+        if needsRebuild {
+            contentCropRing.removeAll(keepingCapacity: true)
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: safeFormat,
+                width: safeW,
+                height: safeH,
+                mipmapped: false
+            )
+            desc.storageMode = .private
+            desc.usage = [.shaderRead, .shaderWrite, .renderTarget]
+            for _ in 0..<3 {
+                if let tex = device.makeTexture(descriptor: desc) {
+                    contentCropRing.append(tex)
+                }
+            }
+            contentCropRingIndex = 0
+        }
+
+        guard !contentCropRing.isEmpty else { return nil }
+        let dst = contentCropRing[contentCropRingIndex]
+        contentCropRingIndex = (contentCropRingIndex + 1) % contentCropRing.count
+
+        let blitSource: any MTLTexture
+        if sourceTexture.pixelFormat == dst.pixelFormat {
+            blitSource = sourceTexture
+        } else if let view = sourceTexture.makeTextureView(pixelFormat: dst.pixelFormat) {
+            blitSource = view
+        } else {
+            return nil
+        }
+
+        guard let blit = commandBuffer.makeBlitCommandEncoder() else { return nil }
+        let copyW = min(subRect.width, dst.width)
+        let copyH = min(subRect.height, dst.height)
+        blit.label = "MetalPie_ContentRectSubCrop"
+        blit.copy(
+            from: blitSource,
+            sourceSlice: 0,
+            sourceLevel: 0,
+            sourceOrigin: MTLOrigin(x: subRect.x, y: subRect.y, z: 0),
+            sourceSize: MTLSize(width: copyW, height: copyH, depth: 1),
+            to: dst,
+            destinationSlice: 0,
+            destinationLevel: 0,
+            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+        )
+        blit.endEncoding()
+        return dst
     }
 
     private func stageLastRawSourceTexture(
@@ -2146,6 +2403,8 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         fgPreparedSettings = nil
         fgPendingBeats.removeAll()
         fgHysteresisSuppressedByHighFPS = false
+        fgConsecutiveDisplayRateBursts = 0
+        fgBurstCooldownUntil = 0
         fgLastNewFrameArrivalTime = 0
         fgLastPassTiming = nil
         cadenceTracker.reset()

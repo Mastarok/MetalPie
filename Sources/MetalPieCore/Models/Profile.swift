@@ -58,7 +58,9 @@ public struct CaptureSettings: Hashable, Codable, Sendable {
     /// Optional FPS cap (`10...1000`); `nil` means uncapped / display native refresh rate.
     public var frameRateLimit: Int?
     public var duplicateFrameMode: DuplicateFrameMode
-    /// Prefer immediate low-latency presentation over buffered display-link cadence when Frame Gen is off.
+    /// Prefer paced immediate presentation over `CAMetalDisplayLink` VSync cadence when Frame Gen is off.
+    /// Defaults to `false` so `CAMetalDisplayLink` (`preferredFrameLatency = 1.0`) provides smooth VSync
+    /// pacing with zero drawable-pool exhaustion during high-frequency UI/video-scrubber animations.
     public var lowLatencyPresent: Bool
     /// Input resolution policy for fullscreen video / browser super-resolution pre-downscaling.
     public var fullscreenVideoInput: FullscreenVideoInputMode
@@ -71,7 +73,7 @@ public struct CaptureSettings: Hashable, Codable, Sendable {
         dynamicRange: DynamicRangeMode = .sdr,
         frameRateLimit: Int? = nil,
         duplicateFrameMode: DuplicateFrameMode = .dynamic,
-        lowLatencyPresent: Bool = true,
+        lowLatencyPresent: Bool = false,
         fullscreenVideoInput: FullscreenVideoInputMode = .auto
     ) {
         self.captureMode = captureMode
@@ -115,7 +117,7 @@ public struct CaptureSettings: Hashable, Codable, Sendable {
             self.frameRateLimit = nil
         }
         self.duplicateFrameMode = try c.decodeIfPresent(DuplicateFrameMode.self, forKey: .duplicateFrameMode) ?? .dynamic
-        self.lowLatencyPresent = try c.decodeIfPresent(Bool.self, forKey: .lowLatencyPresent) ?? true
+        self.lowLatencyPresent = try c.decodeIfPresent(Bool.self, forKey: .lowLatencyPresent) ?? false
         self.fullscreenVideoInput = try c.decodeIfPresent(FullscreenVideoInputMode.self, forKey: .fullscreenVideoInput) ?? .auto
     }
 }

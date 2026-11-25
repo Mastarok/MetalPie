@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import MetalPieCapture
 import MetalPieCore
 import SwiftUI
 
@@ -33,7 +34,10 @@ public final class ProfilerHUDPanel {
     private var anchorOverlayFrame: CGRect = .zero
     private var corner: HUDCornerAnchor = .topLeft
     private var isShown = false
-    private var currentLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) + 1)
+    private var lastReportedInteractiveFrame: CGRect? = nil
+    private var currentLevel = NSWindow.Level(
+        rawValue: OverlayWindowController.fullscreenOverlayLevel.rawValue + 2
+    )
 
     /// Reused SwiftUI `ImageRenderer` for ultra-fast VRR Metal HUD compositing (MetalGoose pattern).
     private static var vrrRenderer: ImageRenderer<ProfilerHUDCardView>?
@@ -107,6 +111,13 @@ public final class ProfilerHUDPanel {
         return CGRect(x: x.rounded(), y: y.rounded(), width: w, height: h)
     }
 
+    public func setLevel(_ level: NSWindow.Level) {
+        currentLevel = level
+        if let panel, panel.level != level {
+            panel.level = level
+        }
+    }
+
     public func show(
         overlayCocoaFrame: CGRect,
         level: NSWindow.Level
@@ -121,11 +132,18 @@ public final class ProfilerHUDPanel {
 
         let targetFrame = computeHUDFrame(for: overlayCocoaFrame, height: estimatedHUDHeight())
         let activePanel = ensurePanel(frame: targetFrame)
-        activePanel.level = level
-        activePanel.setFrame(targetFrame, display: true, animate: false)
-        activePanel.orderFrontRegardless()
+        let wasShown = isShown
+        if activePanel.level != level {
+            activePanel.level = level
+        }
+        if !wasShown || OverlayToolbarAutoHideState.framesDiffer(activePanel.frame, targetFrame) {
+            activePanel.setFrame(targetFrame, display: !wasShown, animate: false)
+        }
+        if !wasShown {
+            activePanel.orderFrontRegardless()
+        }
         isShown = true
-        onInteractiveFrameChanged?()
+        notifyInteractiveFrameIfChanged()
     }
 
     public func update(
@@ -140,28 +158,35 @@ public final class ProfilerHUDPanel {
         if let overlayCocoaFrame, !overlayCocoaFrame.isEmpty {
             anchorOverlayFrame = overlayCocoaFrame
         }
-        let anchorChanged = previousAnchor != anchorOverlayFrame
+        let anchorChanged = OverlayToolbarAutoHideState.framesDiffer(previousAnchor, anchorOverlayFrame)
         if let level {
-            currentLevel = level
-            panel?.level = level
+            setLevel(level)
         }
         guard isShown, let panel, !anchorOverlayFrame.isEmpty else { return }
         let targetCardHeight = estimatedHUDHeight()
         let currentCardHeight = Self.visibleFrame(fromPanelFrame: panel.frame).height
         if anchorChanged || abs(currentCardHeight - targetCardHeight) > 4 {
             let resized = computeHUDFrame(for: anchorOverlayFrame, height: targetCardHeight)
-            panel.setFrame(resized, display: false, animate: false)
-            onInteractiveFrameChanged?()
+            if OverlayToolbarAutoHideState.framesDiffer(panel.frame, resized) {
+                panel.setFrame(resized, display: false, animate: false)
+                notifyInteractiveFrameIfChanged()
+            }
         }
     }
 
     public func hide() {
-        let wasShown = isShown
         isShown = false
         panel?.orderOut(nil)
-        if wasShown {
-            onInteractiveFrameChanged?()
+        notifyInteractiveFrameIfChanged()
+    }
+
+    private func notifyInteractiveFrameIfChanged() {
+        let current = visibleInteractiveCocoaFrame
+        guard OverlayToolbarAutoHideState.framesDiffer(lastReportedInteractiveFrame, current) else {
+            return
         }
+        lastReportedInteractiveFrame = current
+        onInteractiveFrameChanged?()
     }
 
     public func close() {
@@ -274,7 +299,7 @@ public final class ProfilerHUDPanel {
             )
         }
         panel.setFrame(Self.panelFrame(fromVisibleFrame: visibleCard), display: false, animate: false)
-        onInteractiveFrameChanged?()
+        notifyInteractiveFrameIfChanged()
     }
 
     private func snapToNearestCorner() {
@@ -292,7 +317,7 @@ public final class ProfilerHUDPanel {
         }
         let snapped = computeHUDFrame(for: anchorOverlayFrame, height: visibleCard.height)
         panel.setFrame(snapped, display: true, animate: true)
-        onInteractiveFrameChanged?()
+        notifyInteractiveFrameIfChanged()
     }
 }
 

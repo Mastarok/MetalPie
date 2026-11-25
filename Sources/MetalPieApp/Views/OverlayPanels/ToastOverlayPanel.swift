@@ -124,9 +124,16 @@ public final class ToastOverlayPanel {
             ?? NSScreen.screens.first?.visibleFrame
             ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
         // Clamp toast cleanly below Menu Bar / notch when anchored to a fullscreen overlay rect.
-        let matchingVisible = NSScreen.screens
-            .first(where: { $0.frame.intersects(baseFrame) })?
-            .visibleFrame
+        let matchingScreen = NSScreen.screens.max { lhs, rhs in
+            let lInter = lhs.frame.intersection(baseFrame)
+            let rInter = rhs.frame.intersection(baseFrame)
+            let lArea = (lInter.isNull || lInter.isEmpty) ? 0 : (lInter.width * lInter.height)
+            let rArea = (rInter.isNull || rInter.isEmpty) ? 0 : (rInter.width * rInter.height)
+            return lArea < rArea
+        }
+        let matchingVisible = matchingScreen.flatMap {
+            $0.frame.intersects(baseFrame) ? $0.visibleFrame : nil
+        }
         let safeMaxY: CGFloat
         if let visible = matchingVisible, baseFrame.maxY > visible.maxY {
             safeMaxY = visible.maxY

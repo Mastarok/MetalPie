@@ -200,11 +200,21 @@ public final class AppCoordinator {
         var isMenuBarDropdownActive: Bool = false
     }
 
+    private struct ChromeVisibilitySnapshot: Equatable {
+        var isRevealed: Bool
+        var isSuspended: Bool
+        var isVRRDirectScanoutActive: Bool
+        var toolbarMode: ToolbarMode
+        var isProfilerHUDActive: Bool
+    }
+
     private var watchdogToken: RunGuardWatchdog.RecoveryToken?
+    private var workspaceSafetyObservers: [any NSObjectProtocol] = []
     private var countdownTask: Task<Void, Never>?
     private var logRefreshTimer: Timer?
     private var lastLayout: ScalingLayoutResult?
     private var lastOverlayMetrics: OverlayDrawableMetrics?
+    private var lastSyncedChromeVisibility: ChromeVisibilitySnapshot?
     private var cachedVRRCursorGeneration: UInt64 = 0
     private var cachedVRRCursorTexture: (any MTLTexture)?
     private var cachedVRRHUDTexture: (any MTLTexture)?
@@ -548,6 +558,32 @@ public final class AppCoordinator {
         }
         RunLoop.main.add(timer, forMode: .common)
         logRefreshTimer = timer
+
+        // 11. System sleep, display sleep, and fast-user-switch / screen-lock safety guards:
+        //     immediately stop scaling and restore the OS cursor so waking/unlocking never hits
+        //     a stuck overlay or hidden cursor.
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        let sleepSafetyNotifications: [NSNotification.Name] = [
+            NSWorkspace.willSleepNotification,
+            NSWorkspace.screensDidSleepNotification,
+            NSWorkspace.sessionDidResignActiveNotification
+        ]
+        workspaceSafetyObservers = sleepSafetyNotifications.map { name in
+            wsCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                RunGuardWatchdog.forceRestoreSystemCursor()
+                let noteName = note.name.rawValue
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    guard self.isScalingSessionOpen || self.countdownRemaining != nil else { return }
+                    PipelineLog.shared.info(
+                        .app,
+                        "Stopping scaling due to workspace safety event '\(noteName)'."
+                    )
+                    self.cancelCountdown()
+                    await self.stopScaling(isManual: false, showToast: false)
+                }
+            }
+        }
     }
 
     private func prewarmDefaultScalingMode() async {
@@ -560,6 +596,11 @@ public final class AppCoordinator {
     public func prepareForTermination() {
         countdownTask?.cancel()
         logRefreshTimer?.invalidate()
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        for observer in workspaceSafetyObservers {
+            wsCenter.removeObserver(observer)
+        }
+        workspaceSafetyObservers.removeAll()
         stopPopupMenuMonitor()
         permissionsManager.stopPolling()
         autoScaleController.stop()
@@ -1014,6 +1055,7 @@ public final class AppCoordinator {
         defer { isStartingSession = false }
 
         cancelCountdown()
+        toastPanel.hideImmediately()
         lastErrorMessage = nil
 
         guard permissionsManager.isScreenRecordingGranted() else {
@@ -1059,6 +1101,7 @@ public final class AppCoordinator {
         cachedAXWindowRef = nil
         lastAXRepositionTime = 0
         lastIgnoredOverlayWindowIDs.removeAll()
+        lastSyncedChromeVisibility = nil
         cursorCallbackFastPath.withLock { $0 = CursorCallbackFastPathState() }
         stopPopupMenuMonitor()
         telemetry.state = .starting
@@ -1115,7 +1158,8 @@ public final class AppCoordinator {
             profile: effectiveProfile,
             scalingMode: resolvedMode,
             overlayMetrics: metrics,
-            vrrDirectScanout: metrics.isVRRDirectScanoutActive
+            vrrDirectScanout: metrics.isVRRDirectScanoutActive,
+            isNativeFullscreenSource: isFullscreenVideoOrGameSource(for: sessionWindow)
         )
 
         renderLoop.start(
@@ -1210,6 +1254,7 @@ public final class AppCoordinator {
         cachedAXWindowRef = nil
         lastAXRepositionTime = 0
         lastIgnoredOverlayWindowIDs.removeAll()
+        lastSyncedChromeVisibility = nil
         cursorCallbackFastPath.withLock { $0 = CursorCallbackFastPathState() }
 
         autoScaleController.setCurrentlyScaling(window: nil)
@@ -1229,6 +1274,14 @@ public final class AppCoordinator {
         telemetry = .idle
 
         RunGuardWatchdog.forceRestoreSystemCursor()
+
+        // Post-stop safety guard: re-assert OS cursor visibility after 100ms if no new session
+        // has started, covering delayed macOS Space transitions (e.g. exiting native fullscreen).
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self, !self.isScalingSessionOpen else { return }
+            RunGuardWatchdog.forceRestoreSystemCursor()
+        }
 
         if showToast {
             self.showToast(
@@ -1286,7 +1339,8 @@ public final class AppCoordinator {
             profile: effectiveProfile,
             scalingMode: mode,
             overlayMetrics: metrics,
-            vrrDirectScanout: metrics.isVRRDirectScanoutActive
+            vrrDirectScanout: metrics.isVRRDirectScanoutActive,
+            isNativeFullscreenSource: isFullscreenVideoOrGameSource(for: syncedWindow)
         ))
 
         configureCursorForActiveSession(window: syncedWindow, profile: effectiveProfile, metrics: metrics, layout: lastLayout)
@@ -1433,7 +1487,8 @@ public final class AppCoordinator {
             profile: effectiveProfile,
             scalingMode: updatedMode,
             overlayMetrics: metrics,
-            vrrDirectScanout: metrics.isVRRDirectScanoutActive
+            vrrDirectScanout: metrics.isVRRDirectScanoutActive,
+            isNativeFullscreenSource: isFullscreenVideoOrGameSource(for: syncedWindow)
         ))
 
         configureCursorForActiveSession(window: syncedWindow, profile: effectiveProfile, metrics: metrics, layout: lastLayout)
@@ -1450,6 +1505,18 @@ public final class AppCoordinator {
         var copy = profile
         copy.presentationMode = activePresentationMode
         return copy
+    }
+
+    private func isFullscreenVideoOrGameSource(for window: WindowDescriptor) -> Bool {
+        if overlayWindowController?.isCoveringNativeFullscreenSpace == true {
+            return true
+        }
+        let currentDisplays = displays.isEmpty ? WindowEnumerator.enumerateDisplaysOnMain() : displays
+        return WindowEnumerator.isFullscreenVideoOrGameWindow(
+            windowID: window.windowID,
+            bounds: window.cgBounds,
+            displays: currentDisplays
+        )
     }
 
     // MARK: - Cursor-Free PNG Screenshots
@@ -1771,7 +1838,8 @@ public final class AppCoordinator {
             profile: effectiveProfile,
             scalingMode: mode,
             overlayMetrics: metrics,
-            vrrDirectScanout: metrics.isVRRDirectScanoutActive
+            vrrDirectScanout: metrics.isVRRDirectScanoutActive,
+            isNativeFullscreenSource: isFullscreenVideoOrGameSource(for: window)
         ))
         cursorController.update(configuration: buildCursorConfiguration(
             window: window,
@@ -1781,8 +1849,16 @@ public final class AppCoordinator {
         ))
         cursorAlignmentMode = cursorController.alignmentMode
         syncVRRCursorSnapshotIfNeeded()
-        updateChromePanelFrames(for: metrics.cocoaFrame)
-        syncOverlayChromeVisibility(profile: effectiveProfile, metrics: metrics)
+
+        let currentChromeSnapshot = currentChromeVisibilitySnapshot(
+            profile: effectiveProfile,
+            metrics: metrics
+        )
+        if lastSyncedChromeVisibility == currentChromeSnapshot {
+            updateChromePanelFrames(for: metrics.cocoaFrame)
+        } else {
+            syncOverlayChromeVisibility(profile: effectiveProfile, metrics: metrics)
+        }
     }
 
     private func handleCaptureEvent(_ event: CaptureSessionEvent) async {
@@ -1837,8 +1913,8 @@ public final class AppCoordinator {
 
         switch event {
         case .targetLostFocus:
-            // If the same app is still frontmost (e.g. Chrome/Safari entering HTML5 fullscreen video),
-            // seamlessly follow the newly created fullscreen window instead of suspending!
+            // If the same app is still frontmost (e.g. Chrome/Safari entering or exiting HTML5
+            // fullscreen video), seamlessly follow the replacement window instead of suspending!
             if let currentWin = activeWindow,
                NSWorkspace.shared.frontmostApplication?.processIdentifier == currentWin.pid,
                await attemptFollowFullscreenReplacementWindow(forPreviousWindow: currentWin, allowShortSettleWait: false)
@@ -1854,6 +1930,7 @@ public final class AppCoordinator {
             cursorController.suspend()
             toolbarPanel.hide()
             profilerHUDPanel.hide()
+            lastSyncedChromeVisibility = nil
             telemetry.state = .suspended
 
         case .targetGainedFocus(let refreshedWindow):
@@ -1899,6 +1976,7 @@ public final class AppCoordinator {
             cursorController.suspend()
             toolbarPanel.hide()
             profilerHUDPanel.hide()
+            lastSyncedChromeVisibility = nil
             telemetry.state = .waitingForWindow
             showToast(
                 icon: "arrow.down.right.and.arrow.up.left",
@@ -1990,7 +2068,21 @@ public final class AppCoordinator {
 
         case .activeSpaceChanged:
             if let currentWin = activeWindow {
-                _ = await attemptFollowFullscreenReplacementWindow(forPreviousWindow: currentWin, allowShortSettleWait: true)
+                let wasNativeFS = overlayWindowController?.isCoveringNativeFullscreenSpace ?? false
+                let followed = await attemptFollowFullscreenReplacementWindow(
+                    forPreviousWindow: currentWin,
+                    allowShortSettleWait: true
+                )
+                // If we exited a native Full-Screen Space and the previous fullscreen window is
+                // no longer on screen with no replacement desktop window for the same app, stop
+                // cleanly so neither an orphan overlay nor `.accessory` policy lingers.
+                if !followed && wasNativeFS && isScalingSessionOpen && activeWindow?.windowID == currentWin.windowID {
+                    let prevStillOnScreen = WindowEnumerator.windowDescriptor(for: currentWin.windowID)?.isOnScreen ?? false
+                    let sameAppFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == currentWin.pid
+                    if !prevStillOnScreen && sameAppFront {
+                        await stopScaling(isManual: false, showToast: false)
+                    }
+                }
             }
 
         case .activeWindowChanged:
@@ -2036,7 +2128,10 @@ public final class AppCoordinator {
         cursorCallbackFastPath.withLock { $0.isVRRDirectScanoutActive = isVRR }
         cursorController.setPresentationMode(isVRR ? .externalCompositor : .overlayLayer)
 
-        let baseLevel = overlayWindowController?.panel?.level ?? OverlayWindowController.normalOverlayLevel
+        let fallbackBaseLevel = activePresentationMode.isWindowed
+            ? OverlayWindowController.windowedOverlayLevel
+            : OverlayWindowController.fullscreenOverlayLevel
+        let baseLevel = overlayWindowController?.panel?.level ?? fallbackBaseLevel
         cursorController.setOverlayWindowLevel(NSWindow.Level(rawValue: baseLevel.rawValue + 1))
         cursorController.setPresentationIsWindowed(activePresentationMode.isWindowed)
         cursorController.updateDisplays(displays)
@@ -2098,7 +2193,8 @@ public final class AppCoordinator {
             profile: effectiveProfile,
             scalingMode: mode,
             overlayMetrics: metrics,
-            vrrDirectScanout: metrics.isVRRDirectScanoutActive
+            vrrDirectScanout: metrics.isVRRDirectScanoutActive,
+            isNativeFullscreenSource: isFullscreenVideoOrGameSource(for: window)
         ))
         cursorController.update(configuration: buildCursorConfiguration(
             window: window,
@@ -2193,20 +2289,48 @@ public final class AppCoordinator {
         ))
     }
 
+    private func resolvedToolbarMode(for profile: Profile) -> ToolbarMode {
+        if let overrideVisible = isToolbarVisibleOverride {
+            return overrideVisible ? .alwaysShow : .off
+        }
+        if profile.threeDGameMode {
+            return .off
+        }
+        return profile.toolbarMode
+    }
+
+    private func currentChromeVisibilitySnapshot(
+        profile: Profile,
+        metrics: OverlayDrawableMetrics
+    ) -> ChromeVisibilitySnapshot {
+        ChromeVisibilitySnapshot(
+            isRevealed: overlayWindowController?.isRevealed ?? false,
+            isSuspended: overlayWindowController?.isSuspended ?? true,
+            isVRRDirectScanoutActive: metrics.isVRRDirectScanoutActive,
+            toolbarMode: resolvedToolbarMode(for: profile),
+            isProfilerHUDActive: isProfilerHUDActive
+        )
+    }
+
     private func syncOverlayChromeVisibility(
         profile: Profile,
         metrics: OverlayDrawableMetrics
     ) {
+        let snapshot = currentChromeVisibilitySnapshot(profile: profile, metrics: metrics)
         guard isScalingSessionOpen,
               let overlayController = overlayWindowController,
               overlayController.isRevealed,
               !overlayController.isSuspended
         else {
+            lastSyncedChromeVisibility = snapshot
+            stopPopupMenuMonitor()
             toolbarPanel.hide()
             profilerHUDPanel.hide()
             syncInteractiveChromeRects()
             return
         }
+
+        lastSyncedChromeVisibility = snapshot
 
         if metrics.isVRRDirectScanoutActive {
             // ProMotion VRR requires ZERO WindowServer sub-windows above the fullscreen overlay!
@@ -2222,18 +2346,14 @@ public final class AppCoordinator {
             return
         }
 
-        let baseLevel = overlayController.panel?.level ?? OverlayWindowController.normalOverlayLevel
+        let fallbackBaseLevel = activePresentationMode.isWindowed
+            ? OverlayWindowController.windowedOverlayLevel
+            : OverlayWindowController.fullscreenOverlayLevel
+        let baseLevel = overlayController.panel?.level ?? fallbackBaseLevel
         let chromeLevel = NSWindow.Level(rawValue: baseLevel.rawValue + 2)
 
         // 3D Game Mode hides floating toolbar by default unless explicitly toggled on.
-        let effectiveToolbarMode: ToolbarMode
-        if let overrideVisible = isToolbarVisibleOverride {
-            effectiveToolbarMode = overrideVisible ? .alwaysShow : .off
-        } else if profile.threeDGameMode {
-            effectiveToolbarMode = .off
-        } else {
-            effectiveToolbarMode = profile.toolbarMode
-        }
+        let effectiveToolbarMode = resolvedToolbarMode(for: profile)
 
         if effectiveToolbarMode == .off {
             toolbarPanel.hide()
@@ -2304,13 +2424,13 @@ public final class AppCoordinator {
         let hostDisplay = ScreenGeometry.bestDisplay(forCocoaRect: overlayCocoaFrame, in: currentDisplays)
             ?? ScreenGeometry.primaryDisplay(in: currentDisplays)
         let hostCGBounds = hostDisplay?.cgBounds ?? overlayCG
-        let hostScreenCocoa = hostDisplay?.cocoaFrame
-            ?? NSScreen.main?.frame
+        let hostVisibleCocoa = hostDisplay.flatMap { WindowEnumerator.nsScreen(for: $0.id)?.visibleFrame }
+        let hostScreenCocoa = hostVisibleCocoa
+            ?? hostDisplay?.cocoaFrame
+            ?? NSScreen.main?.visibleFrame
             ?? overlayCocoaFrame
-        let visibleCGBounds: CGRect? = hostDisplay.flatMap { descriptor in
-            WindowEnumerator.nsScreen(for: descriptor.id).map { screen in
-                ScreenGeometry.cocoaToCG(rect: screen.visibleFrame, displays: currentDisplays)
-            }
+        let visibleCGBounds: CGRect? = hostVisibleCocoa.map {
+            ScreenGeometry.cocoaToCG(rect: $0, displays: currentDisplays)
         }
 
         // If the user dragged the unlocked windowed overlay smaller than the source window and
@@ -2660,17 +2780,9 @@ public final class AppCoordinator {
 
     private func syncLayeredWindowLevels(baseLevel: NSWindow.Level) {
         cursorController.setOverlayWindowLevel(NSWindow.Level(rawValue: baseLevel.rawValue + 1))
-        guard let metrics = lastOverlayMetrics, !metrics.isVRRDirectScanoutActive else { return }
         let chromeLevel = NSWindow.Level(rawValue: baseLevel.rawValue + 2)
-        toolbarPanel.updateOverlayFrame(metrics.cocoaFrame, level: chromeLevel)
-        if isProfilerHUDActive {
-            profilerHUDPanel.update(
-                telemetry: telemetry,
-                language: effectiveLanguage,
-                overlayCocoaFrame: metrics.cocoaFrame,
-                level: chromeLevel
-            )
-        }
+        toolbarPanel.setLevel(chromeLevel)
+        profilerHUDPanel.setLevel(chromeLevel)
     }
 
     private func startOrUpdatePopupMenuMonitor() {
@@ -2825,7 +2937,14 @@ public final class AppCoordinator {
             return false
         }
 
-        let maxAttempts = allowShortSettleWait ? 3 : 1
+        let currentDisplaysSnapshot = displays.isEmpty ? WindowEnumerator.enumerateDisplaysOnMain() : displays
+        let wasFullscreenSource = (overlayWindowController?.isCoveringNativeFullscreenSpace ?? false)
+            || currentDisplaysSnapshot.contains {
+                WindowEnumerator.boundsCoversDisplay(previousWindow.cgBounds, displayBounds: $0.cgBounds, tolerance: 4.0)
+            }
+            || WindowEnumerator.isNotchInsetFullscreenBounds(previousWindow.cgBounds, displays: currentDisplaysSnapshot)
+
+        let maxAttempts = allowShortSettleWait ? (wasFullscreenSource ? 5 : 3) : 1
         for attempt in 0..<maxAttempts {
             if attempt > 0 {
                 try? await Task.sleep(for: .milliseconds(110))
@@ -2846,6 +2965,24 @@ public final class AppCoordinator {
             ) {
                 await retargetActiveSession(to: replacement, previousWindowID: previousWindow.windowID)
                 return true
+            }
+
+            // Smooth fullscreen video exit (`Esc` out of Bilibili/Safari/Chrome/IINA native fullscreen):
+            // once the native fullscreen video window leaves/closes and the same app remains frontmost
+            // with a normal desktop window (`W1`), seamlessly follow back to `W1` so OverlayWindowController
+            // transitions cleanly from level `19` -> `98`/`21` and restores `.regular` activation policy!
+            if wasFullscreenSource {
+                let prevStillOnScreen = WindowEnumerator.windowDescriptor(for: previousWindow.windowID)?.isOnScreen ?? false
+                if !prevStillOnScreen,
+                   let desktopFallback = WindowEnumerator.bestTargetWindow(
+                       forPID: previousWindow.pid,
+                       displays: currentDisplays
+                   ),
+                   desktopFallback.windowID != previousWindow.windowID
+                {
+                    await retargetActiveSession(to: desktopFallback, previousWindowID: previousWindow.windowID)
+                    return true
+                }
             }
         }
         return false
@@ -2903,7 +3040,8 @@ public final class AppCoordinator {
             profile: effectiveProfile,
             scalingMode: mode,
             overlayMetrics: metrics,
-            vrrDirectScanout: metrics.isVRRDirectScanoutActive
+            vrrDirectScanout: metrics.isVRRDirectScanoutActive,
+            isNativeFullscreenSource: isFullscreenVideoOrGameSource(for: replacement)
         ))
         captureEngine.setPaused(isPaused)
         renderLoop.setPaused(isPaused)

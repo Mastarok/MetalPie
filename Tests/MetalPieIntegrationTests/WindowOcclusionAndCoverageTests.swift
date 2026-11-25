@@ -328,7 +328,7 @@ struct WindowOcclusionAndCoverageTests {
         let underCocoaY = Int((primary.cocoaFrame.midY - CGFloat(underH) * 0.5).rounded())
         let underCocoa = CGRect(x: underCocoaX, y: underCocoaY, width: underW, height: underH)
         let underCG = ScreenGeometry.cocoaToCG(rect: underCocoa, displays: displays)
-        let underLevel = OverlayWindowController.normalOverlayLevel.rawValue - 2
+        let underLevel = OverlayWindowController.windowedOverlayLevel.rawValue - 2
 
         if let hardwareSkipReason = hostDisplayUnavailableForLiveWindowServerReason() {
             print("[WindowOcclusionAndCoverageTests] Skipping live cross-process WindowServer occlusion sampling: \(hardwareSkipReason)")
@@ -1068,28 +1068,50 @@ struct WindowOcclusionAndCoverageTests {
         #expect(hiddenToolbarRects.isEmpty)
     }
 
-    // MARK: - Bug #2 & Bug #3: Menu-Bar-Safe Window Levels & Context-Menu Deduplication Boost
+    // MARK: - Bug #2 & Bug #3: Fullscreen vs Windowed Levels, Menu-Bar Clamping & Context-Menu Dedup Boost
 
-    @Test("Overlay window levels stay strictly below macOS Menu Bar normally and boost above NSMenu (102) ONLY for in-window context menus")
+    @Test("Fullscreen level (98) sits strictly above macOS Menu Bar/Status Bar & below NSMenu (101); Windowed level (21) sits below Menu Bar; popup boost rises cleanly to 102/103/104")
     @MainActor
     func overlayLevelsAndPopupMenuDedupClassifier() throws {
         let displays = Self.dualDisplays
         let menuBarLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
+        let statusBarLevel = Int(CGWindowLevelForKey(.statusWindow))
         let popUpLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
         let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
 
-        // Base overlay (21), cursor (+1 = 22), and chrome (+2 = 23) must ALL be above Dock (20)
-        // and strictly below macOS Menu Bar (24)!
-        let baseLevel = OverlayWindowController.normalOverlayLevel.rawValue
-        #expect(baseLevel > dockLevel)
-        #expect(baseLevel + 2 < menuBarLevel)
-        #expect(OverlayWindowController.popupMenuBoostOverlayLevel.rawValue == popUpLayer + 1)
+        // 1. Fullscreen overlay (98), cursor (+1 = 99), and toolbar/HUD (+2 = 100) must sit
+        //    strictly ABOVE macOS Menu Bar (24) & Status Bar (25) — ZERO Menu Bar bleed-through —
+        //    and ALL strictly BELOW popUpMenuWindow (101)!
+        let fsBase = OverlayWindowController.fullscreenOverlayLevel.rawValue
+        #expect(fsBase == popUpLayer - 3)
+        #expect(OverlayWindowController.normalOverlayLevel == OverlayWindowController.fullscreenOverlayLevel)
+        #expect(fsBase > menuBarLevel)
+        #expect(fsBase > statusBarLevel)
+        #expect(fsBase + 1 < popUpLayer, "Fullscreen cursor level (99) must sit strictly below popUpMenuWindow (101)")
+        #expect(fsBase + 2 < popUpLayer, "Fullscreen toolbar/HUD level (100) must sit strictly below popUpMenuWindow (101)")
+
+        // 2. Windowed overlay (21), cursor (+1 = 22), and toolbar/HUD (+2 = 23) must sit strictly
+        //    above Dock (20) and ALL strictly BELOW macOS Menu Bar (24) & Status Bar (25)!
+        let winBase = OverlayWindowController.windowedOverlayLevel.rawValue
+        #expect(winBase == menuBarLevel - 3)
+        #expect(winBase > dockLevel)
+        #expect(winBase + 1 < menuBarLevel)
+        #expect(winBase + 2 < menuBarLevel)
+        #expect(winBase + 2 < statusBarLevel)
+
+        // 3. Popup boost rises cleanly to 102 (cursor 103, toolbar/HUD 104); native FS = 19; VRR = 100.
+        let boostBase = OverlayWindowController.popupMenuBoostOverlayLevel.rawValue
+        #expect(boostBase == popUpLayer + 1)
+        #expect(boostBase + 1 == popUpLayer + 2)
+        #expect(boostBase + 2 == popUpLayer + 3)
+        #expect(OverlayWindowController.nativeFullscreenOverlayLevel.rawValue == 19)
+        #expect(OverlayWindowController.vrrFullscreenOverlayLevel.rawValue == popUpLayer - 1)
 
         let targetPID: Int32 = 4242
         let sourceWindow = CGRect(x: 100, y: 120, width: 800, height: 500)
         let mbHeights: [CGDirectDisplayID: CGFloat] = [1: 33, 2: 30]
 
-        // 1. In-window right-click NSMenu (layer 101, intersects source, pointer inside window) -> BOOST!
+        // 4. In-window right-click NSMenu (layer 101, intersects source, pointer inside window) -> BOOST!
         let contextMenu = PopupMenuWindowSnapshot(
             windowID: 9001,
             pid: targetPID,
@@ -1107,7 +1129,7 @@ struct WindowOcclusionAndCoverageTests {
         #expect(evalContext.shouldBoostAbovePopupMenus == true)
         #expect(evalContext.isMenuBarDropdownActive == false)
 
-        // 2. Submenu opening slightly outside source while already boosted -> stays boosted!
+        // 5. Submenu opening slightly outside source while already boosted -> stays boosted!
         let submenu = PopupMenuWindowSnapshot(
             windowID: 9002,
             pid: targetPID,
@@ -1125,7 +1147,7 @@ struct WindowOcclusionAndCoverageTests {
         )
         #expect(evalSub.shouldBoostAbovePopupMenus == true)
 
-        // 3. Menu closes -> immediately drops boost!
+        // 6. Menu closes -> immediately drops boost!
         let evalClosed = OverlayWindowController.evaluatePopupMenuLevelBoost(
             popupWindows: [],
             targetPID: targetPID,
@@ -1136,7 +1158,7 @@ struct WindowOcclusionAndCoverageTests {
         #expect(evalClosed.shouldBoostAbovePopupMenus == false)
         #expect(evalClosed.isMenuBarDropdownActive == false)
 
-        // 4. macOS top Menu Bar dropdown (anchored at y=33 on primary, pointer in menu bar, even over fullscreen source!)
+        // 7. macOS top Menu Bar dropdown (anchored at y=33 on primary, pointer in menu bar, even over fullscreen source!)
         //    MUST NOT boost so macOS Menu Bar dropdown stays visible above OverlayPanel!
         let fullscreenSource = Self.primaryRetina.cgBounds
         let menuBarDropdown = PopupMenuWindowSnapshot(
@@ -1156,7 +1178,7 @@ struct WindowOcclusionAndCoverageTests {
         #expect(evalMenuBar.shouldBoostAbovePopupMenus == false)
         #expect(evalMenuBar.isMenuBarDropdownActive == true)
 
-        // 5. External DELL negative-CG-Y top Menu Bar dropdown (y = -720 + 30 = -690) MUST NOT boost!
+        // 8. External DELL negative-CG-Y top Menu Bar dropdown (y = -720 + 30 = -690) MUST NOT boost!
         let dellMenuBarDropdown = PopupMenuWindowSnapshot(
             windowID: 9004,
             pid: targetPID,
@@ -1174,7 +1196,8 @@ struct WindowOcclusionAndCoverageTests {
         #expect(evalDELLMenuBar.shouldBoostAbovePopupMenus == false)
         #expect(evalDELLMenuBar.isMenuBarDropdownActive == true)
 
-        // 6. Live OverlayWindowController boost toggle fires `onOverlayLevelChanged` and restores base level cleanly
+        // 9. Live OverlayWindowController cleanly separates Fullscreen (98), Windowed (21),
+        //    Native FS (19), VRR (100), and popup-menu boost (102) while firing `onOverlayLevelChanged`!
         if let device = MTLCreateSystemDefaultDevice() {
             let controller = try OverlayWindowController(device: device)
             defer { controller.close() }
@@ -1188,15 +1211,28 @@ struct WindowOcclusionAndCoverageTests {
                 cgBounds: sourceWindow,
                 backingScaleFactor: 2.0
             )
+
+            // Fullscreen non-native-FS -> level 98 -> boost 102 -> restore 98
             _ = controller.prepareOverlay(
                 sourceWindow: src,
                 profile: .defaultProfile,
-                presentationOverride: .windowed(initialScale: 1.25),
+                presentationOverride: .fullscreen,
                 isNativeFullscreenSpace: false
             )
             let panel = try #require(controller.panel)
-            #expect(panel.level == OverlayWindowController.windowedOverlayLevel)
+            #expect(panel.level == OverlayWindowController.fullscreenOverlayLevel)
+            controller.setPopupMenuLevelBoost(true)
+            #expect(panel.level == OverlayWindowController.popupMenuBoostOverlayLevel)
+            controller.setPopupMenuLevelBoost(false)
+            #expect(panel.level == OverlayWindowController.fullscreenOverlayLevel)
+            #expect(observedLevels.suffix(2) == [
+                OverlayWindowController.popupMenuBoostOverlayLevel.rawValue,
+                OverlayWindowController.fullscreenOverlayLevel.rawValue
+            ])
 
+            // Windowed -> level 21 -> boost 102 -> restore 21
+            _ = controller.setPresentationMode(.windowed(initialScale: 1.25), multiMonitorMode: .closest)
+            #expect(panel.level == OverlayWindowController.windowedOverlayLevel)
             controller.setPopupMenuLevelBoost(true)
             #expect(panel.level == OverlayWindowController.popupMenuBoostOverlayLevel)
             controller.setPopupMenuLevelBoost(false)
@@ -1205,7 +1241,346 @@ struct WindowOcclusionAndCoverageTests {
                 OverlayWindowController.popupMenuBoostOverlayLevel.rawValue,
                 OverlayWindowController.windowedOverlayLevel.rawValue
             ])
+
+            // Native Fullscreen Space -> level 19 -> exiting back to desktop window restores level 98 & activation policy!
+            let originalPolicy = NSApplication.shared.activationPolicy()
+            _ = controller.prepareOverlay(
+                sourceWindow: src,
+                profile: .defaultProfile,
+                presentationOverride: .fullscreen,
+                isNativeFullscreenSpace: true
+            )
+            #expect(panel.level == OverlayWindowController.nativeFullscreenOverlayLevel)
+            #expect(controller.isCoveringNativeFullscreenSpace == true)
+            #expect(NSApplication.shared.activationPolicy() == .accessory)
+
+            // Smooth fullscreen video exit (`W2` -> `W1`): level transitions 19 -> 98 and policy restores!
+            _ = controller.prepareOverlay(
+                sourceWindow: src,
+                profile: .defaultProfile,
+                presentationOverride: .fullscreen,
+                isNativeFullscreenSpace: false
+            )
+            #expect(panel.level == OverlayWindowController.fullscreenOverlayLevel)
+            #expect(controller.isCoveringNativeFullscreenSpace == false)
+            #expect(NSApplication.shared.activationPolicy() == originalPolicy)
+
+            // VRR Direct-Scanout Fullscreen -> level 100
+            controller.isVRRDirectScanoutEnabled = true
+            #expect(panel.level == OverlayWindowController.vrrFullscreenOverlayLevel)
+            controller.isVRRDirectScanoutEnabled = false
+            #expect(panel.level == OverlayWindowController.fullscreenOverlayLevel)
         }
+    }
+
+    @Test("Windowed overlay frame clamps strictly inside host visibleFrame (never sliding behind macOS Menu Bar)")
+    @MainActor
+    func windowedFrameClampsStrictlyInsideVisibleFrame() throws {
+        let displays = Self.dualDisplays
+
+        // 1. Primary Retina (0, 0, 1512, 982) with 33pt top Menu Bar -> visibleFrame (0, 0, 1512, 949)
+        let primaryVisibleNoDock = CGRect(x: 0, y: 0, width: 1512, height: 949)
+        // Source sits flush below Menu Bar at CG y=33 (Cocoa maxY=949), 1.6x scale would expand above 949 if unclamped!
+        let primaryTopSourceCG = CGRect(x: 200, y: 33, width: 700, height: 420)
+        let primaryWindowed = OverlayWindowController.computeOverlayCocoaFrame(
+            sourceCGRect: primaryTopSourceCG,
+            presentationMode: .windowed(initialScale: 1.6),
+            multiMonitorMode: .closest,
+            displays: displays,
+            aspectRatio: 700.0 / 420.0,
+            hostVisibleCocoaFrame: primaryVisibleNoDock
+        )
+        #expect(primaryWindowed.maxY <= primaryVisibleNoDock.maxY + 0.01, "Windowed overlay maxY \(primaryWindowed.maxY) slid into Menu Bar above \(primaryVisibleNoDock.maxY)")
+        #expect(primaryWindowed.minY >= primaryVisibleNoDock.minY - 0.01)
+        #expect(OverlayWindowController.overlayCoversSource(
+            overlayRect: primaryWindowed,
+            sourceRect: ScreenGeometry.cgToCocoa(rect: primaryTopSourceCG, displays: displays)
+        ))
+
+        // 2. Primary Retina with 38pt notch Menu Bar + 60pt Dock -> visibleFrame (0, 60, 1512, 884)
+        let primaryVisibleWithDock = CGRect(x: 0, y: 60, width: 1512, height: 884)
+        let tallWindowSourceCG = CGRect(x: 80, y: 40, width: 1200, height: 820)
+        let clampedWithDock = OverlayWindowController.computeOverlayCocoaFrame(
+            sourceCGRect: tallWindowSourceCG,
+            presentationMode: .windowed(),
+            multiMonitorMode: .closest,
+            displays: displays,
+            aspectRatio: 1200.0 / 820.0,
+            hostVisibleCocoaFrame: primaryVisibleWithDock
+        )
+        #expect(clampedWithDock.maxY <= primaryVisibleWithDock.maxY + 0.01)
+        #expect(clampedWithDock.minY >= primaryVisibleWithDock.minY - 0.01)
+        #expect(clampedWithDock.height <= primaryVisibleWithDock.height + 0.01)
+
+        // 3. External DELL (negative CG Y; Cocoa 982..1702, 30pt Menu Bar -> visibleFrame 982..1672)
+        let dellVisible = CGRect(x: 1512, y: 982, width: 1280, height: 690)
+        let dellTopSourceCG = CGRect(x: 1620, y: -690, width: 640, height: 360)
+        let dellWindowed = OverlayWindowController.computeOverlayCocoaFrame(
+            sourceCGRect: dellTopSourceCG,
+            presentationMode: .windowed(initialScale: 1.5),
+            multiMonitorMode: .closest,
+            displays: displays,
+            aspectRatio: 16.0 / 9.0,
+            hostVisibleCocoaFrame: dellVisible
+        )
+        #expect(dellWindowed.maxY <= dellVisible.maxY + 0.01, "DELL windowed overlay maxY \(dellWindowed.maxY) slid into Menu Bar above \(dellVisible.maxY)")
+        #expect(dellWindowed.minY >= dellVisible.minY - 0.01)
+        #expect(OverlayWindowController.overlayCoversSource(
+            overlayRect: dellWindowed,
+            sourceRect: ScreenGeometry.cgToCocoa(rect: dellTopSourceCG, displays: displays)
+        ))
+
+        // 4. Proportional resize growth near the top edge MUST also stay strictly inside `visibleFrame`!
+        let prevSourceCG = CGRect(x: 200, y: 33, width: 640, height: 360)
+        let prevOverlayCocoa = CGRect(x: 40, y: 409, width: 960, height: 540) // maxY = 949
+        let grownSourceCG = CGRect(x: 200, y: 33, width: 800, height: 450)
+        let grownOverlayCocoa = OverlayWindowController.computeProportionalResizedWindowedCocoaFrame(
+            previousSourceCGRect: prevSourceCG,
+            newSourceCGRect: grownSourceCG,
+            currentOverlayCocoaFrame: prevOverlayCocoa,
+            displays: displays,
+            hostVisibleCocoaFrame: primaryVisibleNoDock
+        )
+        #expect(grownOverlayCocoa.maxY <= primaryVisibleNoDock.maxY + 0.01)
+        #expect(grownOverlayCocoa.minY >= primaryVisibleNoDock.minY - 0.01)
+
+        // 5. Live OverlayWindowController Windowed preparation respects the host NSScreen's visibleFrame!
+        if let device = MTLCreateSystemDefaultDevice(),
+           let primaryScreen = NSScreen.screens.first(where: { abs($0.frame.origin.x) < 0.5 && abs($0.frame.origin.y) < 0.5 }) ?? NSScreen.main
+        {
+            let liveDisplays = WindowEnumerator.enumerateDisplaysOnMain()
+            let topInset = max(0, primaryScreen.frame.maxY - primaryScreen.visibleFrame.maxY)
+            let liveSourceCG = CGRect(
+                x: primaryScreen.visibleFrame.minX + 120,
+                y: topInset + 4,
+                width: min(640, primaryScreen.visibleFrame.width - 240),
+                height: min(360, primaryScreen.visibleFrame.height - 80)
+            )
+            let controller = try OverlayWindowController(device: device)
+            defer { controller.close() }
+            let src = WindowDescriptor(
+                windowID: 88_009,
+                pid: 4_321,
+                appName: "BrowserTopEdge",
+                title: "Top",
+                cgBounds: liveSourceCG,
+                backingScaleFactor: Double(primaryScreen.backingScaleFactor)
+            )
+            let metrics = controller.prepareOverlay(
+                sourceWindow: src,
+                profile: .defaultProfile,
+                presentationOverride: .windowed(initialScale: 1.75),
+                isNativeFullscreenSpace: false
+            )
+            let panel = try #require(controller.panel)
+            #expect(panel.level == OverlayWindowController.windowedOverlayLevel)
+            #expect(panel.level.rawValue < Int(CGWindowLevelForKey(.mainMenuWindow)))
+            #expect(
+                metrics.cocoaFrame.maxY <= primaryScreen.visibleFrame.maxY + 0.5,
+                "Live Windowed overlay maxY \(metrics.cocoaFrame.maxY) overlapped Menu Bar above visibleFrame.maxY \(primaryScreen.visibleFrame.maxY) (displays=\(liveDisplays.count))"
+            )
+        }
+    }
+
+    // MARK: - Floating Toolbar Anti-Flicker & Dual-Pointer Hover Regression Suite
+
+    @Test("OverlayToolbarAutoHideState.beginShow(.autoHide) is idempotent when already shown and NEVER resets isRevealedByHover (zero flicker)")
+    func toolbarAutoHideIdempotentShowPreventsFlicker() {
+        var state = OverlayToolbarAutoHideState()
+        let overlayFrame = CGRect(x: 0, y: 1, width: 1512, height: 981)
+        let visibleScreen = CGRect(x: 0, y: 0, width: 1512, height: 949)
+        let pillFrame = OverlayChromeGeometry.computeVisibleToolbarCocoaFrame(
+            for: overlayFrame,
+            hostScreenVisibleFrame: visibleScreen
+        )
+
+        // 1. Initial show in .autoHide starts hidden and requests hover timer.
+        let first = state.beginShow(
+            mode: .autoHide,
+            overlayCocoaFrame: overlayFrame,
+            visibleToolbarFrame: pillFrame
+        )
+        #expect(first.shouldHide == false)
+        #expect(first.isIdempotentUpdate == false)
+        #expect(first.shouldResetAutoHideHidden == true)
+        #expect(first.shouldStartHoverTimer == true)
+        #expect(state.isShown == true)
+        #expect(state.isRevealedByHover == false)
+        #expect(state.visibleInteractiveCocoaFrame == nil)
+
+        // 2. Move pointer into top strip -> reveals toolbar and reports interactive frame once.
+        let topEdgePoint = CGPoint(x: pillFrame.midX, y: overlayFrame.maxY - 2)
+        let revealEval = state.evaluateAutoHideHover(
+            physicalCocoaPoint: topEdgePoint,
+            scaledCocoaPoint: nil,
+            now: 10.0
+        )
+        #expect(revealEval.action == .reveal)
+        #expect(revealEval.interactiveFrameChanged == true)
+        #expect(state.isRevealedByHover == true)
+        #expect(state.visibleInteractiveCocoaFrame == pillFrame)
+
+        // 3. Repeated show(.autoHide) calls (e.g. from metric/chrome syncs) MUST be idempotent:
+        //    NEVER reset isRevealedByHover, NEVER hide, NEVER restart hoverTimer, and NEVER spam interactiveFrameChanged!
+        for i in 0..<10 {
+            let jitterFrame = CGRect(
+                x: pillFrame.origin.x + (i.isMultiple(of: 2) ? 0.2 : -0.2),
+                y: pillFrame.origin.y,
+                width: pillFrame.width,
+                height: pillFrame.height
+            )
+            let repeatShow = state.beginShow(
+                mode: .autoHide,
+                overlayCocoaFrame: overlayFrame,
+                visibleToolbarFrame: jitterFrame
+            )
+            #expect(repeatShow.isIdempotentUpdate == true)
+            #expect(repeatShow.shouldResetAutoHideHidden == false)
+            #expect(repeatShow.shouldStartHoverTimer == false)
+            #expect(repeatShow.shouldHide == false)
+            #expect(repeatShow.interactiveFrameChanged == false, "Sub-0.5pt jitter must not spam interactiveFrameChanged")
+            #expect(state.isRevealedByHover == true, "Repeated show(.autoHide) must NEVER hide a hovered toolbar!")
+            #expect(state.visibleInteractiveCocoaFrame != nil)
+        }
+
+        // 4. Genuine frame move (>= 0.5pt) updates frame WITHOUT hiding toolbar and fires interactiveFrameChanged once.
+        let shiftedOverlay = CGRect(x: 200, y: 120, width: 960, height: 540)
+        let shiftedPill = OverlayChromeGeometry.computeVisibleToolbarCocoaFrame(
+            for: shiftedOverlay,
+            hostScreenVisibleFrame: visibleScreen
+        )
+        let movedShow = state.beginShow(
+            mode: .autoHide,
+            overlayCocoaFrame: shiftedOverlay,
+            visibleToolbarFrame: shiftedPill
+        )
+        #expect(movedShow.isIdempotentUpdate == true)
+        #expect(movedShow.shouldResetAutoHideHidden == false)
+        #expect(movedShow.interactiveFrameChanged == true)
+        #expect(state.isRevealedByHover == true)
+        #expect(state.visibleInteractiveCocoaFrame == shiftedPill)
+    }
+
+    @Test("OverlayToolbarAutoHideState stays continuously hovered when EITHER physical or scaled pointer is inside toolbar, topStrip (zero gap), or +24pt hysteresis zone")
+    func toolbarAutoHideDualPointerAndHysteresis() {
+        var state = OverlayToolbarAutoHideState()
+        let overlayFrame = CGRect(x: 0, y: 1, width: 1512, height: 981)
+        let visibleScreen = CGRect(x: 0, y: 0, width: 1512, height: 949)
+        let pillFrame = OverlayChromeGeometry.computeVisibleToolbarCocoaFrame(
+            for: overlayFrame,
+            hostScreenVisibleFrame: visibleScreen
+        )
+        _ = state.beginShow(
+            mode: .autoHide,
+            overlayCocoaFrame: overlayFrame,
+            visibleToolbarFrame: pillFrame
+        )
+
+        // 1. Verify ZERO dead gap between topStrip and visibleToolbarRect from screen top down into the pill!
+        let topStrip = OverlayToolbarAutoHideState.computeAutoHideTopStrip(
+            anchorOverlayFrame: overlayFrame,
+            visibleToolbarRect: pillFrame
+        )
+        #expect(topStrip.maxY >= overlayFrame.maxY, "topStrip must reach the very top edge of the overlay")
+        #expect(topStrip.minY < pillFrame.maxY, "topStrip must overlap visibleToolbarRect with zero dead gap")
+        for y in stride(from: Int(pillFrame.maxY - 20), through: Int(overlayFrame.maxY), by: 2) {
+            let probe = CGPoint(x: pillFrame.midX, y: CGFloat(y))
+            #expect(
+                topStrip.contains(probe) || pillFrame.contains(probe),
+                "Dead gap found between topStrip and visibleToolbarRect at y=\(y)"
+            )
+        }
+
+        // 2. Scaled pointer enters topStrip while physical OS cursor is confined far away in a small source window -> REVEALS!
+        let farAwayPoint = CGPoint(x: 120, y: 120)
+        let scaledTopPoint = CGPoint(x: pillFrame.midX, y: pillFrame.maxY + 4)
+        let e1 = state.evaluateAutoHideHover(
+            physicalCocoaPoint: farAwayPoint,
+            scaledCocoaPoint: scaledTopPoint,
+            now: 1.0
+        )
+        #expect(e1.action == .reveal)
+        #expect(e1.isHovering == true)
+        #expect(state.isRevealedByHover == true)
+
+        // 3. CursorOverlayController switches to .directChrome (physical mouse is on a toolbar button while
+        //    scaled pointer lags far away) -> MUST stay continuously hovered well past 0.85s!
+        let physicalOnStopButton = CGPoint(x: pillFrame.maxX - 24, y: pillFrame.midY)
+        for tick in 1...25 {
+            let eval = state.evaluateAutoHideHover(
+                physicalCocoaPoint: physicalOnStopButton,
+                scaledCocoaPoint: farAwayPoint,
+                now: 1.0 + Double(tick) * 0.08
+            )
+            #expect(eval.action == .none)
+            #expect(eval.isHovering == true)
+            #expect(eval.interactiveFrameChanged == false)
+            #expect(state.isRevealedByHover == true)
+        }
+
+        // 4. +24pt horizontal / +18pt vertical hysteresis zone keeps toolbar continuously revealed for EITHER pointer!
+        let hysteresisPoints: [CGPoint] = [
+            CGPoint(x: pillFrame.minX - 22, y: pillFrame.midY),
+            CGPoint(x: pillFrame.maxX + 22, y: pillFrame.midY),
+            CGPoint(x: pillFrame.midX, y: pillFrame.minY - 16),
+            CGPoint(x: pillFrame.midX, y: pillFrame.maxY + 16)
+        ]
+        for (idx, pt) in hysteresisPoints.enumerated() {
+            // Test with physical inside hysteresis, scaled far away
+            let evalPhys = state.evaluateAutoHideHover(
+                physicalCocoaPoint: pt,
+                scaledCocoaPoint: farAwayPoint,
+                now: 4.0 + Double(idx) * 0.5
+            )
+            #expect(evalPhys.isHovering == true, "Physical point \(pt) inside hysteresis zone must remain hovered")
+            #expect(evalPhys.action == .none)
+
+            // Test with scaled inside hysteresis, physical far away
+            let evalScaled = state.evaluateAutoHideHover(
+                physicalCocoaPoint: farAwayPoint,
+                scaledCocoaPoint: pt,
+                now: 6.0 + Double(idx) * 0.5
+            )
+            #expect(evalScaled.isHovering == true, "Scaled point \(pt) inside hysteresis zone must remain hovered")
+            #expect(evalScaled.action == .none)
+        }
+
+        // 5. Once BOTH pointers leave outside the hysteresis zone, waits >= 0.85s then hides cleanly ONCE.
+        let outsidePoint = CGPoint(x: pillFrame.maxX + 40, y: pillFrame.minY - 40)
+        let leaveStart = state.evaluateAutoHideHover(
+            physicalCocoaPoint: outsidePoint,
+            scaledCocoaPoint: outsidePoint,
+            now: 10.0
+        )
+        #expect(leaveStart.action == .none)
+        #expect(state.isRevealedByHover == true)
+
+        let beforeDelay = state.evaluateAutoHideHover(
+            physicalCocoaPoint: outsidePoint,
+            scaledCocoaPoint: outsidePoint,
+            now: 10.70
+        )
+        #expect(beforeDelay.action == .none)
+        #expect(state.isRevealedByHover == true)
+
+        let afterDelay = state.evaluateAutoHideHover(
+            physicalCocoaPoint: outsidePoint,
+            scaledCocoaPoint: outsidePoint,
+            now: 10.90
+        )
+        #expect(afterDelay.action == .hide)
+        #expect(afterDelay.interactiveFrameChanged == true)
+        #expect(state.isRevealedByHover == false)
+        #expect(state.visibleInteractiveCocoaFrame == nil)
+
+        // Subsequent unhovered ticks produce zero redundant interactive-frame notifications.
+        let steadyHidden = state.evaluateAutoHideHover(
+            physicalCocoaPoint: outsidePoint,
+            scaledCocoaPoint: outsidePoint,
+            now: 11.50
+        )
+        #expect(steadyHidden.action == .none)
+        #expect(steadyHidden.interactiveFrameChanged == false)
     }
 
     // MARK: - Bug #1: WindowEnumerator Fullscreen Video Window Priority
@@ -1285,5 +1660,124 @@ struct WindowOcclusionAndCoverageTests {
             displays: displays
         )
         #expect(picked4?.windowID == 4002)
+
+        // Case 5: Always-on-Top / PiP video window (`layer == floatingWindow`, >= 200x150) is capturable
+        // and classified as `.application`, while still ranking below fullscreen & normal `layer == 0` windows!
+        let floatingLayer = Int(CGWindowLevelForKey(.floatingWindow))
+        let pipVideo = WindowEnumerator.TargetWindowCandidate(
+            windowID: 5001,
+            layer: floatingLayer,
+            alpha: 1.0,
+            bounds: CGRect(x: 900, y: 500, width: 480, height: 270),
+            zOrder: 0
+        )
+        let tinyFloatingPalette = WindowEnumerator.TargetWindowCandidate(
+            windowID: 5002,
+            layer: floatingLayer,
+            alpha: 1.0,
+            bounds: CGRect(x: 100, y: 100, width: 120, height: 48),
+            zOrder: 0
+        )
+        #expect(WindowEnumerator.isSubstantialFloatingAppWindow(layer: floatingLayer, alpha: 1.0, bounds: pipVideo.bounds) == true)
+        #expect(WindowEnumerator.isSubstantialFloatingAppWindow(layer: floatingLayer, alpha: 1.0, bounds: tinyFloatingPalette.bounds) == false)
+        #expect(WindowEnumerator.classifyOwner(
+            pid: 9090,
+            bundleIdentifier: "com.colliderli.iina",
+            ownerName: "IINA",
+            layer: floatingLayer,
+            bounds: pipVideo.bounds,
+            displays: displays
+        ) == .application)
+        #expect(WindowEnumerator.classifyOwner(
+            pid: 9090,
+            bundleIdentifier: "com.colliderli.iina",
+            ownerName: "IINA",
+            layer: floatingLayer,
+            bounds: tinyFloatingPalette.bounds,
+            displays: displays
+        ) == .overlay)
+        // Normal layer-0 window still beats floating PiP when both exist
+        #expect(WindowEnumerator.selectBestTargetWindow(from: [pipVideo, mainContent], displays: displays)?.windowID == 4002)
+        // When ONLY the Float-on-Top / PiP window exists, it is cleanly selected!
+        #expect(WindowEnumerator.selectBestTargetWindow(from: [tinyFloatingPalette, pipVideo], displays: displays)?.windowID == 5001)
+    }
+
+    @Test("WindowEnumerator distinguishes MacBook Pro notch-inset native fullscreen video from maximized desktop Chrome and IINA/Wine legacy fullscreen")
+    func notchFullscreenAndLegacyFullscreenClassification() {
+        let displays = Self.dualDisplays
+        let notchBounds = CGRect(x: 0, y: 33, width: 1512, height: 949)
+        let fullBleedBounds = Self.primaryRetina.cgBounds
+
+        // 1. Native fullscreen Bilibili/Safari/Chrome/IINA below MacBook Pro notch (`AXFullScreen == true`):
+        //    BOTH native FS space (level 19) AND fullscreen video SR source (`true`)!
+        #expect(WindowEnumerator.resolveNativeFullscreenClassification(
+            axFullScreenAttribute: true,
+            windowLayer: 0,
+            bounds: notchBounds,
+            displays: displays
+        ) == true)
+        #expect(WindowEnumerator.resolveFullscreenVideoOrGameClassification(
+            axFullScreenAttribute: true,
+            windowLayer: 0,
+            bounds: notchBounds,
+            displays: displays
+        ) == true)
+
+        // 2. Maximized desktop Chrome webpage below notch (`(0, 33, 1512, 949)` with `AXFullScreen == false`):
+        //    Desktop space (level 98, above Menu Bar) AND NOT a fullscreen video source (`false` -> 1:1 sharp text)!
+        #expect(WindowEnumerator.resolveNativeFullscreenClassification(
+            axFullScreenAttribute: false,
+            windowLayer: 0,
+            bounds: notchBounds,
+            displays: displays
+        ) == false)
+        #expect(WindowEnumerator.resolveFullscreenVideoOrGameClassification(
+            axFullScreenAttribute: false,
+            windowLayer: 0,
+            bounds: notchBounds,
+            displays: displays
+        ) == false)
+
+        // 3. IINA/VLC/mpv Legacy Fullscreen or Wine borderless fullscreen on Desktop Space
+        //    (`(0, 0, 1512, 982)` with `AXFullScreen == false`):
+        //    NOT native FS space (stays level 98 on Desktop Space!), YES fullscreen video/game source (`true`)!
+        #expect(WindowEnumerator.resolveNativeFullscreenClassification(
+            axFullScreenAttribute: false,
+            windowLayer: 0,
+            bounds: fullBleedBounds,
+            displays: displays
+        ) == false)
+        #expect(WindowEnumerator.resolveFullscreenVideoOrGameClassification(
+            axFullScreenAttribute: false,
+            windowLayer: 0,
+            bounds: fullBleedBounds,
+            displays: displays
+        ) == true)
+        #expect(WindowEnumerator.resolveFullscreenVideoOrGameClassification(
+            axFullScreenAttribute: false,
+            windowLayer: 5,
+            bounds: fullBleedBounds,
+            displays: displays
+        ) == true)
+
+        // 4. AX unavailable (`nil`) fallback: exact full-bleed layer 0 -> true; notch desktop -> false
+        #expect(WindowEnumerator.resolveNativeFullscreenClassification(
+            axFullScreenAttribute: nil,
+            windowLayer: 0,
+            bounds: fullBleedBounds,
+            displays: displays
+        ) == true)
+        #expect(WindowEnumerator.resolveNativeFullscreenClassification(
+            axFullScreenAttribute: nil,
+            windowLayer: 5,
+            bounds: fullBleedBounds,
+            displays: displays
+        ) == false)
+        #expect(WindowEnumerator.resolveNativeFullscreenClassification(
+            axFullScreenAttribute: nil,
+            windowLayer: 0,
+            bounds: notchBounds,
+            displays: displays
+        ) == false)
     }
 }

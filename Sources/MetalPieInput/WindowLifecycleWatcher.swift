@@ -141,12 +141,29 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
         "UniversalControl"
     ]
 
+    /// Bundle identifier prefixes for macOS & third-party IME (Chinese/CJK input method) candidate windows
+    /// classified as `.system` so typing in a scaled app or 3D game NEVER triggers a false foreign-window overlap stop.
+    public static let imeBundleIdentifierPrefixes: [String] = [
+        "com.apple.inputmethod.",
+        "im.rime.",
+        "com.sogou.inputmethod",
+        "com.tencent.inputmethod",
+        "com.baidu.inputmethod"
+    ]
+
+    /// Minimum size for substantial always-on-top floating app windows (e.g. IINA/VLC/QuickTime "Float on Top").
+    public static let substantialFloatingMinimumSize = CGSize(width: 200.0, height: 150.0)
+
     public static let defaultPollIntervalMilliseconds: Int = 40 // 25 Hz
     public static let defaultMinimumWindowDimension: CGFloat = 64.0
     public static let defaultOverlapThresholdPoints: CGFloat = 8.0
     /// Grace window after starting/switching tracked window during which delayed activation bounce
     /// notifications belonging to MetalPie's own PID are ignored (preventing instant session dismissal!).
     public static let defaultActivationGraceSeconds: TimeInterval = 0.45
+    /// Off-screen grace duration while the tracked app is still frontmost so macOS's ~0.4–0.5s
+    /// Fullscreen Space enter/exit zoom animation never emits a false `.targetMinimized`.
+    public static let frontmostOffScreenGraceSeconds: TimeInterval = 0.45
+    public static let frontmostOffScreenGraceTicks: Int = 11
 
     private struct WatcherState {
         var isObserving: Bool = false
@@ -158,6 +175,8 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
         var activationGraceDeadlineUptime: TimeInterval = 0
         var autoRepositionState: AutoRepositionWaitState = .inactive
         var consecutiveMissingTicks: Int = 0
+        var consecutiveOffScreenTicks: Int = 0
+        var offScreenSinceUptime: TimeInterval? = nil
         var lastActiveWindowID: CGWindowID?
         var threeDGameMode: Bool = false
         var ignoredOverlayWindowIDs: Set<CGWindowID> = []
@@ -304,6 +323,8 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
             s.trackedHasFocus = false
             s.activationGraceDeadlineUptime = graceDeadline
             s.consecutiveMissingTicks = 0
+            s.consecutiveOffScreenTicks = 0
+            s.offScreenSinceUptime = nil
             s.hasReportedOverlapForCurrentTarget = false
             s.autoRepositionState = trackedWindowID.map { .tracking($0) } ?? .inactive
         }
@@ -338,6 +359,8 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
                 s.trackedHasFocus = false
                 s.activationGraceDeadlineUptime = graceDeadline
                 s.consecutiveMissingTicks = 0
+                s.consecutiveOffScreenTicks = 0
+                s.offScreenSinceUptime = nil
                 s.hasReportedOverlapForCurrentTarget = false
                 s.autoRepositionState = windowID.map { .tracking($0) } ?? .inactive
             }
@@ -365,6 +388,8 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
             s.trackedLastDisplayID = nil
             s.trackedHasFocus = false
             s.consecutiveMissingTicks = 0
+            s.consecutiveOffScreenTicks = 0
+            s.offScreenSinceUptime = nil
             s.hasReportedOverlapForCurrentTarget = false
             s.autoRepositionState = .inactive
             s.onEvent = nil
@@ -460,6 +485,68 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
         return activatedPID == ownPID && nowUptime < graceDeadlineUptime
     }
 
+    /// Pure grace-window helper deciding whether an off-screen tracked window should emit `.targetMinimized`
+    /// right now or wait during macOS's ~0.4–0.5s Fullscreen Space enter/exit zoom animation.
+    ///
+    /// - If Accessibility confirms `axMinimized == true` (genuinely minimized to Dock): emit immediately.
+    /// - If the tracked app is no longer frontmost (`frontmostPID != trackedPID`): emit immediately.
+    /// - While the tracked app is still frontmost (`frontmostPID == trackedPID`): require either
+    ///   `consecutiveOffScreenTicks >= graceTicks` (default 11) or `elapsedOffScreenSeconds >= graceSeconds` (default 0.45s).
+    public static func shouldEmitMinimizedForOffScreenWindow(
+        trackedPID: Int32,
+        frontmostPID: Int32?,
+        axMinimized: Bool?,
+        consecutiveOffScreenTicks: Int,
+        elapsedOffScreenSeconds: TimeInterval,
+        graceTicks: Int = WindowLifecycleWatcher.frontmostOffScreenGraceTicks,
+        graceSeconds: TimeInterval = WindowLifecycleWatcher.frontmostOffScreenGraceSeconds
+    ) -> Bool {
+        if axMinimized == true {
+            return true
+        }
+        guard frontmostPID == trackedPID else {
+            return true
+        }
+        return consecutiveOffScreenTicks >= max(1, graceTicks)
+            || elapsedOffScreenSeconds >= max(0.0, graceSeconds)
+    }
+
+    /// Queries `kAXMinimizedAttribute` on the matching `AXUIElement` window when Accessibility is granted.
+    /// Returns `nil` when AX is unavailable or the window cannot be matched.
+    private static func queryAXWindowMinimized(windowID: CGWindowID, pid: Int32) -> Bool? {
+        guard AXIsProcessTrusted() else { return nil }
+        typealias AXGetWindowFn = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let sym = dlsym(rtldDefault, "_AXUIElementGetWindow") else { return nil }
+        let getWindowID = unsafeBitCast(sym, to: AXGetWindowFn.self)
+
+        let appElem = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement]
+        else {
+            return nil
+        }
+
+        for axWin in axWindows {
+            var candidateID: CGWindowID = 0
+            if getWindowID(axWin, &candidateID) == .success && candidateID == windowID {
+                var minimizedRef: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(axWin, kAXMinimizedAttribute as CFString, &minimizedRef) == .success else {
+                    return nil
+                }
+                if let boolVal = minimizedRef as? Bool {
+                    return boolVal
+                }
+                if let numVal = minimizedRef as? NSNumber {
+                    return numVal.boolValue
+                }
+                return nil
+            }
+        }
+        return nil
+    }
+
     private static func raiseSpecificAXWindowIfPossible(windowID: CGWindowID, pid: Int32) {
         typealias AXGetWindowFn = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
         let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
@@ -522,7 +609,8 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
 
             let isNormalLayer = (snap.layer == 0)
             let isWineRaisedFullscreen = (snap.layer > 0) && isDisplayFillingWindow(snap.cgBounds, displays: displays)
-            guard isNormalLayer || isWineRaisedFullscreen else { continue }
+            let isSubstantialFloating = isSubstantialFloatingAppWindow(layer: snap.layer, bounds: snap.cgBounds)
+            guard isNormalLayer || isWineRaisedFullscreen || isSubstantialFloating else { continue }
 
             let scale = ScreenGeometry.bestDisplay(forCGRect: snap.cgBounds, in: displays)?.backingScaleFactor ?? 2.0
             results.append(WindowDescriptor(
@@ -600,6 +688,31 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
         if let normal = pidSnapshots.first(where: { $0.layer == 0 }) {
             return makeDescriptor(
                 from: normal,
+                displays: displays,
+                excludedBundleIDs: excludedBundleIDs,
+                ownPID: ownPID
+            )
+        }
+
+        // 4. Always-on-top fallback: topmost substantial floating app window (layer == floatingWindow [3], >= 200x150),
+        //    e.g. IINA/VLC/QuickTime "Float on Top", strictly excluding system & IME processes.
+        if let floating = pidSnapshots.first(where: { snap in
+            guard isSubstantialFloatingAppWindow(layer: snap.layer, bounds: snap.cgBounds) else {
+                return false
+            }
+            return classifyOwner(
+                pid: snap.pid,
+                ownerName: snap.ownerName,
+                bundleIdentifier: snap.bundleIdentifier,
+                layer: snap.layer,
+                bounds: snap.cgBounds,
+                displays: displays,
+                excludedBundleIDs: excludedBundleIDs,
+                ownPID: ownPID
+            ) == .application
+        }) {
+            return makeDescriptor(
+                from: floating,
                 displays: displays,
                 excludedBundleIDs: excludedBundleIDs,
                 ownPID: ownPID
@@ -773,14 +886,30 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
             if excludedBundleIDs.contains(where: { $0.caseInsensitiveCompare(bid) == .orderedSame }) {
                 return .system
             }
+            let lowerBid = bid.lowercased()
+            if imeBundleIdentifierPrefixes.contains(where: { lowerBid.hasPrefix($0) }) {
+                return .system
+            }
         }
         if systemOwnerNames.contains(ownerName) {
             return .system
         }
-        if layer != 0 && !isDisplayFillingWindow(bounds, displays: displays) {
+        if layer != 0
+            && !isDisplayFillingWindow(bounds, displays: displays)
+            && !isSubstantialFloatingAppWindow(layer: layer, bounds: bounds)
+        {
             return .overlay
         }
         return .application
+    }
+
+    /// Returns `true` when `layer` matches macOS's standard floating window level (`CGWindowLevelForKey(.floatingWindow)` == `3`)
+    /// and `bounds` is substantial (`>= 200×150`), supporting IINA/VLC/QuickTime "Float on Top" windows.
+    public static func isSubstantialFloatingAppWindow(layer: Int, bounds: CGRect) -> Bool {
+        let normalized = bounds.standardized
+        return layer == Int(CGWindowLevelForKey(.floatingWindow))
+            && normalized.width >= substantialFloatingMinimumSize.width
+            && normalized.height >= substantialFloatingMinimumSize.height
     }
 
     public static func isDisplayFillingWindow(_ bounds: CGRect, displays: [DisplayDescriptor]) -> Bool {
@@ -966,6 +1095,8 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
                             s.trackedLastDescriptor = desc
                             s.autoRepositionState = .tracking(trackedID)
                             s.consecutiveMissingTicks = 0
+                            s.consecutiveOffScreenTicks = 0
+                            s.offScreenSinceUptime = nil
                         }
                         if wasWaiting {
                             emit(.trackedWindowRestored(desc), detailed: .targetRestored(desc))
@@ -1038,6 +1169,33 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
         guard let trackedID = info.trackedID else { return }
         if let snap = Self.fetchSingleWindowSnapshot(windowID: trackedID) {
             if !snap.isOnScreen {
+                let nowUptime = ProcessInfo.processInfo.systemUptime
+                let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                let axMinimized = (frontPID == snap.pid)
+                    ? Self.queryAXWindowMinimized(windowID: trackedID, pid: snap.pid)
+                    : nil
+                let offScreenStats = state.withLockUnchecked { s -> (alreadyWaiting: Bool, ticks: Int, elapsed: TimeInterval) in
+                    if case .waitingForRestore = s.autoRepositionState {
+                        return (true, s.consecutiveOffScreenTicks, 0)
+                    }
+                    let since = s.offScreenSinceUptime ?? nowUptime
+                    s.offScreenSinceUptime = since
+                    s.consecutiveOffScreenTicks += 1
+                    return (false, s.consecutiveOffScreenTicks, max(0, nowUptime - since))
+                }
+                guard !offScreenStats.alreadyWaiting else { return }
+                guard Self.shouldEmitMinimizedForOffScreenWindow(
+                    trackedPID: snap.pid,
+                    frontmostPID: frontPID,
+                    axMinimized: axMinimized,
+                    consecutiveOffScreenTicks: offScreenStats.ticks,
+                    elapsedOffScreenSeconds: offScreenStats.elapsed
+                ) else {
+                    // Tracked app is still frontmost during macOS's ~0.45s Space zoom animation;
+                    // defer to the 25Hz poll loop rather than firing a false `.targetMinimized`!
+                    return
+                }
+
                 let alreadyWaiting = state.withLockUnchecked { s -> Bool in
                     if case .waitingForRestore = s.autoRepositionState { return true }
                     s.trackedHasFocus = false
@@ -1162,6 +1320,29 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
 
         if !raw.isOnScreen {
             if !wasWaiting {
+                let nowUptime = ProcessInfo.processInfo.systemUptime
+                let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                let axMinimized = (frontPID == raw.pid)
+                    ? Self.queryAXWindowMinimized(windowID: trackedID, pid: raw.pid)
+                    : nil
+                let offScreenStats = state.withLockUnchecked { s -> (ticks: Int, elapsed: TimeInterval) in
+                    let since = s.offScreenSinceUptime ?? nowUptime
+                    s.offScreenSinceUptime = since
+                    s.consecutiveOffScreenTicks += 1
+                    return (s.consecutiveOffScreenTicks, max(0, nowUptime - since))
+                }
+
+                guard Self.shouldEmitMinimizedForOffScreenWindow(
+                    trackedPID: raw.pid,
+                    frontmostPID: frontPID,
+                    axMinimized: axMinimized,
+                    consecutiveOffScreenTicks: offScreenStats.ticks,
+                    elapsedOffScreenSeconds: offScreenStats.elapsed
+                ) else {
+                    // Brief Fullscreen Space enter/exit animation blackout while target app stays frontmost.
+                    return
+                }
+
                 state.withLockUnchecked { s in
                     s.trackedHasFocus = false
                     s.autoRepositionState = .waitingForRestore(trackedID, since: Date())
@@ -1181,17 +1362,22 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
                 s.autoRepositionState = .tracking(trackedID)
                 s.trackedLastDescriptor = desc
                 s.trackedHasFocus = nowFocused
+                s.consecutiveOffScreenTicks = 0
+                s.offScreenSinceUptime = nil
             }
             emit(.trackedWindowRestored(desc), detailed: .targetRestored(desc))
             if nowFocused && !snapState.hadFocus {
                 emit(.trackedWindowFocusGained(desc), detailed: .targetGainedFocus(desc))
             }
-        } else if !snapState.hadFocus {
-            // Synchronize focus flag if target app completed cooperative activation right as observing started.
-            let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            if frontPID == raw.pid {
-                state.withLockUnchecked { s in
-                    s.trackedHasFocus = true
+        } else {
+            state.withLockUnchecked { s in
+                s.consecutiveOffScreenTicks = 0
+                s.offScreenSinceUptime = nil
+                if !s.trackedHasFocus {
+                    let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    if frontPID == raw.pid {
+                        s.trackedHasFocus = true
+                    }
                 }
             }
         }
@@ -1280,6 +1466,8 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
             s.trackedLastDisplayID = nil
             s.trackedHasFocus = false
             s.consecutiveMissingTicks = 0
+            s.consecutiveOffScreenTicks = 0
+            s.offScreenSinceUptime = nil
             s.hasReportedOverlapForCurrentTarget = false
             s.autoRepositionState = .inactive
             return true

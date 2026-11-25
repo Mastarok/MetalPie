@@ -2069,9 +2069,9 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         #expect(letterboxToolbar.contains(try #require(lbEnter.warpTarget)))
     }
 
-    // MARK: 13. Regression (Bug #2B): Windowed Mode Outside-Overlay Escape & Fullscreen Top Menu Bar Passthrough
+    // MARK: 13. Regression (Bug #2B): Windowed Mode Outside-Overlay Escape & Fullscreen Top-Edge Stability
 
-    @Test("Windowed mode escapes smoothly outside overlayRect to macOS Menu Bar/Desktop and re-enters cleanly; Fullscreen mode enters Menu Bar passthrough on upward top-edge push while 3D Game Mode stays strictly confined")
+    @Test("Windowed mode escapes smoothly outside overlayRect to macOS Menu Bar/Desktop and re-enters cleanly; Fullscreen mode keeps top edge cleanly in scaled mode without Menu Bar passthrough while 3D Game Mode stays strictly confined")
     func windowedOutsideOverlayAndFullscreenMenuBarPassthrough() throws {
         let sourceCG = CGRect(x: 120, y: 140, width: 680, height: 440)
         let windowedOverlayCG = CGRect(x: 246, y: 160, width: 1020, height: 660) // 1.5x windowed
@@ -2178,7 +2178,10 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         #expect(!controller.currentState.isVisible, "Escaping windowed overlay via controller API must hide scaled sprite!")
         #expect(controller.currentState.scaledCGPosition.y < windowedOverlayCG.minY)
 
-        // --- B. Fullscreen Mode Top Menu Bar Passthrough (Primary 37pt notch & External DELL Negative-CG-Y 25pt!) ---
+        // --- B. Fullscreen Mode Top Edge (Primary 37pt notch & External DELL Negative-CG-Y 25pt):
+        //        OverlayPanel covers macOS's top Menu Bar cleanly (level 98 > 24), so pushing upward at the
+        //        top edge in Fullscreen mode MUST stay cleanly in `.scaled` and NEVER spuriously trigger
+        //        `.menuBarPassthrough` (which previously fought MetalPie's top floating toolbar!).
         let fsOverlayCG = CGRect(x: 0, y: 0, width: 1512, height: 981)
         let fsMapping = PointerMapping(
             sourceRect: sourceCG,
@@ -2195,7 +2198,7 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         let topEdgeSrc = CGPoint(x: 400, y: fsMapping.confinementRect.minY)
         fsProc.reset(initialSourcePosition: topEdgeSrc, physicalLocation: CGPoint(x: 500, y: 300))
 
-        // Hovering near top inside scaled app (moving horizontally) MUST stay in `.scaled` (app tabs remain clickable!).
+        // Hovering near top inside scaled app (moving horizontally) stays in `.scaled`.
         let stayScaledRaw = fsProc.process(
             input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 510, y: 300), deltaX: 10, deltaY: 0, timestamp: 10.0),
             mapping: fsMapping
@@ -2204,63 +2207,55 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         #expect(stayScaled.interactionMode == .scaled)
         #expect(stayScaled.isScaledSpriteVisible)
 
-        // Pushing upward >= 6pt at top edge enters `.menuBarPassthrough` at `(scaledX, minY + 12)`!
-        let pushMenuRaw = fsProc.process(
-            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 510, y: 290), deltaX: 0, deltaY: -10, timestamp: 10.02),
-            mapping: fsMapping
-        )
-        let pushMenu = try #require(pushMenuRaw)
-        #expect(pushMenu.interactionMode == .menuBarPassthrough)
-        #expect(!pushMenu.isScaledSpriteVisible)
-        let menuEntry = try #require(pushMenu.warpTarget)
-        #expect(abs(menuEntry.y - 12.0) < 0.5, "Fullscreen menu-bar passthrough must warp to display.minY + 12")
+        // Repeated upward pushes against top edge in Fullscreen mode MUST remain in `.scaled` (never `.menuBarPassthrough`!).
+        var fsPhysY: CGFloat = 300.0
+        for step in 0..<6 {
+            fsPhysY -= 15.0
+            let pushUpRaw = fsProc.process(
+                input: CursorTapEventInput(
+                    type: .mouseMoved,
+                    location: CGPoint(x: 510, y: fsPhysY),
+                    deltaX: 0,
+                    deltaY: -15,
+                    timestamp: 10.02 + Double(step) * 0.01
+                ),
+                mapping: fsMapping
+            )
+            let pushUp = try #require(pushUpRaw)
+            #expect(pushUp.interactionMode == .scaled, "Fullscreen upward push must NOT trigger menuBarPassthrough (step \(step))!")
+            #expect(pushUp.isScaledSpriteVisible)
+            #expect(sourceCG.contains(pushUp.effectiveSourcePoint))
+        }
 
-        // Click Apple/App menu item at `(menuEntry.x, 12)` -> opens dropdown (`menuBarDropdownActive == true`)!
-        let mbDownRaw = fsProc.process(
-            input: CursorTapEventInput(type: .leftMouseDown, location: menuEntry, deltaX: 0, deltaY: 0, timestamp: 10.05),
-            mapping: fsMapping
+        // Also verify with `adjustCursorSpeed == false` in Fullscreen mode!
+        let fsRawMapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: fsOverlayCG,
+            overlayRect: fsOverlayCG,
+            displays: Self.triMonitorDisplays,
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: false),
+            threeDGameMode: false
         )
-        let mbDown = try #require(mbDownRaw)
-        #expect(mbDown.interactionMode == .menuBarPassthrough)
-        #expect(mbDown.rewrittenEventLocation == nil)
-        let mbUpRaw = fsProc.process(
-            input: CursorTapEventInput(type: .leftMouseUp, location: menuEntry, deltaX: 0, deltaY: 0, timestamp: 10.07),
-            mapping: fsMapping
+        var fsRawProc = CursorEventTapProcessor()
+        fsRawProc.isPresentationWindowed = false
+        fsRawProc.displayMenuBarHeights = [Self.primaryRetina.id: 37.0]
+        fsRawProc.reset(initialSourcePosition: topEdgeSrc, physicalLocation: topEdgeSrc)
+        let fsRawPushRaw = fsRawProc.process(
+            input: CursorTapEventInput(
+                type: .mouseMoved,
+                location: CGPoint(x: 400, y: fsRawMapping.confinementRect.minY - 24),
+                deltaX: 0,
+                deltaY: -24,
+                timestamp: 15.0
+            ),
+            mapping: fsRawMapping
         )
-        let mbUp = try #require(mbUpRaw)
-        #expect(mbUp.interactionMode == .menuBarPassthrough)
-        #expect(fsProc.menuBarDropdownActive, "Clicking inside menu bar must keep passthrough active while dropdown is open!")
+        let fsRawPush = try #require(fsRawPushRaw)
+        #expect(fsRawPush.interactionMode == .scaled, "Fullscreen upward push without speed compensation must NOT trigger menuBarPassthrough!")
+        #expect(fsRawPush.isScaledSpriteVisible)
 
-        // Move DOWN to `y = 180` inside the open dropdown menu -> MUST STAY in `.menuBarPassthrough` 1:1 untouched!
-        let browseDropdownRaw = fsProc.process(
-            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: menuEntry.x, y: 180), deltaX: 0, deltaY: 168, timestamp: 10.10),
-            mapping: fsMapping
-        )
-        let browseDropdown = try #require(browseDropdownRaw)
-        #expect(browseDropdown.interactionMode == .menuBarPassthrough)
-        #expect(browseDropdown.rewrittenEventLocation == nil)
-        #expect(!browseDropdown.isScaledSpriteVisible)
-
-        // Click dropdown item at `y = 180` -> releases dropdown on mouseUp, then next move below menu bar resumes `.scaled`!
-        _ = fsProc.process(
-            input: CursorTapEventInput(type: .leftMouseDown, location: CGPoint(x: menuEntry.x, y: 180), deltaX: 0, deltaY: 0, timestamp: 10.12),
-            mapping: fsMapping
-        )
-        _ = fsProc.process(
-            input: CursorTapEventInput(type: .leftMouseUp, location: CGPoint(x: menuEntry.x, y: 180), deltaX: 0, deltaY: 0, timestamp: 10.14),
-            mapping: fsMapping
-        )
-        #expect(!fsProc.menuBarDropdownActive)
-
-        let backToScaledRaw = fsProc.process(
-            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: menuEntry.x, y: 185), deltaX: 0, deltaY: 5, timestamp: 10.16),
-            mapping: fsMapping
-        )
-        let backToScaled = try #require(backToScaledRaw)
-        #expect(backToScaled.interactionMode == .scaled)
-        #expect(backToScaled.isScaledSpriteVisible)
-
-        // External DELL negative-CG-Y (`minY = -720`, menu bar height = 25pt): enters menu bar at `y = -720 + 12 = -708`!
+        // External DELL negative-CG-Y (`minY = -720`, menu bar height = 25pt): pushing up in Fullscreen ALSO stays in `.scaled`!
         let dellSource = CGRect(x: 1620, y: -620, width: 680, height: 440)
         let dellOverlay = CGRect(x: 1512, y: -720, width: 1280, height: 719)
         let dellMapping = PointerMapping(
@@ -2272,18 +2267,33 @@ struct CursorClickAlignmentAndMultiMonitorTests {
             settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
         )
         var dellProc = CursorEventTapProcessor()
+        dellProc.isPresentationWindowed = false
         dellProc.displayMenuBarHeights = [Self.externalDELLNegativeCGY.id: 25.0]
         dellProc.reset(
             initialSourcePosition: CGPoint(x: 1960, y: dellMapping.confinementRect.minY),
             physicalLocation: CGPoint(x: 2000, y: -400)
         )
         let dellPushRaw = dellProc.process(
-            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 2000, y: -410), deltaX: 0, deltaY: -10, timestamp: 20.0),
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 2000, y: -430), deltaX: 0, deltaY: -30, timestamp: 20.0),
             mapping: dellMapping
         )
         let dellPush = try #require(dellPushRaw)
-        #expect(dellPush.interactionMode == .menuBarPassthrough)
-        #expect(abs((try #require(dellPush.warpTarget)).y - (-708.0)) < 0.5)
+        #expect(dellPush.interactionMode == .scaled, "External display Fullscreen upward push must stay cleanly in `.scaled`!")
+        #expect(dellPush.isScaledSpriteVisible)
+        #expect(dellSource.contains(dellPush.effectiveSourcePoint))
+
+        // Exiting `.directChrome` upward into the top 37pt band in Fullscreen MUST return to `.scaled`, NOT `.menuBarPassthrough`!
+        let topToolbarCG = CGRect(x: 546, y: 38, width: 420, height: 42)
+        fsProc.interactiveChromeRects = [topToolbarCG]
+        fsProc.reset(initialSourcePosition: CGPoint(x: 756, y: 55), physicalLocation: CGPoint(x: 756, y: 55))
+        fsProc.interactionMode = .directChrome
+        let exitUpFromToolbarRaw = fsProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 756, y: 12), deltaX: 0, deltaY: -43, timestamp: 25.0),
+            mapping: fsMapping
+        )
+        let exitUpFromToolbar = try #require(exitUpFromToolbarRaw)
+        #expect(exitUpFromToolbar.interactionMode == .scaled, "Exiting toolbar upward in Fullscreen must transition to `.scaled`, never `.menuBarPassthrough`!")
+        #expect(exitUpFromToolbar.isScaledSpriteVisible)
 
         // --- C. 3D Game Mode MUST stay strictly confined (no windowed escape, no menu-bar passthrough!) ---
         let game3DMapping = PointerMapping(
@@ -2607,5 +2617,575 @@ struct CursorClickAlignmentAndMultiMonitorTests {
             displays: displays
         )
         #expect(notchReplacement?.windowID == 5003)
+    }
+
+    // MARK: 16. Regression: SystemCursorHider Refcount Accounting, Race Gate & Exit Restoration
+
+    @Test("SystemCursorHider tracks reassertHiddenIfDrifted depth with cooldown & cap, blocks late hides via setAllowedToHide(false), and guarantees hideDepth == 0 & processHideDepth == 0 on stop/forceRestore")
+    func systemCursorHiderDriftAccountingAndRaceFreeTeardown() throws {
+        SystemCursorHider.emergencyRestoreAll()
+        defer { SystemCursorHider.emergencyRestoreAll() }
+
+        let hider = SystemCursorHider()
+        defer { hider.forceRestore() }
+
+        #expect(hider.isAllowedToHide)
+        #expect(hider.hideDepth == 0)
+        #expect(SystemCursorHider.processHideDepth == 0)
+
+        // 1. Initial hide acquires depth = 1.
+        hider.hide()
+        #expect(hider.hideDepth == 1)
+        #expect(SystemCursorHider.processHideDepth == 1)
+
+        // 2. reassertHiddenIfDrifted() MUST increment BOTH hideDepth AND processHideDepth,
+        //    enforce the 0.25s cooldown, and cap at maxReassertHideDepth (16).
+        let reassert1 = hider.reassertHiddenIfDrifted(now: 100.0, assumedCursorVisibleForTesting: true)
+        #expect(reassert1)
+        #expect(hider.hideDepth == 2)
+        #expect(SystemCursorHider.processHideDepth == 2)
+
+        // Within 0.25s cooldown -> ignored!
+        let tooSoon = hider.reassertHiddenIfDrifted(now: 100.10, assumedCursorVisibleForTesting: true)
+        #expect(!tooSoon)
+        #expect(hider.hideDepth == 2)
+        #expect(SystemCursorHider.processHideDepth == 2)
+
+        // After >= 0.25s cooldown -> increments both depths accurately!
+        let reassert2 = hider.reassertHiddenIfDrifted(now: 100.25, assumedCursorVisibleForTesting: true)
+        #expect(reassert2)
+        #expect(hider.hideDepth == 3)
+        #expect(SystemCursorHider.processHideDepth == 3)
+
+        // Repeated drifted ticks cap strictly at maxReassertHideDepth (16).
+        var tickTime = 101.0
+        for _ in 0..<25 {
+            _ = hider.reassertHiddenIfDrifted(now: tickTime, assumedCursorVisibleForTesting: true)
+            tickTime += 0.30
+        }
+        #expect(hider.hideDepth == SystemCursorHider.maxReassertHideDepth)
+        #expect(SystemCursorHider.processHideDepth == SystemCursorHider.maxReassertHideDepth)
+
+        // 3. setAllowedToHide(false) atomically unwinds ALL 16 hide levels AND blocks all subsequent hides/reasserts!
+        hider.setAllowedToHide(false)
+        #expect(!hider.isAllowedToHide)
+        #expect(hider.hideDepth == 0)
+        #expect(SystemCursorHider.processHideDepth == 0)
+
+        hider.hide()
+        let lateReassert = hider.reassertHiddenIfDrifted(now: tickTime + 1.0, assumedCursorVisibleForTesting: true)
+        #expect(!lateReassert)
+        #expect(hider.hideDepth == 0, "hide() MUST be a strict no-op while allowedToHide == false")
+        #expect(SystemCursorHider.processHideDepth == 0, "processHideDepth MUST stay 0 while allowedToHide == false")
+
+        // 4. Concurrent race stress: a racing thread hammering hide()/reassertHiddenIfDrifted() can NEVER
+        //    leave depth > 0 after setAllowedToHide(false) completes!
+        hider.setAllowedToHide(true)
+        hider.hide()
+        let keepHammering = OSAllocatedUnfairLock(initialState: true)
+        let startedSem = DispatchSemaphore(value: 0)
+        let finishedSem = DispatchSemaphore(value: 0)
+
+        let racer = Thread {
+            startedSem.signal()
+            var t = 200.0
+            while keepHammering.withLock({ $0 }) {
+                hider.hide()
+                _ = hider.reassertHiddenIfDrifted(now: t, assumedCursorVisibleForTesting: true)
+                t += 0.30
+            }
+            finishedSem.signal()
+        }
+        racer.start()
+        _ = startedSem.wait(timeout: .now() + .seconds(2))
+        Thread.sleep(forTimeInterval: 0.01)
+
+        // Flip gate OFF while racing thread is actively hammering!
+        hider.setAllowedToHide(false)
+        #expect(hider.hideDepth == 0)
+        #expect(SystemCursorHider.processHideDepth == 0)
+
+        Thread.sleep(forTimeInterval: 0.015)
+        #expect(hider.hideDepth == 0, "Racing thread must NEVER increment hideDepth after setAllowedToHide(false)")
+        #expect(SystemCursorHider.processHideDepth == 0, "Racing thread must NEVER increment processHideDepth after setAllowedToHide(false)")
+
+        keepHammering.withLock { $0 = false }
+        _ = finishedSem.wait(timeout: .now() + .seconds(2))
+
+        // 5. CursorOverlayController.stop() and suspend() unwind drifted hide depth and lock gate to false!
+        let controller = CursorOverlayController(presentationMode: .externalCompositor)
+        defer { controller.stop() }
+        let sourceCG = CGRect(x: 120, y: 140, width: 680, height: 440)
+        let overlayCG = CGRect(x: 0, y: 0, width: 1512, height: 981)
+        controller.activateForEventTapTesting(
+            configuration: CursorMappingConfiguration(
+                sourceCGRect: sourceCG,
+                destinationCGRect: overlayCG,
+                overlayCGRect: overlayCG,
+                backingScaleFactor: 2.0,
+                settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
+            ),
+            displays: [Self.primaryRetina],
+            initialPointer: CGPoint(x: sourceCG.midX, y: sourceCG.midY)
+        )
+
+        // Simulate accumulated drift hide depth before suspend() and stop().
+        controller.cursorHiderForTesting.setAllowedToHide(true)
+        controller.cursorHiderForTesting.hide()
+        for i in 0..<6 {
+            _ = controller.cursorHiderForTesting.reassertHiddenIfDrifted(
+                now: 300.0 + Double(i) * 0.30,
+                assumedCursorVisibleForTesting: true
+            )
+        }
+        #expect(controller.cursorHiderForTesting.hideDepth == 7)
+        #expect(SystemCursorHider.processHideDepth == 7)
+
+        controller.suspend()
+        #expect(!controller.cursorHiderForTesting.isAllowedToHide)
+        #expect(controller.cursorHiderForTesting.hideDepth == 0)
+        #expect(SystemCursorHider.processHideDepth == 0)
+
+        // Late hide attempt during suspend must be blocked.
+        controller.cursorHiderForTesting.hide()
+        #expect(controller.cursorHiderForTesting.hideDepth == 0)
+        #expect(SystemCursorHider.processHideDepth == 0)
+
+        // Re-arm and verify stop() unwinds everything cleanly via forceRestore().
+        controller.cursorHiderForTesting.setAllowedToHide(true)
+        controller.cursorHiderForTesting.hide()
+        for i in 0..<10 {
+            _ = controller.cursorHiderForTesting.reassertHiddenIfDrifted(
+                now: 400.0 + Double(i) * 0.30,
+                assumedCursorVisibleForTesting: true
+            )
+        }
+        #expect(controller.cursorHiderForTesting.hideDepth == 11)
+        #expect(SystemCursorHider.processHideDepth == 11)
+
+        controller.stop()
+        #expect(!controller.cursorHiderForTesting.isAllowedToHide)
+        #expect(controller.cursorHiderForTesting.hideDepth == 0)
+        #expect(SystemCursorHider.processHideDepth == 0)
+
+        // RunGuardWatchdog.forceRestoreSystemCursor() also guarantees processHideDepth == 0.
+        hider.setAllowedToHide(true)
+        hider.hide()
+        #expect(SystemCursorHider.processHideDepth >= 1)
+        RunGuardWatchdog.forceRestoreSystemCursor()
+        #expect(SystemCursorHider.processHideDepth == 0)
+        hider.setAllowedToHide(false)
+    }
+
+    // MARK: 17. Regression: .directChrome 8pt Exit Hysteresis & Live scaledCGPosition Updates
+
+    @Test(".directChrome uses 0pt entry and 8pt exit hysteresis to eliminate toolbar edge flicker while updating scaledCGPosition on every move")
+    func directChromeExitHysteresisAndLiveScaledCursorPosition() throws {
+        let sourceCG = CGRect(x: 120, y: 140, width: 680, height: 440)
+        let overlayCG = CGRect(x: 0, y: 0, width: 1512, height: 981)
+        let toolbarCG = CGRect(x: 546, y: 42, width: 420, height: 42) // x: [546..966], y: [42..84]
+
+        let mapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: overlayCG,
+            overlayRect: overlayCG,
+            displays: [Self.primaryRetina],
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
+        )
+
+        var proc = CursorEventTapProcessor()
+        proc.isPresentationWindowed = false
+        proc.interactiveChromeRects = [toolbarCG]
+
+        // 1. Entry requires exact visible toolbar rect (`expansion: 0.0`): 5pt outside (`y = 89`) stays `.scaled`!
+        let outside5Start = CGPoint(x: 756, y: 110)
+        let startSrc = mapping.mapScaledToSource(outside5Start, clampToSource: true)
+        var phys = CGPoint(x: 500, y: 500)
+        proc.reset(initialSourcePosition: startSrc, physicalLocation: phys)
+
+        phys.y -= 21.0 // visual Y moves 110 -> 89 (5pt below toolbarCG.maxY = 84)
+        let approach5OutsideRaw = proc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: phys, deltaX: 0, deltaY: -21, timestamp: 1.0),
+            mapping: mapping
+        )
+        let approach5Outside = try #require(approach5OutsideRaw)
+        #expect(approach5Outside.interactionMode == .scaled, "Approaching 5pt outside toolbar must NOT prematurely enter directChrome!")
+        #expect(approach5Outside.isScaledSpriteVisible)
+
+        // Move 15pt further up -> visual Y = 74 (inside toolbarCG [42..84]) -> cleanly enters `.directChrome`!
+        phys.y -= 15.0
+        let enterToolbarRaw = proc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: phys, deltaX: 0, deltaY: -15, timestamp: 1.02),
+            mapping: mapping
+        )
+        let enterToolbar = try #require(enterToolbarRaw)
+        #expect(enterToolbar.interactionMode == .directChrome)
+        #expect(!enterToolbar.isScaledSpriteVisible)
+        let landedPt = try #require(enterToolbar.warpTarget)
+        #expect(toolbarCG.contains(landedPt))
+
+        // 2. Once inside `.directChrome`, moving 5pt outside ANY side (bottom, top, left, right) MUST stay in
+        //    `.directChrome` with ZERO ping-pong flicker AND update `scaledCGPosition == incoming` every move!
+        let fivePtOutsidePoints: [CGPoint] = [
+            CGPoint(x: 756, y: toolbarCG.maxY + 5.0), // 5pt below (y = 89)
+            CGPoint(x: 756, y: toolbarCG.minY - 5.0), // 5pt above (y = 37)
+            CGPoint(x: toolbarCG.minX - 5.0, y: 63),  // 5pt left  (x = 541)
+            CGPoint(x: toolbarCG.maxX + 5.0, y: 63),  // 5pt right (x = 971)
+            CGPoint(x: 756, y: toolbarCG.maxY + 7.5)  // 7.5pt below (still <= 8pt hysteresis!)
+        ]
+        var t = 1.05
+        var prev = landedPt
+        for pt in fivePtOutsidePoints {
+            let decRaw = proc.process(
+                input: CursorTapEventInput(
+                    type: .mouseMoved,
+                    location: pt,
+                    deltaX: Double(pt.x - prev.x),
+                    deltaY: Double(pt.y - prev.y),
+                    timestamp: t
+                ),
+                mapping: mapping
+            )
+            let dec = try #require(decRaw)
+            #expect(dec.interactionMode == .directChrome, "Point 5..7.5pt outside toolbar (\(pt)) must stay in directChrome via 8pt hysteresis!")
+            #expect(!dec.isScaledSpriteVisible)
+            #expect(dec.rewrittenEventLocation == nil)
+            #expect(dec.warpTarget == nil)
+            #expect(dec.scaledCGPosition == pt, "directChrome must update scaledCGPosition to incoming on every move!")
+            prev = pt
+            t += 0.01
+        }
+
+        // 3. Moving 12pt outside toolbar (`y = toolbarCG.maxY + 12 = 96`) cleanly exits back to `.scaled`!
+        let outside12Pt = CGPoint(x: 756, y: toolbarCG.maxY + 12.0)
+        let exitDecRaw = proc.process(
+            input: CursorTapEventInput(
+                type: .mouseMoved,
+                location: outside12Pt,
+                deltaX: Double(outside12Pt.x - prev.x),
+                deltaY: Double(outside12Pt.y - prev.y),
+                timestamp: t + 0.01
+            ),
+            mapping: mapping
+        )
+        let exitDec = try #require(exitDecRaw)
+        #expect(exitDec.interactionMode == .scaled, "Moving 12pt outside toolbar (> 8pt hysteresis) must transition cleanly back to `.scaled`!")
+        #expect(exitDec.isScaledSpriteVisible)
+
+        // 4. Verify live `CursorOverlayController` + `EventTapCallbackBox` keeps `currentState.scaledCGPosition`
+        //    in sync on every `.directChrome` move AND honors 8pt hysteresis across `updateInteractiveChromeRects`!
+        let controller = CursorOverlayController(presentationMode: .externalCompositor)
+        defer { controller.stop() }
+        controller.setPresentationIsWindowed(false)
+        controller.updateInteractiveChromeRects([toolbarCG])
+        let insideToolbarSrc = mapping.mapScaledToSource(CGPoint(x: 756, y: 63), clampToSource: true)
+        controller.activateForEventTapTesting(
+            configuration: CursorMappingConfiguration(
+                sourceCGRect: sourceCG,
+                destinationCGRect: overlayCG,
+                overlayCGRect: overlayCG,
+                backingScaleFactor: 2.0,
+                settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
+            ),
+            displays: [Self.primaryRetina],
+            initialPointer: insideToolbarSrc
+        )
+        let box = EventTapCallbackBox(controller: controller)
+        let dummyProxy = OpaquePointer(bitPattern: 0x1000)!
+
+        // Move inside toolbar -> enters `.directChrome`
+        let enterEv = try #require(CGEvent(
+            mouseEventSource: nil,
+            mouseType: .mouseMoved,
+            mouseCursorPosition: CGPoint(x: insideToolbarSrc.x + 1, y: insideToolbarSrc.y),
+            mouseButton: .left
+        ))
+        _ = box.invoke(proxy: dummyProxy, type: .mouseMoved, event: enterEv)
+        #expect(controller.currentInteractionModeForTesting == .directChrome)
+
+        // Move to 5pt below toolbar (`(760, 89)`) -> stays `.directChrome`, `scaledCGPosition` updates live!
+        let hoverBorderPt = CGPoint(x: 760, y: toolbarCG.maxY + 5.0)
+        let borderEv = try #require(CGEvent(
+            mouseEventSource: nil,
+            mouseType: .mouseMoved,
+            mouseCursorPosition: hoverBorderPt,
+            mouseButton: .left
+        ))
+        _ = box.invoke(proxy: dummyProxy, type: .mouseMoved, event: borderEv)
+        #expect(controller.currentInteractionModeForTesting == .directChrome)
+        #expect(abs(controller.currentState.scaledCGPosition.x - hoverBorderPt.x) < 0.5)
+        #expect(abs(controller.currentState.scaledCGPosition.y - hoverBorderPt.y) < 0.5)
+
+        // Refreshing chrome rects while hovering 5pt outside MUST NOT kick back to `.scaled`!
+        controller.updateInteractiveChromeRects([toolbarCG])
+        #expect(controller.currentInteractionModeForTesting == .directChrome)
+
+        // When toolbar genuinely hides (`[]`), controller cleanly transitions back to `.scaled`!
+        controller.updateInteractiveChromeRects([])
+        #expect(controller.currentInteractionModeForTesting == .scaled)
+    }
+
+    // MARK: 18. Regression (#103): FIFO Down -> Up Repost Ordering for Fast Trackpad Taps
+
+    @Test("Fast trackpad taps within 40ms of a reposted MouseDown also repost MouseUp in FIFO order per button while slower releases do not")
+    func fifoMouseDownUpRepostOrderingForFastTrackpadTaps() throws {
+        let sourceCG = CGRect(x: 120, y: 140, width: 680, height: 440)
+        let overlayCG = CGRect(x: 0, y: 0, width: 1512, height: 981)
+        let toolbarCG = CGRect(x: 546, y: 42, width: 420, height: 42)
+
+        let mapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: overlayCG,
+            overlayRect: overlayCG,
+            displays: [Self.primaryRetina],
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
+        )
+
+        // 1. Fast left-click tap (15ms Down -> Up) when physical cursor had drifted outside sourceCG:
+        //    Down warps + reposts via .cghidEventTap, and Up within 40ms MUST ALSO set shouldRepostAfterWarp
+        //    even after physical cursor already landed at targetPos!
+        var proc = CursorEventTapProcessor()
+        let virtualTarget = CGPoint(x: 420, y: 310)
+        let driftedPhys = CGPoint(x: 1180, y: 760)
+        proc.reset(initialSourcePosition: virtualTarget, physicalLocation: driftedPhys)
+
+        let fastDownRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: driftedPhys, deltaX: 0, deltaY: 0, timestamp: 10.000),
+            mapping: mapping
+        )
+        let fastDown = try #require(fastDownRaw)
+        #expect(fastDown.warpTarget == virtualTarget)
+        #expect(fastDown.shouldRepostAfterWarp, "Drifted leftMouseDown must repost via .cghidEventTap")
+
+        // Per-button isolation: an unrelated rightMouseUp 10ms later MUST NOT consume or trigger left's repost!
+        let unrelatedRightUpRaw = proc.process(
+            input: CursorTapEventInput(type: .rightMouseUp, location: virtualTarget, deltaX: 0, deltaY: 0, timestamp: 10.010),
+            mapping: mapping
+        )
+        let unrelatedRightUp = try #require(unrelatedRightUpRaw)
+        #expect(!unrelatedRightUp.shouldRepostAfterWarp, "rightMouseUp must NOT inherit leftMouseDown's FIFO repost flag")
+
+        // Matching leftMouseUp arrives 15ms later (<= 40ms) already at `virtualTarget` -> MUST repost to stay FIFO!
+        let fastUpRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: virtualTarget, deltaX: 0, deltaY: 0, timestamp: 10.015),
+            mapping: mapping
+        )
+        let fastUp = try #require(fastUpRaw)
+        #expect(fastUp.shouldRepostAfterWarp, "Fast trackpad tap leftMouseUp within 40ms of reposted leftMouseDown MUST repost in FIFO order!")
+        #expect(fastUp.rewrittenEventLocation == virtualTarget)
+
+        // 2. Slow click (80ms > 40ms): leftMouseUp does NOT need reposting.
+        proc.reset(initialSourcePosition: virtualTarget, physicalLocation: driftedPhys)
+        let slowDownRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: driftedPhys, deltaX: 0, deltaY: 0, timestamp: 20.000),
+            mapping: mapping
+        )
+        #expect(try #require(slowDownRaw).shouldRepostAfterWarp)
+        let slowUpRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: virtualTarget, deltaX: 0, deltaY: 0, timestamp: 20.080),
+            mapping: mapping
+        )
+        #expect(!(try #require(slowUpRaw).shouldRepostAfterWarp), "Release after 80ms (> 40ms) must not unnecessarily repost")
+
+        // 3. Fast right-click tap (12ms) also preserves FIFO Down -> Up repost ordering.
+        proc.reset(initialSourcePosition: virtualTarget, physicalLocation: driftedPhys)
+        let rDownRaw = proc.process(
+            input: CursorTapEventInput(type: .rightMouseDown, location: driftedPhys, deltaX: 0, deltaY: 0, timestamp: 30.000),
+            mapping: mapping
+        )
+        #expect(try #require(rDownRaw).shouldRepostAfterWarp)
+        let rUpRaw = proc.process(
+            input: CursorTapEventInput(type: .rightMouseUp, location: virtualTarget, deltaX: 0, deltaY: 0, timestamp: 30.012),
+            mapping: mapping
+        )
+        #expect(try #require(rUpRaw).shouldRepostAfterWarp, "Fast right-click tap within 40ms MUST repost rightMouseUp in FIFO order!")
+
+        // 4. Fast tap entering `.directChrome` (stationary click onto toolbar while hidden cursor was drifted):
+        //    Down warps + reposts onto toolbar, and fast Up 18ms later inside `.directChrome` ALSO reposts!
+        proc.interactiveChromeRects = [toolbarCG]
+        let toolbarVisual = CGPoint(x: toolbarCG.midX, y: toolbarCG.midY)
+        let toolbarSrc = mapping.mapScaledToSource(toolbarVisual, clampToSource: true)
+        proc.reset(initialSourcePosition: toolbarSrc, physicalLocation: CGPoint(x: 950, y: 750))
+        let chromeDownRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: CGPoint(x: 950, y: 750), deltaX: 0, deltaY: 0, timestamp: 40.000),
+            mapping: mapping
+        )
+        let chromeDown = try #require(chromeDownRaw)
+        #expect(chromeDown.interactionMode == .directChrome)
+        #expect(chromeDown.shouldRepostAfterWarp)
+        let chromeUpRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: toolbarVisual, deltaX: 0, deltaY: 0, timestamp: 40.018),
+            mapping: mapping
+        )
+        let chromeUp = try #require(chromeUpRaw)
+        #expect(chromeUp.interactionMode == .directChrome)
+        #expect(chromeUp.shouldRepostAfterWarp, "Fast tap release on chrome within 40ms of reposted entry Down MUST repost in FIFO order!")
+        #expect(chromeUp.rewrittenEventLocation == toolbarVisual)
+    }
+
+    // MARK: 19. Regression (#107): Chinese IME Exclusion, Fullscreen Space Transition Grace & Always-on-Top Video Windows
+
+    @Test("WindowLifecycleWatcher classifies Chinese IMEs as system, applies ~450ms/11-tick Space transition grace when frontmost, and supports substantial always-on-top floating video windows")
+    func windowLifecycleChineseIMESpaceGraceAndFloatingVideoWindows() throws {
+        let displays = [Self.primaryRetina]
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let gameBounds = CGRect(x: 100, y: 100, width: 1280, height: 720)
+        let gamePID: Int32 = 8001
+
+        // 1. Chinese IME candidate windows (Apple Pinyin/SCIM, Rime/Squirrel, Sogou, WeType/Tencent, Baidu)
+        //    MUST classify as `.system`, be excluded from capturable windows, and NEVER trigger 3D overlap!
+        let imeSnapshots: [RawWindowSnapshot] = [
+            RawWindowSnapshot(windowID: 8101, pid: 8101, ownerName: "SCIM", bundleIdentifier: "com.apple.inputmethod.SCIM", title: "Candidate", cgBounds: CGRect(x: 200, y: 200, width: 320, height: 220), layer: 3),
+            RawWindowSnapshot(windowID: 8102, pid: 8102, ownerName: "Squirrel", bundleIdentifier: "im.rime.inputmethod.Squirrel", title: "", cgBounds: CGRect(x: 220, y: 220, width: 300, height: 180), layer: 0),
+            RawWindowSnapshot(windowID: 8103, pid: 8103, ownerName: "SogouInput", bundleIdentifier: "com.sogou.inputmethod.sogou", title: "", cgBounds: CGRect(x: 240, y: 240, width: 340, height: 200), layer: 3),
+            RawWindowSnapshot(windowID: 8104, pid: 8104, ownerName: "WeType", bundleIdentifier: "com.tencent.inputmethod.wetype", title: "", cgBounds: CGRect(x: 260, y: 260, width: 310, height: 190), layer: 3),
+            RawWindowSnapshot(windowID: 8105, pid: 8105, ownerName: "BaiduIM", bundleIdentifier: "com.baidu.inputmethod.BaiduIM", title: "", cgBounds: CGRect(x: 280, y: 280, width: 300, height: 180), layer: 0)
+        ]
+
+        for ime in imeSnapshots {
+            let category = WindowLifecycleWatcher.classifyOwner(
+                pid: ime.pid,
+                ownerName: ime.ownerName,
+                bundleIdentifier: ime.bundleIdentifier,
+                layer: ime.layer,
+                bounds: ime.cgBounds,
+                displays: displays,
+                excludedBundleIDs: AppConfig.defaultAutoScaleExcludedBundleIDs,
+                ownPID: ownPID
+            )
+            #expect(category == .system, "IME '\(ime.bundleIdentifier ?? ime.ownerName)' MUST classify as .system!")
+        }
+
+        let capturableIMEs = WindowLifecycleWatcher.filterCapturableWindows(
+            from: imeSnapshots,
+            displays: displays,
+            ownPID: ownPID
+        )
+        #expect(capturableIMEs.isEmpty, "Chinese IME candidate windows must never be listed as capturable targets!")
+
+        let imeOverlap = WindowLifecycleWatcher.detectForeignWindowOverlap(
+            trackedBounds: gameBounds,
+            trackedPID: gamePID,
+            ownPID: ownPID,
+            displays: displays,
+            windowsAboveTarget: imeSnapshots
+        )
+        #expect(imeOverlap == nil, "Typing with Chinese IME candidate windows over a scaled app/3D game must NEVER trigger foreign overlap!")
+
+        // 2. Fullscreen Space Transition Grace (`shouldEmitMinimizedForOffScreenWindow`):
+        //    - While tracked PID is still frontmost and AX doesn't report minimized: ignore transient 1..10 ticks (< 0.45s)!
+        #expect(!WindowLifecycleWatcher.shouldEmitMinimizedForOffScreenWindow(
+            trackedPID: gamePID,
+            frontmostPID: gamePID,
+            axMinimized: false,
+            consecutiveOffScreenTicks: 8,
+            elapsedOffScreenSeconds: 0.32
+        ))
+        #expect(!WindowLifecycleWatcher.shouldEmitMinimizedForOffScreenWindow(
+            trackedPID: gamePID,
+            frontmostPID: gamePID,
+            axMinimized: nil,
+            consecutiveOffScreenTicks: 10,
+            elapsedOffScreenSeconds: 0.40
+        ))
+        //    - Reaching 11 ticks OR >= 0.45s elapsed -> emits cleanly!
+        #expect(WindowLifecycleWatcher.shouldEmitMinimizedForOffScreenWindow(
+            trackedPID: gamePID,
+            frontmostPID: gamePID,
+            axMinimized: nil,
+            consecutiveOffScreenTicks: 11,
+            elapsedOffScreenSeconds: 0.40
+        ))
+        #expect(WindowLifecycleWatcher.shouldEmitMinimizedForOffScreenWindow(
+            trackedPID: gamePID,
+            frontmostPID: gamePID,
+            axMinimized: false,
+            consecutiveOffScreenTicks: 5,
+            elapsedOffScreenSeconds: 0.46
+        ))
+        //    - Genuinely AX-minimized -> emits immediately on tick 1!
+        #expect(WindowLifecycleWatcher.shouldEmitMinimizedForOffScreenWindow(
+            trackedPID: gamePID,
+            frontmostPID: gamePID,
+            axMinimized: true,
+            consecutiveOffScreenTicks: 1,
+            elapsedOffScreenSeconds: 0.0
+        ))
+        //    - Another app became frontmost -> emits immediately on tick 1!
+        #expect(WindowLifecycleWatcher.shouldEmitMinimizedForOffScreenWindow(
+            trackedPID: gamePID,
+            frontmostPID: 9999,
+            axMinimized: nil,
+            consecutiveOffScreenTicks: 1,
+            elapsedOffScreenSeconds: 0.0
+        ))
+
+        // 3. Always-on-Top Video Windows (`layer == floatingWindow [3]`, `>= 200x150`):
+        let floatingLayer = Int(CGWindowLevelForKey(.floatingWindow))
+        let iinaPID: Int32 = 8200
+        let iinaFloatVideo = RawWindowSnapshot(
+            windowID: 8201,
+            pid: iinaPID,
+            ownerName: "IINA",
+            bundleIdentifier: "com.colliderli.iina",
+            title: "Anime.mkv (Float on Top)",
+            cgBounds: CGRect(x: 200, y: 150, width: 640, height: 360),
+            layer: floatingLayer
+        )
+        let iinaTinyPalette = RawWindowSnapshot(
+            windowID: 8202,
+            pid: iinaPID,
+            ownerName: "IINA",
+            bundleIdentifier: "com.colliderli.iina",
+            title: "Tiny Palette",
+            cgBounds: CGRect(x: 100, y: 100, width: 140, height: 90),
+            layer: floatingLayer
+        )
+        let highLayerOverlay = RawWindowSnapshot(
+            windowID: 8203,
+            pid: iinaPID,
+            ownerName: "IINA",
+            bundleIdentifier: "com.colliderli.iina",
+            title: "HUD Overlay",
+            cgBounds: CGRect(x: 300, y: 200, width: 320, height: 220),
+            layer: 25
+        )
+        let iinaNormalWin = RawWindowSnapshot(
+            windowID: 8204,
+            pid: iinaPID,
+            ownerName: "IINA",
+            bundleIdentifier: "com.colliderli.iina",
+            title: "Main Window",
+            cgBounds: CGRect(x: 150, y: 120, width: 800, height: 500),
+            layer: 0
+        )
+
+        // Substantial floating video (8201) IS capturable; tiny floating palette (8202) & layer-25 overlay (8203) are NOT!
+        let capturableFloating = WindowLifecycleWatcher.filterCapturableWindows(
+            from: [iinaTinyPalette, highLayerOverlay, iinaFloatVideo],
+            displays: displays,
+            ownPID: ownPID
+        )
+        #expect(capturableFloating.map(\.windowID) == [8201], "Substantial floating video window (layer 3, >=200x150) must be capturable!")
+
+        // selectFrontmostWindow falls back to substantial floating video when no fullscreen or layer-0 window exists!
+        let pickedFloatFallback = WindowLifecycleWatcher.selectFrontmostWindow(
+            forPID: iinaPID,
+            from: [iinaTinyPalette, highLayerOverlay, iinaFloatVideo],
+            displays: displays,
+            ownPID: ownPID
+        )
+        #expect(pickedFloatFallback?.windowID == 8201, "selectFrontmostWindow must fall back to substantial floating video window!")
+
+        // When a normal layer-0 window also exists, selectFrontmostWindow still prefers layer-0 over floating fallback!
+        let pickedNormalFirst = WindowLifecycleWatcher.selectFrontmostWindow(
+            forPID: iinaPID,
+            from: [iinaFloatVideo, iinaNormalWin],
+            displays: displays,
+            ownPID: ownPID
+        )
+        #expect(pickedNormalFirst?.windowID == 8204, "selectFrontmostWindow must still prefer layer-0 window ahead of floating fallback!")
     }
 }

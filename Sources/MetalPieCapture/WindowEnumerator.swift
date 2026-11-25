@@ -1,5 +1,7 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
 import MetalPieCore
 import ScreenCaptureKit
@@ -19,6 +21,9 @@ import os
 public enum WindowEnumerator: Sendable {
     /// Minimum logical point width/height required for a window to be considered capturable.
     public static let minimumWindowDimension: CGFloat = 64.0
+
+    /// Minimum logical point size required for always-on-top / floating PiP video windows (`layer == floatingWindow`).
+    public static let minimumFloatingVideoDimension = CGSize(width: 200.0, height: 150.0)
 
     /// Bundle identifiers permanently classified as macOS system processes / excluded from capture.
     public static let systemBundleIdentifiers: Set<String> = [
@@ -450,6 +455,14 @@ public enum WindowEnumerator: Sendable {
         if let topNormal = normalCandidates.min(by: { $0.zOrder < $1.zOrder }) {
             return topNormal
         }
+
+        // 3. Fallback: substantial floating / always-on-top / PiP video windows (`layer == floatingWindow`, >= 200x150).
+        let floatingVideoCandidates = visible.filter {
+            isSubstantialFloatingAppWindow(layer: $0.layer, alpha: $0.alpha, bounds: $0.bounds)
+        }
+        if let topFloating = floatingVideoCandidates.min(by: { $0.zOrder < $1.zOrder }) {
+            return topFloating
+        }
         return nil
     }
 
@@ -560,8 +573,71 @@ public enum WindowEnumerator: Sendable {
         return expanded.contains(displayBounds.standardized)
     }
 
-    /// Heuristic detection for whether a window is occupying a native macOS Full-Screen Space.
-    /// When `true`, `OverlayWindowController` switches to level 19 + `.accessory` activation policy.
+    /// Returns `true` when a floating-level window (`layer == floatingWindow` = 3, e.g. IINA/VLC/QuickTime
+    /// "Float on Top" or browser Picture-in-Picture) is substantial enough (`>= 200×150`) to capture.
+    public static func isSubstantialFloatingAppWindow(
+        layer: Int,
+        alpha: Double,
+        bounds: CGRect
+    ) -> Bool {
+        let floatingLayer = Int(CGWindowLevelForKey(.floatingWindow))
+        let normalized = bounds.standardized
+        return layer == floatingLayer
+            && alpha > 0.01
+            && normalized.width >= minimumFloatingVideoDimension.width
+            && normalized.height >= minimumFloatingVideoDimension.height
+    }
+
+    /// Pure, unit-testable decision rule for `isLikelyNativeFullscreenWindow(windowID:bounds:displays:)`.
+    /// When `axFullScreenAttribute` is known (`true`/`false`), it is authoritative — distinguishing
+    /// MacBook Pro notch-inset native fullscreen video (`(0, 33, 1512, 949)` with `AXFullScreen == true`)
+    /// from maximized desktop browser windows (`(0, 33, 1512, 949)` with `AXFullScreen == false`).
+    public static func resolveNativeFullscreenClassification(
+        axFullScreenAttribute: Bool?,
+        windowLayer: Int?,
+        bounds: CGRect,
+        displays: [DisplayDescriptor]
+    ) -> Bool {
+        if let axFullScreen = axFullScreenAttribute {
+            return axFullScreen
+        }
+        guard let display = ScreenGeometry.bestDisplay(forCGRect: bounds, in: displays) else {
+            return false
+        }
+        guard boundsCoversDisplay(bounds, displayBounds: display.cgBounds, tolerance: 2.0) else {
+            return false
+        }
+        return (windowLayer ?? 0) == 0
+    }
+
+    /// Pure, unit-testable decision rule for `isFullscreenVideoOrGameWindow(windowID:bounds:displays:)`.
+    /// Returns `true` for EITHER native macOS Full-Screen Space (`AXFullScreen == true`, including
+    /// below a MacBook Pro notch) OR exact full-bleed `boundsCoversDisplay(tolerance: 2.0)` windows
+    /// on Desktop Space (e.g. IINA/VLC/mpv Legacy Fullscreen and Wine/CrossOver borderless games).
+    public static func resolveFullscreenVideoOrGameClassification(
+        axFullScreenAttribute: Bool?,
+        windowLayer: Int?,
+        bounds: CGRect,
+        displays: [DisplayDescriptor]
+    ) -> Bool {
+        if axFullScreenAttribute == true {
+            return true
+        }
+        guard let display = ScreenGeometry.bestDisplay(forCGRect: bounds, in: displays) else {
+            return false
+        }
+        guard boundsCoversDisplay(bounds, displayBounds: display.cgBounds, tolerance: 2.0) else {
+            return false
+        }
+        let maxAllowedLayer = Int(CGWindowLevelForKey(.screenSaverWindow))
+        let layer = windowLayer ?? 0
+        return layer >= 0 && layer < maxAllowedLayer
+    }
+
+    /// Detects whether a window occupies a native macOS Full-Screen Space.
+    /// Uses AX `"AXFullScreen"` when Accessibility is trusted (handling MacBook Pro notch-inset
+    /// `(0, 33, 1512, 949)` native fullscreen cleanly without misclassifying maximized desktop windows),
+    /// falling back to exact `boundsCoversDisplay(tolerance: 2.0)` + `layer == 0` when AX is unavailable.
     public static func isLikelyNativeFullscreenWindow(
         windowID: CGWindowID,
         bounds: CGRect,
@@ -570,19 +646,105 @@ public enum WindowEnumerator: Sendable {
         guard let display = ScreenGeometry.bestDisplay(forCGRect: bounds, in: displays) else {
             return false
         }
-        guard boundsCoversDisplay(bounds, displayBounds: display.cgBounds, tolerance: 2.0) else {
+        let isFullBleed = boundsCoversDisplay(bounds, displayBounds: display.cgBounds, tolerance: 2.0)
+        let isNotchCandidate = isFullBleed || isNotchInsetFullscreenBounds(bounds, displays: [display])
+        guard isNotchCandidate else {
             return false
         }
-        // Native macOS fullscreen windows live at layer 0 on their own Space while matching
-        // exact display bounds (unlike Wine raised-layer windows which sit at layer > 0).
-        let options: CGWindowListOption = [.optionIncludingWindow]
-        if let list = CGWindowListCopyWindowInfo(options, windowID) as? [[String: Any]],
-           let first = list.first,
-           let layer = first[kCGWindowLayer as String] as? Int
-        {
-            return layer == 0
+
+        let (pid, layer) = lookupCGWindowPIDAndLayer(windowID: windowID)
+        let axFullScreen = pid.flatMap { queryAXFullScreenAttribute(windowID: windowID, pid: $0) }
+        return resolveNativeFullscreenClassification(
+            axFullScreenAttribute: axFullScreen,
+            windowLayer: layer,
+            bounds: bounds,
+            displays: displays
+        )
+    }
+
+    /// Returns `true` when `windowID` is EITHER a native macOS Full-Screen Space window
+    /// (`AXFullScreen == true`, including MacBook Pro notch-inset fullscreen video) OR an exact
+    /// full-bleed Desktop Space fullscreen video/game window (IINA/VLC/mpv Legacy Fullscreen,
+    /// Wine/CrossOver borderless games). Returns `false` for normal maximized desktop browsers.
+    public static func isFullscreenVideoOrGameWindow(
+        windowID: CGWindowID,
+        bounds: CGRect,
+        displays: [DisplayDescriptor]
+    ) -> Bool {
+        guard let display = ScreenGeometry.bestDisplay(forCGRect: bounds, in: displays) else {
+            return false
         }
-        return true
+        let isFullBleed = boundsCoversDisplay(bounds, displayBounds: display.cgBounds, tolerance: 2.0)
+        let isNotchCandidate = isFullBleed || isNotchInsetFullscreenBounds(bounds, displays: [display])
+        guard isNotchCandidate else {
+            return false
+        }
+
+        let (pid, layer) = lookupCGWindowPIDAndLayer(windowID: windowID)
+        let axFullScreen = pid.flatMap { queryAXFullScreenAttribute(windowID: windowID, pid: $0) }
+        return resolveFullscreenVideoOrGameClassification(
+            axFullScreenAttribute: axFullScreen,
+            windowLayer: layer,
+            bounds: bounds,
+            displays: displays
+        )
+    }
+
+    private static func lookupCGWindowPIDAndLayer(windowID: CGWindowID) -> (pid: Int32?, layer: Int?) {
+        let options: CGWindowListOption = [.optionIncludingWindow]
+        guard let list = CGWindowListCopyWindowInfo(options, windowID) as? [[String: Any]],
+              let first = list.first
+        else {
+            return (nil, nil)
+        }
+        let pid = (first[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+        let layer = (first[kCGWindowLayer as String] as? NSNumber)?.intValue
+        return (pid, layer)
+    }
+
+    private static func queryAXFullScreenAttribute(windowID: CGWindowID, pid: Int32) -> Bool? {
+        guard AXIsProcessTrusted(),
+              pid > 0,
+              pid != ProcessInfo.processInfo.processIdentifier
+        else {
+            return nil
+        }
+
+        typealias AXGetWindowFn = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let sym = dlsym(rtldDefault, "_AXUIElementGetWindow") else {
+            return nil
+        }
+        let getWindowID = unsafeBitCast(sym, to: AXGetWindowFn.self)
+
+        let appElem = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElem, 0.15)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement]
+        else {
+            return nil
+        }
+
+        for axWin in axWindows {
+            var candidateID: CGWindowID = 0
+            if getWindowID(axWin, &candidateID) == .success && candidateID == windowID {
+                var fsRef: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(axWin, "AXFullScreen" as CFString, &fsRef) == .success,
+                      let fsRef
+                else {
+                    return nil
+                }
+                if let boolVal = fsRef as? Bool {
+                    return boolVal
+                }
+                if let numVal = fsRef as? NSNumber {
+                    return numVal.boolValue
+                }
+                return nil
+            }
+        }
+        return nil
     }
 
     /// Classifies a window owner against MetalPie's own PID/bundle and macOS system blacklists.
@@ -624,7 +786,10 @@ public enum WindowEnumerator: Sendable {
         if layer < 0 {
             return .system
         }
-        if layer > 0 && !isRaisedFullscreenWindow(layer: layer, alpha: 1.0, bounds: bounds, displays: displays) {
+        if layer > 0
+            && !isRaisedFullscreenWindow(layer: layer, alpha: 1.0, bounds: bounds, displays: displays)
+            && !isSubstantialFloatingAppWindow(layer: layer, alpha: 1.0, bounds: bounds)
+        {
             return .overlay
         }
 
@@ -847,13 +1012,18 @@ public enum WindowEnumerator: Sendable {
                 continue
             }
 
-            // Accept layer == 0 OR Wine/CrossOver raised-layer fullscreen window.
+            // Accept layer == 0, Wine/CrossOver raised-layer fullscreen, or substantial floating/PiP video window.
             let isAllowedLayer = (cg.layer == 0)
                 || isRaisedFullscreenWindow(
                     layer: cg.layer,
                     alpha: cg.alpha,
                     bounds: bounds,
                     displays: displays
+                )
+                || isSubstantialFloatingAppWindow(
+                    layer: cg.layer,
+                    alpha: cg.alpha,
+                    bounds: bounds
                 )
             guard isAllowedLayer else { continue }
 
@@ -940,6 +1110,11 @@ public enum WindowEnumerator: Sendable {
                         alpha: 1.0,
                         bounds: bounds,
                         displays: displays
+                    )
+                    || isSubstantialFloatingAppWindow(
+                        layer: layer,
+                        alpha: 1.0,
+                        bounds: bounds
                     )
                 guard isAllowedLayer else { continue }
 

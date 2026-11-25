@@ -1,5 +1,7 @@
 import CoreGraphics
+import CoreVideo
 import Foundation
+import IOSurface
 import Metal
 import MetalPieCore
 import MetalPieShaders
@@ -307,12 +309,16 @@ struct CrashAndFullscreenVideoTests {
         ]
 
         // 2a. Verify `.auto`, `.p720`, `.p1080` (with AND without `demagnifyMode = .bilinear` active!)
-        let configs: [(label: String, inputMode: FullscreenVideoInputMode, demag: DemagnifyMode, expectedInput: PixelSize)] = [
-            ("auto+none", .auto, .none, PixelSize(width: 1512, height: 982)),
-            ("auto+bilinear_coalesced", .auto, .bilinear, PixelSize(width: 1512, height: 982)),
-            ("p720+bilinear", .p720, .bilinear, PixelSize(width: 1109, height: 720)),
-            ("p1080+bilinear", .p1080, .bilinear, PixelSize(width: 1663, height: 1080)),
-            ("native+bilinear", .native, .bilinear, PixelSize(width: 1512, height: 982))
+        // for true fullscreen video (`isNativeFullscreenSource = true`), AND verify normal desktop Retina
+        // webpages (`isNativeFullscreenSource = false`, `demagnifyMode = .none`, `.auto`) stay 1:1 native!
+        let configs: [(label: String, inputMode: FullscreenVideoInputMode, demag: DemagnifyMode, isNativeFS: Bool, expectedInput: PixelSize)] = [
+            ("nativeFS_auto+none", .auto, .none, true, PixelSize(width: 1512, height: 982)),
+            ("desktopWebpage_auto+none_sharp1to1", .auto, .none, false, PixelSize(width: 3024, height: 1964)),
+            ("auto+bilinear_coalesced", .auto, .bilinear, true, PixelSize(width: 1512, height: 982)),
+            ("auto+bilinear_nonFS_coalesced", .auto, .bilinear, false, PixelSize(width: 1512, height: 982)),
+            ("p720+bilinear", .p720, .bilinear, true, PixelSize(width: 1109, height: 720)),
+            ("p1080+bilinear", .p1080, .bilinear, false, PixelSize(width: 1663, height: 1080)),
+            ("native+bilinear", .native, .bilinear, true, PixelSize(width: 1512, height: 982))
         ]
 
         for cfg in configs {
@@ -322,12 +328,16 @@ struct CrashAndFullscreenVideoTests {
                 targetPixelSize: targetSize,
                 presentationMode: .fullscreen,
                 fullscreenVideoInput: cfg.inputMode,
-                demagnifyActive: renderer.isDemagnifyActive
+                demagnifyActive: renderer.isDemagnifyActive,
+                isNativeFullscreenSource: cfg.isNativeFS
             )
             #expect(
                 resolved.effectiveSize == cfg.expectedInput,
                 "\(cfg.label): expected effective input \(cfg.expectedInput), got \(resolved.effectiveSize)"
             )
+            if !cfg.isNativeFS && cfg.inputMode == .auto && cfg.demag == .none {
+                #expect(resolved.videoPreDownscaleSize == nil, "Normal Retina desktop webpage must NOT pre-downscale")
+            }
             renderer.fullscreenVideoPreDownscaleSize = resolved.videoPreDownscaleSize
 
             for (modeName, mode) in modesToTest {
@@ -378,7 +388,8 @@ struct CrashAndFullscreenVideoTests {
             targetPixelSize: targetSize,
             presentationMode: .fullscreen,
             fullscreenVideoInput: .auto,
-            demagnifyActive: true
+            demagnifyActive: true,
+            isNativeFullscreenSource: true
         )
         renderer.fullscreenVideoPreDownscaleSize = autoResolved.videoPreDownscaleSize
         let animeLayout = ScalingLayoutCalculator.calculate(
@@ -453,6 +464,233 @@ struct CrashAndFullscreenVideoTests {
         #expect(abs(Double(rawCroppedRect.y) / Double(rawSize.height) - Double(scaledCroppedRect.y) / 982.0) < 0.002)
         #expect(abs(Double(rawCroppedRect.width) / Double(rawSize.width) - Double(scaledCroppedRect.width) / 1512.0) < 0.002)
         #expect(abs(Double(rawCroppedRect.height) / Double(rawSize.height) - Double(scaledCroppedRect.height) / 982.0) < 0.002)
+    }
+
+    // MARK: - 2b. Padded SCStream IOSurface (3024x1898 with active contentRect 2705x1764) -> Zero Right Black Strip!
+
+    @Test("Padded 3024x1898 IOSurface with active contentRect (0,0,2705,1764) crops black padding cleanly and fills all 4 quadrants of 3024x1964")
+    func paddedIOSurfaceContentRectCropsBlackStripOnRealGPU() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        let renderer = try EffectChainRenderer(device: device)
+        defer {
+            renderer.sourceContentPixelRect = nil
+            renderer.fullscreenVideoPreDownscaleSize = nil
+            renderer.demagnifyMode = .none
+            renderer.reset()
+        }
+
+        let surfaceW = 3024
+        let surfaceH = 1898
+        let activeW = 2705
+        let activeH = 1764
+        let targetSize = PixelSize(width: 3024, height: 1964)
+        let targetCGRect = CGRect(x: 0, y: 0, width: 1512, height: 982)
+
+        // Build a real 3024x1898 BGRA8 texture where active (0,0,2705,1764) is vivid 4-quadrant video
+        // and x = 2705..<3024 plus y = 1764..<1898 are solid pure black (exact Bilibili SCStream padding!).
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: surfaceW,
+            height: surfaceH,
+            mipmapped: false
+        )
+        desc.usage = [.shaderRead]
+        desc.storageMode = .shared
+        let paddedTex = try #require(device.makeTexture(descriptor: desc))
+        var bytes = [UInt8](repeating: 0, count: surfaceW * surfaceH * 4)
+        let halfW = activeW / 2
+        let halfH = activeH / 2
+        for y in 0..<surfaceH {
+            let rowOff = y * surfaceW * 4
+            for x in 0..<surfaceW {
+                let idx = rowOff + x * 4
+                if x >= activeW || y >= activeH {
+                    // Solid black SCK padding bar on right (10.55%) & bottom!
+                    bytes[idx + 0] = 0
+                    bytes[idx + 1] = 0
+                    bytes[idx + 2] = 0
+                    bytes[idx + 3] = 255
+                    continue
+                }
+                let bottom = y >= halfH
+                let right = x >= halfW
+                let (r, g, b): (UInt8, UInt8, UInt8)
+                switch (bottom, right) {
+                case (false, false): (r, g, b) = (235, 30, 30)   // Red
+                case (false, true):  (r, g, b) = (30, 235, 30)   // Green
+                case (true, false):  (r, g, b) = (30, 55, 240)   // Blue
+                case (true, true):   (r, g, b) = (242, 232, 30)  // Yellow
+                }
+                bytes[idx + 0] = b
+                bytes[idx + 1] = g
+                bytes[idx + 2] = r
+                bytes[idx + 3] = 255
+            }
+        }
+        paddedTex.replace(
+            region: MTLRegionMake2D(0, 0, surfaceW, surfaceH),
+            mipmapLevel: 0,
+            withBytes: bytes,
+            bytesPerRow: surfaceW * 4
+        )
+
+        // Convert SCStreamFrameInfo.contentRect (points @ 2x) -> pixel sub-rect
+        let pixelContentRect = ScalingLayoutCalculator.convertSCKContentRectToPixels(
+            pointRect: CGRect(x: 0, y: 0, width: Double(activeW) / 2.0, height: Double(activeH) / 2.0),
+            scaleFactor: 2.0,
+            textureSize: PixelSize(width: surfaceW, height: surfaceH)
+        )
+        let subRect = try #require(
+            ScalingLayoutCalculator.activeContentSubRect(
+                contentPixelRect: pixelContentRect,
+                textureSize: PixelSize(width: surfaceW, height: surfaceH)
+            )
+        )
+        #expect(subRect == PixelRect(x: 0, y: 0, width: activeW, height: activeH))
+
+        let dstTex = try Self.makeSharedOutputTexture(device: device, width: targetSize.width, height: targetSize.height)
+        let anime4kModeA = try #require(ScalingMode.builtInPresets.first { $0.id == ScalingMode.anime4kModeAID })
+        let metalFXMode = try #require(ScalingMode.builtInPresets.first { $0.id == ScalingMode.metalFXSpatialID })
+        let fsr1Mode = try #require(ScalingMode.builtInPresets.first { $0.id == ScalingMode.fsr1ID })
+
+        for (label, mode) in [("Anime4K Mode A", anime4kModeA), ("MetalFX", metalFXMode), ("FSR 1.0", fsr1Mode)] {
+            let resolved = ScalingLayoutCalculator.resolveEffectiveSourceSize(
+                rawSourceSize: subRect.size,
+                targetPixelSize: targetSize,
+                presentationMode: .fullscreen,
+                fullscreenVideoInput: .auto,
+                demagnifyActive: false,
+                isNativeFullscreenSource: true
+            )
+            #expect(resolved.effectiveSize == PixelSize(width: activeW / 2, height: activeH / 2))
+
+            renderer.sourceContentPixelRect = subRect
+            renderer.fullscreenVideoPreDownscaleSize = resolved.videoPreDownscaleSize
+
+            let layout = ScalingLayoutCalculator.calculate(
+                sourcePixelSize: resolved.effectiveSize,
+                targetPixelSize: targetSize,
+                targetCGRect: targetCGRect,
+                backingScaleFactor: 2.0,
+                crop: .zero,
+                effects: mode.effects,
+                presentationMode: .fullscreen,
+                alignment: .center
+            )
+            // Verify layout spans ~100% of width (zero 10.55% right black bar!) and keeps 1:1 croppedSourceRect for PointerMapping.
+            #expect(layout.visibleContentPixelRect.width >= 3008, "\(label): expected near-full width, got \(layout.visibleContentPixelRect.width)")
+            #expect(layout.visibleContentPixelRect.height == 1964)
+            #expect(layout.croppedSourceRect.width == layout.sourcePixelSize.width)
+            #expect(layout.croppedSourceRect.height == layout.sourcePixelSize.height)
+
+            let cb = try #require(queue.makeCommandBuffer())
+            _ = try renderer.encode(
+                scalingMode: mode,
+                context: EffectRenderContext(
+                    device: device,
+                    commandBuffer: cb,
+                    sourceTexture: paddedTex,
+                    destinationTexture: dstTex,
+                    layout: layout,
+                    duplicateFrameMode: .never
+                )
+            )
+            cb.commit()
+            cb.waitUntilCompleted()
+            #expect(cb.error == nil)
+
+            Self.verifyAllFourQuadrantsFilled(outputTexture: dstTex, label: "PaddedContentRect/\(label)")
+
+            // Explicitly probe the exact right-hand strip region (x = 95%..99% of 3024px) where the old
+            // Bilibili screenshot showed a solid black bar (`x = 89.45%..100%`) -> MUST be vivid Green / Yellow!
+            let farRightTop = Self.sampleBGRA8(texture: dstTex, x: 2980, y: 400)
+            let farRightBottom = Self.sampleBGRA8(texture: dstTex, x: 2980, y: 1500)
+            #expect(farRightTop.g > 0.65 && farRightTop.r < 0.35, "\(label): far-right top must be green (zero black strip!), got \(farRightTop)")
+            #expect(farRightBottom.r > 0.65 && farRightBottom.g > 0.65 && farRightBottom.b < 0.35, "\(label): far-right bottom must be yellow (zero black strip!), got \(farRightBottom)")
+        }
+    }
+
+    // MARK: - 2c. Eliminating Redundant 23MB/Frame Output Snapshot GPU Blits (`usesExternalOutputCache`)
+
+    @Test("External output cache mode eliminates redundant per-frame snapshot GPU blits while preserving zero-stall IOSurface duplicate skip")
+    func externalOutputCacheEliminatesSnapshotBlits() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        let renderer = try EffectChainRenderer(device: device)
+        defer { renderer.reset() }
+
+        // Configure exactly as `RenderLoopController.init` does:
+        renderer.usesExternalOutputCache = true
+
+        let width = 320
+        let height = 180
+        let props: [IOSurfacePropertyKey: Int] = [
+            .width: width,
+            .height: height,
+            .bytesPerElement: 4,
+            .bytesPerRow: width * 4,
+            .allocSize: width * height * 4,
+            .pixelFormat: Int(kCVPixelFormatType_32BGRA)
+        ]
+        let surface = try #require(IOSurface(properties: props))
+        let srcDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        srcDesc.usage = [.shaderRead]
+        srcDesc.storageMode = .shared
+        let srcTex = try #require(device.makeTexture(descriptor: srcDesc, iosurface: surface, plane: 0))
+        let dstTex = try Self.makeSharedOutputTexture(device: device, width: 640, height: 360)
+
+        let mode = try #require(ScalingMode.builtInPresets.first { $0.id == ScalingMode.metalFXSpatialID })
+        let layout = ScalingLayoutCalculator.calculate(
+            sourcePixelSize: PixelSize(width: width, height: height),
+            targetPixelSize: PixelSize(width: 640, height: 360),
+            effects: mode.effects
+        )
+
+        // Frame 0 (.dynamic): renders cleanly with ZERO snapshot blit!
+        let cb0 = try #require(queue.makeCommandBuffer())
+        let rep0 = try renderer.encode(
+            scalingMode: mode,
+            context: EffectRenderContext(
+                device: device,
+                commandBuffer: cb0,
+                sourceTexture: srcTex,
+                destinationTexture: dstTex,
+                layout: layout,
+                frameIndex: 0,
+                duplicateFrameMode: .dynamic
+            )
+        )
+        cb0.commit()
+        cb0.waitUntilCompleted()
+        #expect(rep0.wasDuplicateFrameSkipped == false)
+        #expect(renderer.outputSnapshotBlitCount == 0, "External output cache mode must perform ZERO full-frame snapshot blits!")
+
+        // Frames 1..5 (unchanged IOSurface with .dynamic): zero-stall duplicate skip STILL works with ZERO snapshot blits!
+        for i in 1...5 {
+            let cb = try #require(queue.makeCommandBuffer())
+            let rep = try renderer.encode(
+                scalingMode: mode,
+                context: EffectRenderContext(
+                    device: device,
+                    commandBuffer: cb,
+                    sourceTexture: srcTex,
+                    destinationTexture: dstTex,
+                    layout: layout,
+                    frameIndex: UInt64(i),
+                    duplicateFrameMode: .dynamic
+                )
+            )
+            cb.commit()
+            cb.waitUntilCompleted()
+            #expect(rep.wasDuplicateFrameSkipped == true, "Frame \(i) on unchanged IOSurface should still skip cleanly")
+        }
+        #expect(renderer.outputSnapshotBlitCount == 0, "Expected 0 snapshot blits across all frames when externalOutputCache is enabled!")
     }
 
     // MARK: - 3. Backward-Compatible CaptureSettings JSON Decoding

@@ -156,6 +156,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
     private static let cacheFlushIntervalFrames: UInt64 = 120
     private static let maxNonRetinaProbes = 3
     private static let resizeDebounceMilliseconds = 180
+    private static let fastResizeDebounceMilliseconds = 40
 
     private struct PendingResizeState: Sendable {
         var task: Task<Void, Never>?
@@ -651,9 +652,8 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
         // Frame rate interval:
         // - Explicit user FPS cap is honored directly.
-        // - When uncapped (`nil` / Auto), cap sensibly to the host display refresh rate (+5% jitter
-        //   headroom so 60fps/120fps sources never miss a beat due to sub-ms clock phase jitter, while
-        //   preventing 120–240fps SCK bursts from flooding a 60Hz display mailbox!).
+        // - When uncapped (`nil` / Auto), match the host display refresh rate 1:1 (e.g. 120Hz on ProMotion,
+        //   60Hz on 60Hz monitors) so SCK cadence aligns with CAMetalDisplayLink with zero beat-frequency drift.
         let hostRefreshHz: Double = {
             switch profile.multiMonitorMode {
             case .closest:
@@ -670,7 +670,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             effectiveFrameRateCap = limit
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(limit))
         } else {
-            let autoCap = min(240, max(60, Int((max(60.0, hostRefreshHz) * 1.05).rounded())))
+            let autoCap = min(240, max(60, Int(max(60.0, hostRefreshHz).rounded())))
             effectiveFrameRateCap = autoCap
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(autoCap))
         }
@@ -857,6 +857,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
     private func handleFrameGeometryUpdate(
         screenRect: CGRect,
+        contentPixelRect: CGRect,
         scaleFactor: Double,
         contentScale: Double,
         pixelWidth: Int,
@@ -866,7 +867,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
         let result: (
             emitBounds: Bool,
-            reconfig: (WindowDescriptor, Profile, ScalingMode)?,
+            reconfig: (WindowDescriptor, Profile, ScalingMode, Int)?,
             checkCrossDisplay: (appliedDisplayID: CGDirectDisplayID, payload: (WindowDescriptor, Profile, ScalingMode))?
         ) = state.withLock { s in
             guard s.isRunning, let applied = s.appliedConfig else { return (false, nil, nil) }
@@ -882,15 +883,26 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                 s.activeWindow?.cgBounds = screenRect
             }
 
-            var reconfigPayload: (WindowDescriptor, Profile, ScalingMode)?
+            var reconfigPayload: (WindowDescriptor, Profile, ScalingMode, Int)?
             var crossDisplayCheck: (CGDirectDisplayID, (WindowDescriptor, Profile, ScalingMode))?
             if applied.captureMode == .window {
                 let expectedW = Self.clampedCaptureDimension(Double(screenRect.width) * scaleFactor)
                 let expectedH = Self.clampedCaptureDimension(Double(screenRect.height) * scaleFactor)
-                let contentScaleDrifted = abs(contentScale - 1.0) >= 0.05
-                // Reconfigure on ANY pixel size, content scale, or backing scale change
-                // (fixes MetalDuck proportional-resize bug!).
+                let contentScaleDrifted = contentScale < 0.98 || abs(contentScale - 1.0) >= 0.02
+                let appliedAspect = Double(applied.pixelWidth) / Double(max(1, applied.pixelHeight))
+                let bufferAspect = Double(pixelWidth) / Double(max(1, pixelHeight))
+                let liveAspect = Double(screenRect.width) / Double(max(1, screenRect.height))
+                let aspectRatioChanged = abs(liveAspect - appliedAspect) / max(appliedAspect, 0.001) > 0.02
+                    || abs(liveAspect - bufferAspect) / max(bufferAspect, 0.001) > 0.02
+                let hasContentPadding = ScalingLayoutCalculator.activeContentSubRect(
+                    contentPixelRect: contentPixelRect,
+                    textureSize: PixelSize(width: pixelWidth, height: pixelHeight)
+                ) != nil
+
+                // Reconfigure on ANY pixel size, content scale, aspect ratio, padding, or backing scale change.
                 if contentScaleDrifted
+                    || aspectRatioChanged
+                    || hasContentPadding
                     || abs(expectedW - applied.pixelWidth) >= 2
                     || abs(expectedH - applied.pixelHeight) >= 2
                     || abs(scaleFactor - applied.backingScaleFactor) >= 0.05
@@ -901,7 +913,12 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                         win.cgBounds = screenRect
                         win.backingScaleFactor = scaleFactor
                         s.activeWindow = win
-                        reconfigPayload = (win, prof, mode)
+                        // Snap quickly (40ms) on fullscreen transitions / aspect shifts / SCK padding,
+                        // while keeping 180ms settle debounce for gradual drags & titlebar zooms.
+                        let debounceMs = (contentScale < 0.98 || aspectRatioChanged || hasContentPadding)
+                            ? Self.fastResizeDebounceMilliseconds
+                            : Self.resizeDebounceMilliseconds
+                        reconfigPayload = (win, prof, mode, debounceMs)
                     }
                 } else if movedOrResized,
                           var win = s.activeWindow,
@@ -921,8 +938,13 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             onEvent?(.windowBoundsChanged(screenRect))
         }
 
-        if let (win, prof, mode) = result.reconfig {
-            scheduleDebouncedResizeReconfig(window: win, profile: prof, scalingMode: mode)
+        if let (win, prof, mode, debounceMs) = result.reconfig {
+            scheduleDebouncedResizeReconfig(
+                window: win,
+                profile: prof,
+                scalingMode: mode,
+                debounceMilliseconds: debounceMs
+            )
         } else if let (appliedDisplayID, payload) = result.checkCrossDisplay {
             // Check outside unfair lock if window moved onto a different display (e.g. Display P3 <-> sRGB).
             let displays = WindowEnumerator.enumerateDisplays()
@@ -947,7 +969,8 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
     private func scheduleDebouncedResizeReconfig(
         window: WindowDescriptor,
         profile: Profile,
-        scalingMode: ScalingMode
+        scalingMode: ScalingMode,
+        debounceMilliseconds: Int = resizeDebounceMilliseconds
     ) {
         let scheduledGen = pendingResizeLock.withLock { s -> UInt64 in
             s.generation &+= 1
@@ -956,8 +979,9 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
         let nextTask = Task { [weak self] in
             // 180 ms settle debounce coalesces macOS titlebar zoom animations (250-350 ms)
-            // and live edge resize drags into a single post-settle SCStream update.
-            try? await Task.sleep(for: .milliseconds(Self.resizeDebounceMilliseconds))
+            // and live edge resize drags into a single post-settle SCStream update;
+            // 40 ms fast debounce snaps fullscreen / aspect-ratio transitions immediately.
+            try? await Task.sleep(for: .milliseconds(max(10, debounceMilliseconds)))
             guard !Task.isCancelled, let self else { return }
             let stillCurrent = self.pendingResizeLock.withLock { $0.generation == scheduledGen }
             guard stillCurrent, self.state.withLock(\.isRunning) else { return }
@@ -1252,15 +1276,22 @@ extension ScreenCaptureEngine: SCStreamOutput, SCStreamDelegate {
             return 1.0
         }()
 
-        let contentRect: CGRect = {
+        // Empirically verified on macOS: SCStreamFrameInfo.contentRect is reported in surface points
+        // (already scaled by contentScale); multiply by scaleFactor to obtain exact texture pixel bounds.
+        let rawPointContentRect: CGRect? = {
             if let dict = info?[.contentRect] as? NSDictionary,
                let rect = CGRect(dictionaryRepresentation: dict),
                rect.width > 0 && rect.height > 0
             {
                 return rect.standardized
             }
-            return CGRect(x: 0, y: 0, width: Double(pixelWidth), height: Double(pixelHeight))
+            return nil
         }()
+        let contentRect = ScalingLayoutCalculator.convertSCKContentRectToPixels(
+            pointRect: rawPointContentRect,
+            scaleFactor: scaleFactor,
+            textureSize: PixelSize(width: pixelWidth, height: pixelHeight)
+        )
 
         let screenRect: CGRect = {
             if let dict = info?[.screenRect] as? NSDictionary,
@@ -1295,6 +1326,7 @@ extension ScreenCaptureEngine: SCStreamOutput, SCStreamDelegate {
         // Track live window movement & dynamic proportional resizes without CGWindowList IPC.
         handleFrameGeometryUpdate(
             screenRect: screenRect,
+            contentPixelRect: contentRect,
             scaleFactor: scaleFactor,
             contentScale: contentScale,
             pixelWidth: pixelWidth,

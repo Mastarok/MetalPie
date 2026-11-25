@@ -247,6 +247,12 @@ public struct CursorEventTapProcessor: Sendable {
     /// Cached per-display macOS Menu Bar heights (from `NSScreen.frame.maxY - visibleFrame.maxY`).
     public var displayMenuBarHeights: [CGDirectDisplayID: CGFloat] = [:]
 
+    /// FIFO `Down -> Up` repost ordering window (seconds): if a `*MouseDown` was reposted via
+    /// `.cghidEventTap` after a warp and the matching `*MouseUp` arrives within 40ms (e.g. a fast
+    /// trackpad tap), also repost `*MouseUp` via `.cghidEventTap` so macOS never delivers `Up`
+    /// ahead of the reposted `Down` (preventing missed taps and stuck-button phantom drags!).
+    public static let mouseDownUpRepostOrderWindowSeconds: TimeInterval = 0.040
+
     // Active interaction state cleared by `reset()`:
     public var interactionMode: CursorPointerInteractionMode = .scaled
     public var activeChromeDrag: Bool = false
@@ -255,6 +261,9 @@ public struct CursorEventTapProcessor: Sendable {
     public var topEdgeUpwardOverflow: CGFloat = 0
     public var menuBarDropdownActive: Bool = false
     public var menuBarDropdownDismissPendingOnUp: Bool = false
+    public var lastRepostedLeftDownTimestamp: TimeInterval = -1
+    public var lastRepostedRightDownTimestamp: TimeInterval = -1
+    public var lastRepostedOtherDownTimestamp: TimeInterval = -1
 
     public init() {}
 
@@ -278,6 +287,42 @@ public struct CursorEventTapProcessor: Sendable {
         topEdgeUpwardOverflow = 0
         menuBarDropdownActive = false
         menuBarDropdownDismissPendingOnUp = false
+        lastRepostedLeftDownTimestamp = -1
+        lastRepostedRightDownTimestamp = -1
+        lastRepostedOtherDownTimestamp = -1
+    }
+
+    private mutating func recordRepostedMouseDown(for type: CGEventType, at timestamp: TimeInterval) {
+        switch type {
+        case .leftMouseDown:
+            lastRepostedLeftDownTimestamp = timestamp
+        case .rightMouseDown:
+            lastRepostedRightDownTimestamp = timestamp
+        case .otherMouseDown:
+            lastRepostedOtherDownTimestamp = timestamp
+        default:
+            break
+        }
+    }
+
+    private mutating func consumeRecentRepostedMouseDown(forUpEvent type: CGEventType, at timestamp: TimeInterval) -> Bool {
+        let prev: TimeInterval
+        switch type {
+        case .leftMouseUp:
+            prev = lastRepostedLeftDownTimestamp
+            lastRepostedLeftDownTimestamp = -1
+        case .rightMouseUp:
+            prev = lastRepostedRightDownTimestamp
+            lastRepostedRightDownTimestamp = -1
+        case .otherMouseUp:
+            prev = lastRepostedOtherDownTimestamp
+            lastRepostedOtherDownTimestamp = -1
+        default:
+            return false
+        }
+        guard prev >= 0 else { return false }
+        let dt = timestamp - prev
+        return dt >= 0 && dt <= Self.mouseDownUpRepostOrderWindowSeconds
     }
 
     public mutating func recordExternalWarp(
@@ -298,10 +343,20 @@ public struct CursorEventTapProcessor: Sendable {
         pointerTracker.recordSelfWarp(to: point, rawIncoming: warpFrom)
     }
 
-    /// Returns `true` if `cgPoint` lies inside any visible interactive MetalPie chrome rect. Zero heap allocations.
-    public func isPointInInteractiveChrome(_ cgPoint: CGPoint) -> Bool {
+    /// Exit hysteresis margin (in logical points) around `interactiveChromeRects` while already in
+    /// `.directChrome` so hovering near the toolbar/HUD border never ping-pongs between `.directChrome` and `.scaled`.
+    public static let directChromeExitHysteresis: CGFloat = 8.0
+
+    /// Returns `true` if `cgPoint` lies inside any visible interactive MetalPie chrome rect
+    /// (optionally expanded outward by `expansion` logical points on all four sides). Zero heap allocations.
+    public func isPointInInteractiveChrome(_ cgPoint: CGPoint, expansion: CGFloat = 0.0) -> Bool {
+        let pad = max(0.0, expansion)
         for rect in interactiveChromeRects {
-            if rect.contains(cgPoint) {
+            if pad == 0.0 {
+                if rect.contains(cgPoint) {
+                    return true
+                }
+            } else if rect.insetBy(dx: -pad, dy: -pad).contains(cgPoint) {
                 return true
             }
         }
@@ -486,6 +541,11 @@ public struct CursorEventTapProcessor: Sendable {
                 let anchor = pw.to
                 if isButtonDownEvent { activeChromeDrag = true }
                 if isButtonUpEvent && pressedButtonsMask == 0 { activeChromeDrag = false }
+                let repostUp = isButtonUpEvent && consumeRecentRepostedMouseDown(forUpEvent: type, at: now)
+                let shouldRepost = isButtonDownEvent || isScrollEvent || repostUp
+                if isButtonDownEvent && shouldRepost {
+                    recordRepostedMouseDown(for: type, at: now)
+                }
                 return CursorTapEventDecision(
                     rewrittenEventLocation: anchor,
                     warpTarget: nil,
@@ -494,7 +554,7 @@ public struct CursorEventTapProcessor: Sendable {
                     isScaledSpriteVisible: false,
                     isMouseGrabbedByGame: false,
                     isPointerOutsideUnconfinedSource: false,
-                    shouldRepostAfterWarp: isButtonDownEvent || isScrollEvent,
+                    shouldRepostAfterWarp: shouldRepost,
                     interactionMode: .directChrome
                 )
             } else if let pw = pendingWarp, (now - pw.timestamp) >= 0.05 {
@@ -518,6 +578,11 @@ public struct CursorEventTapProcessor: Sendable {
                     pendingWarp = PendingWarp(from: incoming, to: anchor, timestamp: now)
                 }
                 lastPhysicalLocation = incoming
+                let repostUp = isButtonUpEvent && consumeRecentRepostedMouseDown(forUpEvent: type, at: now)
+                let shouldRepost = isButtonDownEvent || isScrollEvent || repostUp
+                if isButtonDownEvent && shouldRepost {
+                    recordRepostedMouseDown(for: type, at: now)
+                }
                 return CursorTapEventDecision(
                     rewrittenEventLocation: anchor,
                     warpTarget: wt,
@@ -526,33 +591,34 @@ public struct CursorEventTapProcessor: Sendable {
                     isScaledSpriteVisible: false,
                     isMouseGrabbedByGame: false,
                     isPointerOutsideUnconfinedSource: false,
-                    shouldRepostAfterWarp: isButtonDownEvent || isScrollEvent,
+                    shouldRepostAfterWarp: shouldRepost,
                     interactionMode: .directChrome
                 )
             }
 
-            if isButtonDownEvent && isPointInInteractiveChrome(incoming) {
+            if isButtonDownEvent && isPointInInteractiveChrome(incoming, expansion: Self.directChromeExitHysteresis) {
                 activeChromeDrag = true
             }
-            let stayInChrome = isPointInInteractiveChrome(incoming)
+            let stayInChrome = isPointInInteractiveChrome(incoming, expansion: Self.directChromeExitHysteresis)
                 || activeChromeDrag
-                || (isButtonUpEvent && hadButtonsPressedBeforeEvent)
+                || hadButtonsPressedBeforeEvent
             if stayInChrome {
                 if isButtonUpEvent && pressedButtonsMask == 0 {
                     activeChromeDrag = false
                 }
+                let repostUp = isButtonUpEvent && consumeRecentRepostedMouseDown(forUpEvent: type, at: now)
                 lastPhysicalLocation = incoming
                 virtualSourcePosition = incoming
                 if isMotionEvent { lastMotionTimestamp = now }
                 return CursorTapEventDecision(
-                    rewrittenEventLocation: nil,
+                    rewrittenEventLocation: repostUp ? incoming : nil,
                     warpTarget: nil,
                     effectiveSourcePoint: incoming,
                     scaledCGPosition: incoming,
                     isScaledSpriteVisible: false,
                     isMouseGrabbedByGame: false,
                     isPointerOutsideUnconfinedSource: false,
-                    shouldRepostAfterWarp: false,
+                    shouldRepostAfterWarp: repostUp,
                     interactionMode: .directChrome
                 )
             }
@@ -574,25 +640,6 @@ public struct CursorEventTapProcessor: Sendable {
                     isPointerOutsideUnconfinedSource: false,
                     shouldRepostAfterWarp: false,
                     interactionMode: .outsideWindowedOverlay
-                )
-            }
-            if !isPresentationWindowed && !mapping.threeDGameMode && hostMenuBarRect(for: mapping).contains(incoming) {
-                interactionMode = .menuBarPassthrough
-                menuBarDropdownActive = isButtonDownEvent
-                menuBarDropdownDismissPendingOnUp = false
-                lastPhysicalLocation = incoming
-                virtualSourcePosition = incoming
-                if isMotionEvent { lastMotionTimestamp = now }
-                return CursorTapEventDecision(
-                    rewrittenEventLocation: nil,
-                    warpTarget: nil,
-                    effectiveSourcePoint: incoming,
-                    scaledCGPosition: incoming,
-                    isScaledSpriteVisible: false,
-                    isMouseGrabbedByGame: false,
-                    isPointerOutsideUnconfinedSource: false,
-                    shouldRepostAfterWarp: false,
-                    interactionMode: .menuBarPassthrough
                 )
             }
             if !enforceConfinement && !mapping.isPointInsideSource(incoming) {
@@ -701,82 +748,13 @@ public struct CursorEventTapProcessor: Sendable {
             )
 
         case .menuBarPassthrough:
-            if isPresentationWindowed || mapping.threeDGameMode {
-                if isPresentationWindowed && !mapping.threeDGameMode && !mapping.overlayRect.contains(incoming) {
-                    interactionMode = .outsideWindowedOverlay
-                    menuBarDropdownActive = false
-                    menuBarDropdownDismissPendingOnUp = false
-                    lastPhysicalLocation = incoming
-                    virtualSourcePosition = incoming
-                    if isMotionEvent { lastMotionTimestamp = now }
-                    return CursorTapEventDecision(
-                        rewrittenEventLocation: nil,
-                        warpTarget: nil,
-                        effectiveSourcePoint: incoming,
-                        scaledCGPosition: incoming,
-                        isScaledSpriteVisible: false,
-                        isMouseGrabbedByGame: false,
-                        isPointerOutsideUnconfinedSource: false,
-                        shouldRepostAfterWarp: false,
-                        interactionMode: .outsideWindowedOverlay
-                    )
-                }
-                return transitionBackToScaled(
-                    at: incoming,
-                    input: input,
-                    mapping: mapping,
-                    enforceConfinement: enforceConfinement,
-                    isHiddenForScreenshot: isHiddenForScreenshot,
-                    isIdleHidden: isIdleHidden,
-                    isButtonDownEvent: isButtonDownEvent,
-                    isScrollEvent: isScrollEvent,
-                    isMotionEvent: isMotionEvent
-                )
-            }
-            if case .preWarpQueued = warpResolution {
-                let anchor = pendingWarp?.to ?? lastWarpedPoint ?? incoming
-                return CursorTapEventDecision(
-                    rewrittenEventLocation: anchor,
-                    warpTarget: nil,
-                    effectiveSourcePoint: anchor,
-                    scaledCGPosition: anchor,
-                    isScaledSpriteVisible: false,
-                    isMouseGrabbedByGame: false,
-                    isPointerOutsideUnconfinedSource: false,
-                    shouldRepostAfterWarp: isButtonDownEvent,
-                    interactionMode: .menuBarPassthrough
-                )
-            }
-
-            let menuBar = hostMenuBarRect(for: mapping)
-            let inMenuBarStrip = incoming.y <= menuBar.maxY + 4.0 &&
-                incoming.x >= menuBar.minX - 2.0 &&
-                incoming.x <= menuBar.maxX + 2.0
-            let belowExitHysteresis = incoming.y > menuBar.maxY + 8.0
-
-            if isButtonDownEvent {
-                if inMenuBarStrip {
-                    menuBarDropdownActive = true
-                    menuBarDropdownDismissPendingOnUp = false
-                } else if menuBarDropdownActive {
-                    menuBarDropdownDismissPendingOnUp = true
-                }
-            } else if isButtonUpEvent && pressedButtonsMask == 0 {
-                if menuBarDropdownDismissPendingOnUp || !inMenuBarStrip {
-                    menuBarDropdownActive = false
-                    menuBarDropdownDismissPendingOnUp = false
-                }
-            }
-
-            // Moving directly from menu bar down onto MetalPie's floating toolbar transitions cleanly to `.directChrome`.
-            if !inMenuBarStrip &&
-                !menuBarDropdownActive &&
-                !hadButtonsPressedBeforeEvent &&
-                !isButtonUpEvent &&
-                isPointInInteractiveChrome(incoming)
-            {
-                interactionMode = .directChrome
-                activeChromeDrag = isButtonDownEvent
+            // Fullscreen OverlayPanel cleanly covers macOS's top Menu Bar (level 98 > 24), so Fullscreen
+            // menu-bar passthrough is disabled to avoid fighting MetalPie's top floating toolbar.
+            // If this mode is ever observed, transition immediately to outsideWindowedOverlay (windowed) or scaled.
+            menuBarDropdownActive = false
+            menuBarDropdownDismissPendingOnUp = false
+            if isPresentationWindowed && !mapping.threeDGameMode && !mapping.overlayRect.contains(incoming) {
+                interactionMode = .outsideWindowedOverlay
                 lastPhysicalLocation = incoming
                 virtualSourcePosition = incoming
                 if isMotionEvent { lastMotionTimestamp = now }
@@ -789,31 +767,9 @@ public struct CursorEventTapProcessor: Sendable {
                     isMouseGrabbedByGame: false,
                     isPointerOutsideUnconfinedSource: false,
                     shouldRepostAfterWarp: false,
-                    interactionMode: .directChrome
+                    interactionMode: .outsideWindowedOverlay
                 )
             }
-
-            let stayInMenuBar = !belowExitHysteresis
-                || menuBarDropdownActive
-                || hadButtonsPressedBeforeEvent
-                || isButtonUpEvent
-            if stayInMenuBar {
-                lastPhysicalLocation = incoming
-                virtualSourcePosition = incoming
-                if isMotionEvent { lastMotionTimestamp = now }
-                return CursorTapEventDecision(
-                    rewrittenEventLocation: nil,
-                    warpTarget: nil,
-                    effectiveSourcePoint: incoming,
-                    scaledCGPosition: incoming,
-                    isScaledSpriteVisible: false,
-                    isMouseGrabbedByGame: false,
-                    isPointerOutsideUnconfinedSource: false,
-                    shouldRepostAfterWarp: false,
-                    interactionMode: .menuBarPassthrough
-                )
-            }
-
             return transitionBackToScaled(
                 at: incoming,
                 input: input,
@@ -1049,6 +1005,8 @@ public struct CursorEventTapProcessor: Sendable {
                     }
 
                     // 2. Windowed mode smooth outside-overlay escape (releases confinement to Menu Bar / Dock / Desktop).
+                    //    In Fullscreen mode (`!isPresentationWindowed`), OverlayPanel cleanly covers the top Menu Bar
+                    //    so top-edge pushes stay dedicated to scaled content + MetalPie's floating toolbar (no menu-bar fight!).
                     if isPresentationWindowed {
                         if let exitPoint = computeWindowedOverlayExitPoint(
                             unclampedScaled: unclampedScaled,
@@ -1056,21 +1014,6 @@ public struct CursorEventTapProcessor: Sendable {
                         ) {
                             return enterOutsideWindowedOverlay(
                                 at: exitPoint,
-                                incoming: incoming,
-                                input: input
-                            )
-                        }
-                    }
-
-                    // 3. Fullscreen mode top Menu Bar passthrough (pushing upward at top edge into Menu Bar strip).
-                    //    Only applies when confined (`enforceConfinement == true`); unconfined mode escapes naturally.
-                    if enforceConfinement && !isPresentationWindowed {
-                        if let menuEntry = computeFullscreenMenuBarEntryPoint(
-                            candidateScaledX: unclampedScaled.x,
-                            mapping: mapping
-                        ) {
-                            return enterMenuBarPassthrough(
-                                at: menuEntry,
                                 incoming: incoming,
                                 input: input
                             )
@@ -1150,7 +1093,13 @@ public struct CursorEventTapProcessor: Sendable {
                         }
                         if isScrollEvent || isButtonDownEvent {
                             shouldRepostAfterWarp = true
+                            if isButtonDownEvent {
+                                recordRepostedMouseDown(for: type, at: now)
+                            }
                         }
+                    }
+                    if isButtonUpEvent && consumeRecentRepostedMouseDown(forUpEvent: type, at: now) {
+                        shouldRepostAfterWarp = true
                     }
                 } else if type == .leftMouseDragged && activeWindowBorderDrag {
                     // Bug #5: Keep macOS WindowServer's live window resize / titlebar drag loop synced
@@ -1234,19 +1183,6 @@ public struct CursorEventTapProcessor: Sendable {
                         )
                     }
                 }
-
-                if enforceConfinement && !isPresentationWindowed {
-                    if let menuEntry = computeFullscreenMenuBarEntryPoint(
-                        candidateScaledX: unclampedScaled.x,
-                        mapping: mapping
-                    ) {
-                        return enterMenuBarPassthrough(
-                            at: menuEntry,
-                            incoming: incoming,
-                            input: input
-                        )
-                    }
-                }
             } else {
                 topEdgeUpwardOverflow = 0
             }
@@ -1264,15 +1200,26 @@ public struct CursorEventTapProcessor: Sendable {
                     warpTarget = constrained.point
                     if isScrollEvent || isButtonDownEvent {
                         shouldRepostAfterWarp = true
+                        if isButtonDownEvent {
+                            recordRepostedMouseDown(for: type, at: now)
+                        }
                     }
                 }
                 effectiveSourcePoint = constrained.point
+                if isButtonUpEvent && consumeRecentRepostedMouseDown(forUpEvent: type, at: now) {
+                    shouldRepostAfterWarp = true
+                    newEventLocation = effectiveSourcePoint
+                }
                 if type == .leftMouseDown && mapping.isPointInWindowResizeOrTitlebarZone(effectiveSourcePoint) {
                     activeWindowBorderDrag = true
                     wasBorderDragThisEvent = true
                 }
             } else {
                 effectiveSourcePoint = incoming
+                if isButtonUpEvent && consumeRecentRepostedMouseDown(forUpEvent: type, at: now) {
+                    shouldRepostAfterWarp = true
+                    newEventLocation = effectiveSourcePoint
+                }
                 if type == .leftMouseDown && mapping.isPointInWindowResizeOrTitlebarZone(effectiveSourcePoint) {
                     activeWindowBorderDrag = true
                     wasBorderDragThisEvent = true
@@ -1365,7 +1312,18 @@ public struct CursorEventTapProcessor: Sendable {
             }
             if isButtonDownEvent || isScrollEvent {
                 shouldRepost = true
+                if isButtonDownEvent {
+                    recordRepostedMouseDown(for: input.type, at: input.timestamp)
+                }
             }
+        }
+        let isUpEvent = (
+            input.type == .leftMouseUp ||
+            input.type == .rightMouseUp ||
+            input.type == .otherMouseUp
+        )
+        if isUpEvent && consumeRecentRepostedMouseDown(forUpEvent: input.type, at: input.timestamp) {
+            shouldRepost = true
         }
 
         return CursorTapEventDecision(
@@ -1420,45 +1378,6 @@ public struct CursorEventTapProcessor: Sendable {
         )
     }
 
-    private mutating func enterMenuBarPassthrough(
-        at entryPoint: CGPoint,
-        incoming: CGPoint,
-        input: CursorTapEventInput
-    ) -> CursorTapEventDecision {
-        interactionMode = .menuBarPassthrough
-        isPointerOutsideUnconfinedSource = false
-        activeChromeDrag = false
-        activeWindowBorderDrag = false
-        topEdgeUpwardOverflow = 0
-        menuBarDropdownActive = false
-        menuBarDropdownDismissPendingOnUp = false
-
-        virtualSourcePosition = entryPoint
-        lastPhysicalLocation = incoming
-        lastMotionTimestamp = input.timestamp
-
-        var warpTarget: CGPoint? = nil
-        if hypot(incoming.x - entryPoint.x, incoming.y - entryPoint.y) >= 1.0 {
-            warpTarget = entryPoint
-            lastWarpedPoint = entryPoint
-            lastWarpedTimestamp = input.timestamp
-            pendingWarp = PendingWarp(from: incoming, to: entryPoint, timestamp: input.timestamp)
-            pointerTracker.recordSelfWarp(to: entryPoint, rawIncoming: incoming)
-        }
-
-        return CursorTapEventDecision(
-            rewrittenEventLocation: entryPoint,
-            warpTarget: warpTarget,
-            effectiveSourcePoint: entryPoint,
-            scaledCGPosition: entryPoint,
-            isScaledSpriteVisible: false,
-            isMouseGrabbedByGame: false,
-            isPointerOutsideUnconfinedSource: false,
-            shouldRepostAfterWarp: false,
-            interactionMode: .menuBarPassthrough
-        )
-    }
-
     private mutating func transitionBackToScaled(
         at incoming: CGPoint,
         input: CursorTapEventInput,
@@ -1506,9 +1425,20 @@ public struct CursorEventTapProcessor: Sendable {
             pointerTracker.recordSelfWarp(to: entrySource, rawIncoming: incoming)
             if isButtonDownEvent || isScrollEvent {
                 shouldRepost = true
+                if isButtonDownEvent {
+                    recordRepostedMouseDown(for: input.type, at: input.timestamp)
+                }
             }
         } else {
             pointerTracker.recordSelfWarp(to: incoming, rawIncoming: nil)
+        }
+        let isUpEvent = (
+            input.type == .leftMouseUp ||
+            input.type == .rightMouseUp ||
+            input.type == .otherMouseUp
+        )
+        if isUpEvent && consumeRecentRepostedMouseDown(forUpEvent: input.type, at: input.timestamp) {
+            shouldRepost = true
         }
 
         let scaledPos = mapping.mapSourceToScaled(entrySource, clampToContent: true)
@@ -1557,27 +1487,6 @@ public struct CursorEventTapProcessor: Sendable {
         // Only escape if the resulting desktop point lies strictly outside `overlayRect`
         // (prevents futile escape on edges flush against an outer monitor bezel with no adjacent display).
         return overlay.contains(clampedExit) ? nil : clampedExit
-    }
-
-    private func computeFullscreenMenuBarEntryPoint(
-        candidateScaledX: CGFloat,
-        mapping: PointerMapping
-    ) -> CGPoint? {
-        let menuBar = hostMenuBarRect(for: mapping)
-        guard !menuBar.isEmpty, mapping.overlayRect.minY <= menuBar.maxY + 4.0 else {
-            return nil
-        }
-        let requiredPush = max(6.0, mapping.contentRect.minY - menuBar.maxY + 4.0)
-        guard topEdgeUpwardOverflow >= requiredPush else {
-            return nil
-        }
-        let entryX = min(max(candidateScaledX, menuBar.minX + 1.0), max(menuBar.minX + 1.0, menuBar.maxX - 1.0))
-        let entryY = menuBar.minY + min(12.0, max(1.0, menuBar.height * 0.5))
-        let entryPoint = CGPoint(x: entryX, y: entryY)
-        guard !isPointInInteractiveChrome(entryPoint) else {
-            return nil
-        }
-        return entryPoint
     }
 }
 
@@ -1858,8 +1767,17 @@ public final class SystemCursorHider: Sendable {
     private typealias SetConnectionPropertyFn = @convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32
     private typealias CursorIsVisibleFn = @convention(c) () -> Int32
 
+    /// Maximum hide depth allowed from drift reassertions to prevent unbounded WindowServer refcount growth.
+    public static let maxReassertHideDepth: Int = 16
+    /// Minimum cooldown (seconds) between consecutive drift reassertions.
+    public static let reassertCooldownSeconds: TimeInterval = 0.25
+    /// Maximum belt-and-suspenders `CGDisplayShowCursor` unwind attempts when `CGCursorIsVisible()` still reports hidden.
+    public static let maxEmergencyShowAttempts: Int = 64
+
     private struct HiderState: Sendable {
         var hideDepth: Int = 0
+        var allowedToHide: Bool = true
+        var lastReassertUptime: TimeInterval = 0
         var backgroundPropertyConfigured: Bool = false
     }
 
@@ -1875,7 +1793,7 @@ public final class SystemCursorHider: Sendable {
     public init() {}
 
     deinit {
-        show()
+        setAllowedToHide(false)
     }
 
     public var hideDepth: Int {
@@ -1886,59 +1804,150 @@ public final class SystemCursorHider: Sendable {
         state.withLock { $0.hideDepth > 0 }
     }
 
+    public var isAllowedToHide: Bool {
+        state.withLock(\.allowedToHide)
+    }
+
     /// Current aggregate balanced hide depth across all `SystemCursorHider` instances in this process.
     public static var processHideDepth: Int {
         globalState.withLock(\.totalProcessHideDepth)
     }
 
-    /// Acquires a balanced single-level cursor hide (idempotent while already hidden by this hider).
-    public func hide() {
-        ensureBackgroundCursorPermission()
-        let acquired = state.withLock { s -> Bool in
-            guard s.hideDepth == 0 else { return false }
-            CGDisplayHideCursor(CGMainDisplayID())
-            s.hideDepth = 1
-            return true
-        }
-        if acquired {
-            Self.globalState.withLock { $0.totalProcessHideDepth += 1 }
-        }
-    }
-
-    /// Releases all hide levels acquired by this hider.
-    public func show() {
+    /// Atomically enables or disables cursor hiding for this hider.
+    /// When set to `false`, atomically marks `allowedToHide = false`, immediately unwinds ALL tracked
+    /// `hideDepth` via `CGDisplayShowCursor`, reassociates mouse-cursor position, and guarantees the OS
+    /// cursor is visible so no racing thread (`EventTapThread` / `maintenanceQueue`) can ever re-hide it.
+    public func setAllowedToHide(_ allowed: Bool) {
         let released = state.withLock { s -> Int in
+            s.allowedToHide = allowed
+            guard !allowed else { return 0 }
+            s.lastReassertUptime = 0
+            // Re-assert SetsCursorInBackground cleanly on the next session (safe across Space changes & sleep/wake).
+            s.backgroundPropertyConfigured = false
+            let mainDisplay = CGMainDisplayID()
             var count = 0
             while s.hideDepth > 0 {
-                CGDisplayShowCursor(CGMainDisplayID())
+                CGDisplayShowCursor(mainDisplay)
                 s.hideDepth -= 1
                 count += 1
             }
+            if count > 0 {
+                let releasedCount = count
+                Self.globalState.withLock { g in
+                    g.totalProcessHideDepth = max(0, g.totalProcessHideDepth - releasedCount)
+                }
+            }
             return count
         }
-        if released > 0 {
-            Self.globalState.withLock { g in
-                g.totalProcessHideDepth = max(0, g.totalProcessHideDepth - released)
+
+        if !allowed {
+            let mainDisplay = CGMainDisplayID()
+            CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+            if released == 0 {
+                CGDisplayShowCursor(mainDisplay)
             }
+            var extraAttempts = 0
+            while Self.querySystemCursorVisible() == false && extraAttempts < Self.maxEmergencyShowAttempts {
+                CGDisplayShowCursor(mainDisplay)
+                extraAttempts += 1
+            }
+        }
+    }
+
+    /// Acquires a balanced single-level cursor hide (idempotent while already hidden, and strictly
+    /// no-op while `allowedToHide == false`).
+    public func hide() {
+        guard state.withLock({ $0.allowedToHide && $0.hideDepth == 0 }) else { return }
+        ensureBackgroundCursorPermission()
+        _ = state.withLock { s -> Bool in
+            guard s.allowedToHide else { return false }
+            guard s.hideDepth == 0 else { return false }
+            CGDisplayHideCursor(CGMainDisplayID())
+            s.hideDepth = 1
+            s.lastReassertUptime = 0
+            Self.globalState.withLock { $0.totalProcessHideDepth += 1 }
+            return true
+        }
+    }
+
+    /// Releases all hide levels acquired by this hider, reassociates mouse cursor positioning,
+    /// and verifies CoreGraphics visibility (looping up to 64 times if still reported hidden).
+    public func show() {
+        let mainDisplay = CGMainDisplayID()
+        let released = state.withLock { s -> Int in
+            s.lastReassertUptime = 0
+            var count = 0
+            while s.hideDepth > 0 {
+                CGDisplayShowCursor(mainDisplay)
+                s.hideDepth -= 1
+                count += 1
+            }
+            if count > 0 {
+                let releasedCount = count
+                Self.globalState.withLock { g in
+                    g.totalProcessHideDepth = max(0, g.totalProcessHideDepth - releasedCount)
+                }
+            }
+            return count
+        }
+
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+        if released == 0 {
+            CGDisplayShowCursor(mainDisplay)
+        }
+        var extraAttempts = 0
+        while Self.querySystemCursorVisible() == false && extraAttempts < Self.maxEmergencyShowAttempts {
+            CGDisplayShowCursor(mainDisplay)
+            extraAttempts += 1
         }
     }
 
     /// Checks whether WindowServer externally unhid the cursor while we intend it to remain hidden.
-    /// Calls `CGDisplayHideCursor` ONLY if `CGCursorIsVisible` (resolved via `dlsym`) reports visible —
-    /// ZERO Show+Hide flicker!
+    /// Calls `CGDisplayHideCursor` ONLY when `allowedToHide == true`, within the depth cap (`16`) and
+    /// `0.25s` cooldown, and `CGCursorIsVisible` reports visible — ALWAYS incrementing BOTH `hideDepth`
+    /// and `globalState.totalProcessHideDepth` so exit unwinds every single hide level!
     public func reassertHiddenIfDrifted() {
-        let shouldCheck = state.withLock { $0.hideDepth > 0 }
-        guard shouldCheck else { return }
-        guard Self.querySystemCursorVisible() == true else { return }
+        _ = reassertHiddenIfDrifted(
+            now: ProcessInfo.processInfo.systemUptime,
+            assumedCursorVisibleForTesting: nil
+        )
+    }
+
+    @discardableResult
+    internal func reassertHiddenIfDrifted(
+        now: TimeInterval,
+        assumedCursorVisibleForTesting: Bool?
+    ) -> Bool {
+        let shouldCheck = state.withLock { s -> Bool in
+            guard s.allowedToHide,
+                  s.hideDepth > 0,
+                  s.hideDepth < Self.maxReassertHideDepth
+            else {
+                return false
+            }
+            return s.lastReassertUptime == 0 || (now - s.lastReassertUptime) >= Self.reassertCooldownSeconds
+        }
+        guard shouldCheck else { return false }
+
+        let isVisible = assumedCursorVisibleForTesting ?? (Self.querySystemCursorVisible() == true)
+        guard isVisible else { return false }
 
         let reasserted = state.withLock { s -> Bool in
-            guard s.hideDepth > 0 else { return false }
+            guard s.allowedToHide else { return false }
+            guard s.hideDepth > 0, s.hideDepth < Self.maxReassertHideDepth else { return false }
+            guard s.lastReassertUptime == 0 || (now - s.lastReassertUptime) >= Self.reassertCooldownSeconds else {
+                return false
+            }
             CGDisplayHideCursor(CGMainDisplayID())
+            s.hideDepth += 1
+            s.lastReassertUptime = now
+            Self.globalState.withLock { $0.totalProcessHideDepth += 1 }
             return true
         }
         if reasserted {
             PipelineLog.shared.debug(.cursor, "Reasserted hidden OS cursor after external visibility drift (no Show+Hide flicker).")
         }
+        return reasserted
     }
 
     /// Unconditionally clears local hide depth and guarantees the system cursor is visible.
@@ -1950,6 +1959,8 @@ public final class SystemCursorHider: Sendable {
     /// Process-wide emergency restoration invoked by `RunGuardWatchdog`, panic stop, and exit hooks.
     public static func emergencyRestoreAll() {
         let mainDisplay = CGMainDisplayID()
+        CGAssociateMouseAndMouseCursorPosition(boolean_t(1))
+
         let remaining = globalState.withLock { g -> Int in
             let count = g.totalProcessHideDepth
             g.totalProcessHideDepth = 0
@@ -1960,13 +1971,12 @@ public final class SystemCursorHider: Sendable {
             for _ in 0..<remaining {
                 CGDisplayShowCursor(mainDisplay)
             }
-        } else {
-            // CoreGraphics clamps per-connection hide depth at 0, so a single Show is safe & idempotent.
-            CGDisplayShowCursor(mainDisplay)
         }
+        // CoreGraphics clamps per-connection hide depth at 0, so an extra Show is always safe & idempotent.
+        CGDisplayShowCursor(mainDisplay)
 
         var extraAttempts = 0
-        while querySystemCursorVisible() == false && extraAttempts < 8 {
+        while querySystemCursorVisible() == false && extraAttempts < Self.maxEmergencyShowAttempts {
             CGDisplayShowCursor(mainDisplay)
             extraAttempts += 1
         }
@@ -2248,11 +2258,14 @@ internal final class CursorSpriteOverlayPanel {
             // ONLY toggle `spriteLayer.isHidden` inside `CATransaction` — NEVER call `panel?.orderOut(nil)`,
             // which tears down and recreates the WindowServer backing surface causing visible flicker!
             // (`orderOut` is reserved strictly for `hide()` / `close()` on suspend, stop, or VRR mode.)
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            spriteLayer.isHidden = true
-            CATransaction.commit()
-            CATransaction.flush()
+            // Never call synchronous `CATransaction.flush()` on pointer packets — let CoreAnimation batch
+            // cleanly to the display's hardware VSync commit with zero MainActor/WindowServer IPC stall!
+            if !spriteLayer.isHidden {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                spriteLayer.isHidden = true
+                CATransaction.commit()
+            }
             return
         }
 
@@ -2267,8 +2280,13 @@ internal final class CursorSpriteOverlayPanel {
 
         // Update sprite position FIRST for minimal pointer-to-photon latency.
         spriteLayer.position = geometry.overlayLocalCocoaPosition
-        spriteLayer.anchorPoint = geometry.layerAnchorPoint
-        spriteLayer.bounds = CGRect(origin: .zero, size: geometry.scaledSize)
+        if spriteLayer.anchorPoint != geometry.layerAnchorPoint {
+            spriteLayer.anchorPoint = geometry.layerAnchorPoint
+        }
+        let targetBounds = CGRect(origin: .zero, size: geometry.scaledSize)
+        if spriteLayer.bounds != targetBounds {
+            spriteLayer.bounds = targetBounds
+        }
 
         if lastAppliedGeneration != image.generation {
             spriteLayer.contents = image.cgImage
@@ -2278,13 +2296,18 @@ internal final class CursorSpriteOverlayPanel {
 
         let useNearest = (snapshot.interpolation == .nearest) || abs(geometry.scaleFactor - 1.0) < 0.01
         let filter: CALayerContentsFilter = useNearest ? .nearest : .linear
-        spriteLayer.magnificationFilter = filter
-        spriteLayer.minificationFilter = filter
+        if spriteLayer.magnificationFilter != filter {
+            spriteLayer.magnificationFilter = filter
+        }
+        if spriteLayer.minificationFilter != filter {
+            spriteLayer.minificationFilter = filter
+        }
 
-        spriteLayer.isHidden = false
+        if spriteLayer.isHidden {
+            spriteLayer.isHidden = false
+        }
 
         CATransaction.commit()
-        CATransaction.flush()
 
         if !activePanel.isVisible {
             activePanel.orderFrontRegardless()
@@ -2296,7 +2319,6 @@ internal final class CursorSpriteOverlayPanel {
         CATransaction.setDisableActions(true)
         spriteLayer.isHidden = true
         CATransaction.commit()
-        CATransaction.flush()
         panel?.orderOut(nil)
     }
 
@@ -2427,6 +2449,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         var tapPort: CFMachPort?
         var runLoopSource: CFRunLoopSource?
         var callbackBox: EventTapCallbackBox?
+        var exitSemaphore: DispatchSemaphore?
     }
 
     private let state: OSAllocatedUnfairLock<ControllerState>
@@ -2606,12 +2629,13 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                s.tapProcessor.pressedButtonsMask == 0
             {
                 let ptr = s.tapProcessor.lastPhysicalLocation ?? s.currentState.scaledCGPosition
-                if !s.tapProcessor.isPointInInteractiveChrome(ptr) {
+                if !s.tapProcessor.isPointInInteractiveChrome(
+                    ptr,
+                    expansion: CursorEventTapProcessor.directChromeExitHysteresis
+                ) {
                     let enforceConfinement = mapping.settings.confineCursor || mapping.threeDGameMode
                     if s.isPresentationWindowed && !mapping.threeDGameMode && !mapping.overlayRect.contains(ptr) {
                         s.tapProcessor.interactionMode = .outsideWindowedOverlay
-                    } else if !s.isPresentationWindowed && !mapping.threeDGameMode && s.tapProcessor.hostMenuBarRect(for: mapping).contains(ptr) {
-                        s.tapProcessor.interactionMode = .menuBarPassthrough
                     } else if !enforceConfinement && !mapping.isPointInsideSource(ptr) {
                         s.tapProcessor.interactionMode = .unconfinedOutsideSource
                         s.tapProcessor.isPointerOutsideUnconfinedSource = true
@@ -2903,9 +2927,18 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.latestRenderSnapshot.state = s.currentState
         }
 
-        if didStartTap && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode) {
-            let isNativeMode = state.withLock { $0.tapProcessor.interactionMode != .scaled }
-            if !isNativeMode {
+        let hideGate = state.withLock { s -> (allowHide: Bool, isNativeMode: Bool) in
+            guard s.isActive, !s.isSuspended, s.isUsingEventTap,
+                  (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode)
+            else {
+                return (false, true)
+            }
+            return (true, s.tapProcessor.interactionMode != .scaled)
+        }
+
+        if hideGate.allowHide {
+            cursorHider.setAllowedToHide(true)
+            if !hideGate.isNativeMode {
                 cursorHider.hide()
                 if (mapping.settings.confineCursor || configuration.threeDGameMode) && initialPlacement.shouldWarp {
                     recordWarp(from: initialPointer, to: initialPlacement.point)
@@ -2915,7 +2948,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 cursorHider.show()
             }
         } else {
-            cursorHider.show()
+            cursorHider.setAllowedToHide(false)
             hideSpritePanelOnMain()
         }
 
@@ -3090,17 +3123,28 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             return pendingWarpSpec
         }
 
-        let isNativeMode = state.withLock { $0.tapProcessor.interactionMode != .scaled }
-        if transition.shouldHideOS && tapActive && !isNativeMode {
-            cursorHider.hide()
-            if let wp = warpSpec {
-                recordWarp(from: wp.from, to: wp.to)
-                performCursorWarp(to: wp.to, reassociateMouse: !configuration.threeDGameMode)
+        let hideGate = state.withLock { s -> (allowHide: Bool, isNativeMode: Bool) in
+            guard s.isActive, !s.isSuspended, s.isUsingEventTap, transition.shouldHideOS else {
+                return (false, true)
             }
-            scheduleVisualPositionUpdate()
-            scheduleCursorShapeRefresh()
+            return (true, s.tapProcessor.interactionMode != .scaled)
+        }
+        if hideGate.allowHide {
+            cursorHider.setAllowedToHide(true)
+            if !hideGate.isNativeMode {
+                cursorHider.hide()
+                if let wp = warpSpec {
+                    recordWarp(from: wp.from, to: wp.to)
+                    performCursorWarp(to: wp.to, reassociateMouse: !configuration.threeDGameMode)
+                }
+                scheduleVisualPositionUpdate()
+                scheduleCursorShapeRefresh()
+            } else {
+                cursorHider.show()
+                hideSpritePanelOnMain()
+            }
         } else {
-            cursorHider.show()
+            cursorHider.setAllowedToHide(false)
             hideSpritePanelOnMain()
         }
 
@@ -3111,6 +3155,9 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     }
 
     public func suspend() {
+        // Atomically block any late hide()/reassertHiddenIfDrifted() AND release all local hide levels FIRST!
+        cursorHider.setAllowedToHide(false)
+
         let shouldSuspend = state.withLock { s -> Bool in
             guard s.isActive, !s.isSuspended else { return false }
             s.isSuspended = true
@@ -3123,9 +3170,9 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
         guard shouldSuspend else { return }
 
-        // Always restore OS hardware cursor immediately and pause tap interception.
-        cursorHider.show()
         setEventTapEnabled(false)
+        // Belt-and-suspenders: guarantee OS hardware cursor is visible after disabling tap.
+        cursorHider.show()
         hideSpritePanelOnMain()
 
         notifyStateChange()
@@ -3233,17 +3280,28 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.latestRenderSnapshot.state = s.currentState
         }
 
-        let isNativeMode = state.withLock { $0.tapProcessor.interactionMode != .scaled }
-        if resumeInfo.shouldHideOS && tapActive && !isNativeMode {
-            cursorHider.hide()
-            if (resumeInfo.mapping.settings.confineCursor || resumeInfo.mapping.threeDGameMode) && resumeInfo.placement.shouldWarp {
-                recordWarp(from: resumeInfo.currentPtr, to: resumeInfo.placement.point)
-                performCursorWarp(to: resumeInfo.placement.point, reassociateMouse: !resumeInfo.mapping.threeDGameMode)
+        let hideGate = state.withLock { s -> (allowHide: Bool, isNativeMode: Bool) in
+            guard s.isActive, !s.isSuspended, s.isUsingEventTap, resumeInfo.shouldHideOS else {
+                return (false, true)
             }
-            scheduleVisualPositionUpdate()
-            scheduleCursorShapeRefresh()
+            return (true, s.tapProcessor.interactionMode != .scaled)
+        }
+        if hideGate.allowHide {
+            cursorHider.setAllowedToHide(true)
+            if !hideGate.isNativeMode {
+                cursorHider.hide()
+                if (resumeInfo.mapping.settings.confineCursor || resumeInfo.mapping.threeDGameMode) && resumeInfo.placement.shouldWarp {
+                    recordWarp(from: resumeInfo.currentPtr, to: resumeInfo.placement.point)
+                    performCursorWarp(to: resumeInfo.placement.point, reassociateMouse: !resumeInfo.mapping.threeDGameMode)
+                }
+                scheduleVisualPositionUpdate()
+                scheduleCursorShapeRefresh()
+            } else {
+                cursorHider.show()
+                hideSpritePanelOnMain()
+            }
         } else {
-            cursorHider.show()
+            cursorHider.setAllowedToHide(false)
             hideSpritePanelOnMain()
         }
 
@@ -3255,6 +3313,10 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     }
 
     public func stop() {
+        // Atomically disallow any new hides AND release all local hide levels FIRST so no racing
+        // EventTapThread or maintenanceQueue callback can ever re-hide the cursor during teardown!
+        cursorHider.setAllowedToHide(false)
+
         let cleanup = state.withLock { s -> (wasActive: Bool, prevMode: CursorAlignmentMode, token: RunGuardWatchdog.RecoveryToken?) in
             let wasActive = s.isActive
             let prevMode = s.alignmentMode
@@ -3291,8 +3353,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
 
         stopMaintenanceTimer()
         stopEventTapThread()
-        // Unconditionally release any cursor hide we acquired.
-        cursorHider.show()
+        // Final belt-and-suspenders restore AFTER maintenance timer & event-tap thread have exited.
+        cursorHider.forceRestore()
 
         // Extract panel strongly BEFORE async hop so off-main-thread `deinit` NEVER leaks the panel via `[weak self]`.
         let panelToClose = spritePanelLock.withLockUnchecked { p -> CursorSpriteOverlayPanel? in
@@ -3327,6 +3389,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     // MARK: - Emergency Watchdog Recovery
 
     private func emergencyStopFromWatchdog() {
+        cursorHider.setAllowedToHide(false)
+        stopMaintenanceTimer()
         stopEventTapThread()
         cursorHider.forceRestore()
         state.withLock { s in
@@ -3362,6 +3426,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         let box = EventTapCallbackBox(controller: self)
 
         let readySem = DispatchSemaphore(value: 0)
+        let exitSem = DispatchSemaphore(value: 0)
         let startedFlag = OSAllocatedUnfairLock(initialState: false)
 
         let thread = Thread { [weak self] in
@@ -3410,6 +3475,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 rt.tapPort = tapPort
                 rt.runLoopSource = source
                 rt.callbackBox = box
+                rt.exitSemaphore = exitSem
             }
 
             startedFlag.withLock { $0 = true }
@@ -3430,8 +3496,10 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                     rt.runLoop = nil
                     rt.callbackBox = nil
                     rt.thread = nil
+                    rt.exitSemaphore = nil
                 }
             }
+            exitSem.signal()
         }
 
         thread.name = "com.metalpie.input.event-tap"
@@ -3451,20 +3519,29 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     }
 
     private func stopEventTapThread() {
-        let runtime = tapRuntime.withLockUnchecked { rt -> (CFMachPort?, CFRunLoop?, EventTapCallbackBox?) in
-            let port = rt.tapPort
-            let loop = rt.runLoop
-            let box = rt.callbackBox
-            return (port, loop, box)
+        let runtime = tapRuntime.withLockUnchecked { rt -> (
+            port: CFMachPort?,
+            loop: CFRunLoop?,
+            box: EventTapCallbackBox?,
+            thread: Thread?,
+            exitSem: DispatchSemaphore?
+        ) in
+            let result = (rt.tapPort, rt.runLoop, rt.callbackBox, rt.thread, rt.exitSemaphore)
+            rt.exitSemaphore = nil
+            return result
         }
 
-        runtime.2?.invalidate()
-        if let port = runtime.0 {
+        runtime.box?.invalidate()
+        if let port = runtime.port {
             CGEvent.tapEnable(tap: port, enable: false)
         }
-        if let loop = runtime.1 {
+        if let loop = runtime.loop {
             CFRunLoopStop(loop)
             CFRunLoopWakeUp(loop)
+        }
+        // Bounded wait so any in-flight `handleEventTap` callback finishes cleanly before teardown completes.
+        if let exitSem = runtime.exitSem, runtime.thread !== Thread.current {
+            _ = exitSem.wait(timeout: .now() + .milliseconds(150))
         }
     }
 
@@ -3508,7 +3585,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if !AXIsProcessTrusted() {
                 PipelineLog.shared.warning(.cursor, "Accessibility trust revoked mid-session; restoring OS cursor and switching to accessibilityRequired mode.")
-                cursorHider.show()
+                cursorHider.setAllowedToHide(false)
                 let changedToAXRequired = state.withLock { s -> Bool in
                     let prev = s.alignmentMode
                     s.isUsingEventTap = false
@@ -3548,6 +3625,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             case update(
                 newEventLocation: CGPoint?,
                 warpTarget: CGPoint?,
+                effectiveSourcePoint: CGPoint,
                 shouldRepostAfterWarp: Bool,
                 reassociateMouseOnWarp: Bool,
                 immediateStateNotify: Bool,
@@ -3557,7 +3635,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         let action: TapAction = state.withLock { s in
-            guard s.isActive, !s.isSuspended, let mapping = s.mapping, mapping.isValid else {
+            guard s.isActive, !s.isSuspended, s.isUsingEventTap, let mapping = s.mapping, mapping.isValid else {
                 return .passthrough
             }
 
@@ -3627,6 +3705,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             return .update(
                 newEventLocation: decision.rewrittenEventLocation,
                 warpTarget: decision.warpTarget,
+                effectiveSourcePoint: decision.effectiveSourcePoint,
                 shouldRepostAfterWarp: decision.shouldRepostAfterWarp,
                 reassociateMouseOnWarp: reassociate,
                 immediateStateNotify: stateFlagChanged,
@@ -3642,6 +3721,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         case .update(
             let newEventLocation,
             let warpTarget,
+            let effectiveSourcePoint,
             let shouldRepostAfterWarp,
             let reassociateMouseOnWarp,
             let immediateStateNotify,
@@ -3670,10 +3750,9 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 notifyStateChange()
             }
             if shouldRepostAfterWarp,
-               let loc = newEventLocation ?? warpTarget,
-               repostEventAfterWarp(event, at: loc)
+               repostEventAfterWarp(event, at: newEventLocation ?? warpTarget ?? effectiveSourcePoint)
             {
-                // Drop stale pre-warp event; the freshly hit-tested copy at `loc` was posted to `.cghidEventTap`.
+                // Drop original event; the freshly hit-tested / FIFO-ordered copy was posted to `.cghidEventTap`.
                 return nil
             }
             return Unmanaged.passUnretained(event)
@@ -4067,7 +4146,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     /// suppression interval via `localEventsSuppressionInterval = 0.0` + `CGAssociateMouseAndMouseCursorPosition(true)`
     /// (when not in 3D game mode or FPS mouse-grab). Never calls `CGAssociateMouseAndMouseCursorPosition(false)`.
     private func performCursorWarp(to point: CGPoint, reassociateMouse: Bool) {
-        if state.withLock(\.suppressSystemWarpForTesting) {
+        if state.withLock({ $0.suppressSystemWarpForTesting || !$0.isActive || $0.isSuspended }) {
             return
         }
         warpEventSource?.localEventsSuppressionInterval = 0.0
@@ -4097,6 +4176,16 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
         copied.post(tap: .cghidEventTap)
         return true
+    }
+
+    /// Exposes the underlying `SystemCursorHider` for unit-test depth & race-gate verification.
+    internal var cursorHiderForTesting: SystemCursorHider {
+        cursorHider
+    }
+
+    /// Exposes the active `CursorPointerInteractionMode` for unit-test transition verification.
+    internal var currentInteractionModeForTesting: CursorPointerInteractionMode {
+        state.withLock { $0.tapProcessor.interactionMode }
     }
 
     /// Configures active controller state without launching a live system event tap or warping the
