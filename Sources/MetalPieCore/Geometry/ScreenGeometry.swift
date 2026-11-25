@@ -121,6 +121,9 @@ public struct DisplayDescriptor: Identifiable, Hashable, Codable, Sendable {
     public var maxEDRHeadroom: Double
     /// True for the primary macOS display (`cocoaFrame.origin == .zero`).
     public var isPrimary: Bool
+    /// Top inset in logical points reserved by a physical camera notch / bezel strip on notched
+    /// MacBook displays (`> 0`, e.g. `32`–`33pt` on MacBook Pro 14"/16"; `0` on non-notched displays).
+    public var safeAreaTopInset: Double
 
     public init(
         id: CGDirectDisplayID,
@@ -130,7 +133,8 @@ public struct DisplayDescriptor: Identifiable, Hashable, Codable, Sendable {
         backingScaleFactor: Double = 2.0,
         refreshRateHz: Double = 60.0,
         maxEDRHeadroom: Double = 1.0,
-        isPrimary: Bool = false
+        isPrimary: Bool = false,
+        safeAreaTopInset: Double = 0.0
     ) {
         self.id = id
         self.name = name
@@ -140,6 +144,32 @@ public struct DisplayDescriptor: Identifiable, Hashable, Codable, Sendable {
         self.refreshRateHz = max(1.0, refreshRateHz)
         self.maxEDRHeadroom = max(1.0, maxEDRHeadroom)
         self.isPrimary = isPrimary
+        self.safeAreaTopInset = max(0.0, safeAreaTopInset)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case cocoaFrame
+        case cgBounds
+        case backingScaleFactor
+        case refreshRateHz
+        case maxEDRHeadroom
+        case isPrimary
+        case safeAreaTopInset
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(CGDirectDisplayID.self, forKey: .id)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.cocoaFrame = try c.decode(CGRect.self, forKey: .cocoaFrame)
+        self.cgBounds = try c.decode(CGRect.self, forKey: .cgBounds)
+        self.backingScaleFactor = max(1.0, try c.decode(Double.self, forKey: .backingScaleFactor))
+        self.refreshRateHz = max(1.0, try c.decode(Double.self, forKey: .refreshRateHz))
+        self.maxEDRHeadroom = max(1.0, try c.decode(Double.self, forKey: .maxEDRHeadroom))
+        self.isPrimary = try c.decode(Bool.self, forKey: .isPrimary)
+        self.safeAreaTopInset = max(0.0, try c.decodeIfPresent(Double.self, forKey: .safeAreaTopInset) ?? 0.0)
     }
 
     public var pixelSize: PixelSize {
@@ -151,6 +181,41 @@ public struct DisplayDescriptor: Identifiable, Hashable, Codable, Sendable {
 
     public var supportsHDR: Bool {
         maxEDRHeadroom > 1.0
+    }
+
+    /// True when the display has a physical top camera notch / safe-area inset.
+    public var hasNotch: Bool {
+        safeAreaTopInset > 0.5
+    }
+
+    /// AppKit (Y-up) frame excluding any physical camera notch strip along the top edge.
+    /// Equal to `cocoaFrame` on non-notched displays.
+    public var notchSafeCocoaFrame: CGRect {
+        let inset = CGFloat(max(0.0, safeAreaTopInset))
+        guard inset > 0.5, cocoaFrame.height > inset * 2 else {
+            return cocoaFrame
+        }
+        return CGRect(
+            x: cocoaFrame.origin.x,
+            y: cocoaFrame.origin.y,
+            width: cocoaFrame.size.width,
+            height: cocoaFrame.size.height - inset
+        )
+    }
+
+    /// CoreGraphics (Y-down) bounds excluding any physical camera notch strip along the top edge.
+    /// Equal to `cgBounds` on non-notched displays.
+    public var notchSafeCGBounds: CGRect {
+        let inset = CGFloat(max(0.0, safeAreaTopInset))
+        guard inset > 0.5, cgBounds.height > inset * 2 else {
+            return cgBounds
+        }
+        return CGRect(
+            x: cgBounds.origin.x,
+            y: cgBounds.origin.y + inset,
+            width: cgBounds.size.width,
+            height: cgBounds.size.height - inset
+        )
     }
 
     public func hash(into hasher: inout Hasher) {
@@ -168,6 +233,7 @@ public struct DisplayDescriptor: Identifiable, Hashable, Codable, Sendable {
         hasher.combine(refreshRateHz)
         hasher.combine(maxEDRHeadroom)
         hasher.combine(isPrimary)
+        hasher.combine(safeAreaTopInset)
     }
 }
 
@@ -297,6 +363,22 @@ public enum ScreenGeometry: Sendable {
         in displays: [DisplayDescriptor]
     ) -> CGRect? {
         let selected = targetDisplays(forCGRect: rect, mode: mode, in: displays)
+        return unionRect(selected.map(\.cocoaFrame))
+    }
+
+    /// Returns the notch-safe AppKit (Y-up) fullscreen target frame for `rect`.
+    /// When targeting a single notched display (e.g. MacBook Pro 14"/16"), excludes the physical
+    /// top notch band so scaled content is NEVER clipped behind the camera notch or overlapping
+    /// the top Menu Bar; on non-notched displays (or multi-monitor spans), uses full `cocoaFrame`.
+    public static func targetFullscreenSafeCocoaFrame(
+        forCGRect rect: CGRect,
+        mode: MultiMonitorMode,
+        in displays: [DisplayDescriptor]
+    ) -> CGRect? {
+        let selected = targetDisplays(forCGRect: rect, mode: mode, in: displays)
+        if selected.count == 1 {
+            return selected[0].notchSafeCocoaFrame
+        }
         return unionRect(selected.map(\.cocoaFrame))
     }
 

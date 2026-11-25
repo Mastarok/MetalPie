@@ -299,6 +299,35 @@ struct ConfigStoreAndCatalogTests {
         #expect(result.config.countdownSeconds == 6)
     }
 
+    @Test("ConfigStore default v1 -> v2 migration upgrades legacy lowLatencyPresent=true to false while preserving explicit v2 preference")
+    func configStoreV1ToV2LowLatencyMigration() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let configURL = dir.appendingPathComponent("v1_config.json")
+        var v1 = AppConfig.defaultConfig
+        v1.schemaVersion = 1
+        v1.profiles[0].capture.lowLatencyPresent = true
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(v1).write(to: configURL, options: [.atomic])
+
+        let store = ConfigStore(fileURL: configURL, logger: PipelineLog(maxEntries: 50))
+        let migrated = store.loadResult()
+        #expect(migrated.status == .migrated(fromVersion: 1, toVersion: AppConfig.currentSchemaVersion))
+        #expect(migrated.config.schemaVersion == AppConfig.currentSchemaVersion)
+        #expect(migrated.config.profiles[0].capture.lowLatencyPresent == false)
+
+        // Explicit v2 opt-in to lowLatencyPresent=true must be preserved untouched on subsequent reload
+        var optedIn = migrated.config
+        optedIn.profiles[0].capture.lowLatencyPresent = true
+        try store.save(optedIn)
+        let reloaded = store.loadResult()
+        #expect(reloaded.status == .loaded)
+        #expect(reloaded.config.profiles[0].capture.lowLatencyPresent == true)
+    }
+
     @Test("ScalingMode JSON export and import round-trip")
     func scalingModeExportImport() throws {
         let store = ConfigStore(logger: PipelineLog(maxEntries: 20))

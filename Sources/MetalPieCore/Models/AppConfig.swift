@@ -137,7 +137,7 @@ public enum AppLanguage: String, Codable, Sendable, CaseIterable, Identifiable {
 
 /// Versioned root application configuration persisted atomically to disk.
 public struct AppConfig: Hashable, Codable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
     public static let defaultScreenshotFilenameTemplate = "MetalPie_%PN%_%Y%%M%%D%_%H%%m%%S%"
 
     /// macOS system processes and MetalPie itself that must never be auto-scaled.

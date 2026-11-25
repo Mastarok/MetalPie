@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import Testing
 @testable import MetalPieCore
 
@@ -167,5 +168,73 @@ struct ScreenGeometryTests {
         // Tiny rect should not collapse to negative or zero height
         let tiny = CGRect(x: 0, y: 0, width: 10, height: 2)
         #expect(ScreenGeometry.antiOcclusionInset(cocoaRect: tiny) == tiny)
+    }
+
+    @Test("DisplayDescriptor notch-safe fullscreen geometry excludes camera notch on notched MacBooks and preserves full edge-to-edge on non-notched monitors")
+    func notchSafeDisplayGeometry() throws {
+        let notchedMacBook = DisplayDescriptor(
+            id: 1,
+            name: "Built-in Retina Display",
+            cocoaFrame: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            cgBounds: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            backingScaleFactor: 2.0,
+            refreshRateHz: 120.0,
+            maxEDRHeadroom: 16.0,
+            isPrimary: true,
+            safeAreaTopInset: 33.0
+        )
+        let externalDELL = DisplayDescriptor(
+            id: 3,
+            name: "DELL P2422H",
+            cocoaFrame: CGRect(x: 1512, y: 982, width: 1280, height: 720),
+            cgBounds: CGRect(x: 1512, y: -720, width: 1280, height: 720),
+            backingScaleFactor: 2.0,
+            refreshRateHz: 60.0,
+            maxEDRHeadroom: 1.0,
+            isPrimary: false,
+            safeAreaTopInset: 0.0
+        )
+        let displays = [notchedMacBook, externalDELL]
+
+        #expect(notchedMacBook.hasNotch == true)
+        #expect(notchedMacBook.notchSafeCocoaFrame == CGRect(x: 0, y: 0, width: 1512, height: 949))
+        #expect(notchedMacBook.notchSafeCGBounds == CGRect(x: 0, y: 33, width: 1512, height: 949))
+
+        #expect(externalDELL.hasNotch == false)
+        #expect(externalDELL.notchSafeCocoaFrame == externalDELL.cocoaFrame)
+        #expect(externalDELL.notchSafeCGBounds == externalDELL.cgBounds)
+
+        // Single notched display -> exact below-notch 1512x949 (maxY == 949, zero notch overlap)
+        let macSafe = ScreenGeometry.targetFullscreenSafeCocoaFrame(
+            forCGRect: CGRect(x: 100, y: 120, width: 900, height: 600),
+            mode: .closest,
+            in: displays
+        )
+        #expect(macSafe == CGRect(x: 0, y: 0, width: 1512, height: 949))
+
+        // External non-notched display -> full 1280x720 edge-to-edge
+        let dellSafe = ScreenGeometry.targetFullscreenSafeCocoaFrame(
+            forCGRect: CGRect(x: 1620, y: -600, width: 800, height: 500),
+            mode: .closest,
+            in: displays
+        )
+        #expect(dellSafe == externalDELL.cocoaFrame)
+
+        // Multi-display `.all` span -> preserves full union
+        let allSpan = ScreenGeometry.targetFullscreenSafeCocoaFrame(
+            forCGRect: CGRect(x: 100, y: 120, width: 900, height: 600),
+            mode: .all,
+            in: displays
+        )
+        #expect(allSpan == notchedMacBook.cocoaFrame.union(externalDELL.cocoaFrame))
+
+        // Backwards-compatible Codable decode without `safeAreaTopInset` defaults to 0.0
+        let encoded = try JSONEncoder().encode(notchedMacBook)
+        var obj = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        obj.removeValue(forKey: "safeAreaTopInset")
+        let legacyData = try JSONSerialization.data(withJSONObject: obj)
+        let decodedLegacy = try JSONDecoder().decode(DisplayDescriptor.self, from: legacyData)
+        #expect(decodedLegacy.safeAreaTopInset == 0.0)
+        #expect(decodedLegacy.hasNotch == false)
     }
 }

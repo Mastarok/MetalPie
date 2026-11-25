@@ -186,27 +186,91 @@ private struct CadenceTracker: Sendable {
     }
 }
 
-// MARK: - Telemetry EMA Accumulator
+// MARK: - Rolling Window FPS Counter (Zero Jensen-Inequality Bias)
 
-/// Rolling 500 ms EMA telemetry accumulator computing `sourceFPS`, `outputFPS`, `presentedFPS`,
+/// Unbiased rolling-window FPS estimator measuring exact `(frames - 1) / span` over a sliding
+/// time window (default `0.6 s`).
+///
+/// Unlike averaging instantaneous `1 / dt` values (which suffers Jensen's-inequality upward bias
+/// `E[1/dt] > 1/E[dt]` and inflates jittered 120 Hz cadences to 150-170 fps), counting events
+/// over their true elapsed span reports the exact true frame rate regardless of timing jitter.
+public struct RollingFPSCounter: Sendable {
+    public let windowSeconds: Double
+    private var timestamps: [Double] = []
+    private var headIndex: Int = 0
+    public private(set) var lastTimestamp: Double = 0
+    public private(set) var currentFPS: Double = 0
+
+    public init(windowSeconds: Double = 0.6) {
+        self.windowSeconds = max(0.1, windowSeconds)
+    }
+
+    public mutating func reset() {
+        timestamps.removeAll(keepingCapacity: true)
+        headIndex = 0
+        lastTimestamp = 0
+        currentFPS = 0
+    }
+
+    @discardableResult
+    public mutating func record(at rawTimestamp: Double) -> Double {
+        guard rawTimestamp.isFinite, rawTimestamp > 0 else { return currentFPS }
+        // After a long pause (> 2 s), restart cleanly so pre-pause gaps don't drag down FPS.
+        if lastTimestamp > 0 && (rawTimestamp - lastTimestamp) >= 2.0 {
+            timestamps.removeAll(keepingCapacity: true)
+            headIndex = 0
+            currentFPS = 0
+        }
+        // Keep timestamps monotonic even if async presented callbacks arrive slightly out of order.
+        let t = max(rawTimestamp, lastTimestamp)
+        lastTimestamp = t
+        timestamps.append(t)
+
+        let cutoff = t - windowSeconds
+        while headIndex + 2 < timestamps.count && timestamps[headIndex] < cutoff {
+            headIndex += 1
+        }
+        if headIndex >= 64 && headIndex * 2 >= timestamps.count {
+            timestamps.removeFirst(headIndex)
+            headIndex = 0
+        }
+
+        let activeCount = timestamps.count - headIndex
+        if activeCount >= 2 {
+            let span = t - timestamps[headIndex]
+            if span >= 0.002 {
+                currentFPS = Double(activeCount - 1) / span
+            }
+        }
+        return currentFPS
+    }
+
+    /// Returns `currentFPS`, decaying cleanly to `0` if no frame arrived within `idleTimeout`.
+    public func fps(at now: Double, idleTimeout: Double = 1.5) -> Double {
+        guard lastTimestamp > 0 else { return 0 }
+        if (now - lastTimestamp) > idleTimeout {
+            return 0
+        }
+        return currentFPS
+    }
+}
+
+// MARK: - Telemetry Accumulator
+
+/// Rolling-window telemetry accumulator computing unbiased `sourceFPS`, `outputFPS`, `presentedFPS`,
 /// GPU `frameTimeMs`, duplicate skips, dropped frames, and per-pass timings.
 private final class TelemetryAccumulator: @unchecked Sendable {
-    private static let emaTimeConstantSeconds: Double = 0.5
-
     private struct State: Sendable {
         var telemetry = SessionTelemetry.idle
-        var lastSourceTime: Double = 0
-        var lastOutputTime: Double = 0
-        var lastPresentTime: Double = 0
+        var sourceCounter = RollingFPSCounter(windowSeconds: 0.6)
+        var outputCounter = RollingFPSCounter(windowSeconds: 0.6)
+        var presentCounter = RollingFPSCounter(windowSeconds: 0.6)
         var lastPublishTime: Double = 0
         var lastRenderConsumeTime: Double = 0
         var displayIntervalSeconds: Double = 1.0 / 60.0
         var resizeGraceUntil: Double = 0
         var lastSourceSize: PixelSize = .zero
         var lastDrawableSize: PixelSize = .zero
-        var sourceFPS: Double = 0
-        var outputFPS: Double = 0
-        var presentedFPS: Double = 0
         var frameTimeMs: Double = 0
         var hasPublishedNonZeroFPS: Bool = false
         var hasPublishedNonZeroFrameTime: Bool = false
@@ -300,16 +364,7 @@ private final class TelemetryAccumulator: @unchecked Sendable {
             {
                 s.telemetry.droppedFrames &+= 1
             }
-            if s.lastSourceTime > 0 {
-                let dt = now - s.lastSourceTime
-                if dt >= 0.002 && dt < 2.0 {
-                    let instantFPS = 1.0 / dt
-                    let alpha = 1.0 - exp(-dt / Self.emaTimeConstantSeconds)
-                    s.sourceFPS = s.sourceFPS == 0 ? instantFPS : (s.sourceFPS + alpha * (instantFPS - s.sourceFPS))
-                }
-            }
-            s.lastSourceTime = now
-            s.telemetry.sourceFPS = s.sourceFPS
+            s.telemetry.sourceFPS = s.sourceCounter.record(at: now)
         }
     }
 
@@ -322,16 +377,7 @@ private final class TelemetryAccumulator: @unchecked Sendable {
             if wasDuplicateSkipped {
                 s.telemetry.duplicateFramesSkipped &+= 1
             }
-            if s.lastOutputTime > 0 {
-                let dt = now - s.lastOutputTime
-                if dt > 0.0005 && dt < 2.0 {
-                    let instantFPS = 1.0 / dt
-                    let alpha = 1.0 - exp(-dt / Self.emaTimeConstantSeconds)
-                    s.outputFPS = s.outputFPS == 0 ? instantFPS : (s.outputFPS + alpha * (instantFPS - s.outputFPS))
-                }
-            }
-            s.lastOutputTime = now
-            s.telemetry.outputFPS = s.outputFPS
+            s.telemetry.outputFPS = s.outputCounter.record(at: now)
             if !passTimings.isEmpty {
                 s.telemetry.passTimings = passTimings
             }
@@ -348,18 +394,7 @@ private final class TelemetryAccumulator: @unchecked Sendable {
 
     func recordPresented(presentedTime: Double) {
         lock.withLock { s in
-            if s.lastPresentTime > 0 {
-                let dt = presentedTime - s.lastPresentTime
-                if dt > 0.0005 && dt < 2.0 {
-                    let instantFPS = 1.0 / dt
-                    let alpha = 1.0 - exp(-dt / Self.emaTimeConstantSeconds)
-                    s.presentedFPS = s.presentedFPS == 0
-                        ? instantFPS
-                        : (s.presentedFPS + alpha * (instantFPS - s.presentedFPS))
-                }
-            }
-            s.lastPresentTime = presentedTime
-            s.telemetry.presentedFPS = s.presentedFPS
+            s.telemetry.presentedFPS = s.presentCounter.record(at: presentedTime)
         }
     }
 
@@ -368,15 +403,9 @@ private final class TelemetryAccumulator: @unchecked Sendable {
             var copy = s.telemetry
             let now = CACurrentMediaTime()
             // Decay stale FPS readouts cleanly to 0 if idle > 1.5 s.
-            if s.lastSourceTime > 0 && (now - s.lastSourceTime) > 1.5 {
-                copy.sourceFPS = 0
-            }
-            if s.lastOutputTime > 0 && (now - s.lastOutputTime) > 1.5 {
-                copy.outputFPS = 0
-            }
-            if s.lastPresentTime > 0 && (now - s.lastPresentTime) > 1.5 {
-                copy.presentedFPS = 0
-            }
+            copy.sourceFPS = s.sourceCounter.fps(at: now)
+            copy.outputFPS = s.outputCounter.fps(at: now)
+            copy.presentedFPS = s.presentCounter.fps(at: now)
             return copy
         }
     }
@@ -400,15 +429,9 @@ private final class TelemetryAccumulator: @unchecked Sendable {
             }
             s.lastPublishTime = now
             var copy = s.telemetry
-            if s.lastSourceTime > 0 && (now - s.lastSourceTime) > 1.5 {
-                copy.sourceFPS = 0
-            }
-            if s.lastOutputTime > 0 && (now - s.lastOutputTime) > 1.5 {
-                copy.outputFPS = 0
-            }
-            if s.lastPresentTime > 0 && (now - s.lastPresentTime) > 1.5 {
-                copy.presentedFPS = 0
-            }
+            copy.sourceFPS = s.sourceCounter.fps(at: now)
+            copy.outputFPS = s.outputCounter.fps(at: now)
+            copy.presentedFPS = s.presentCounter.fps(at: now)
             return copy
         }
     }

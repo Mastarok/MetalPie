@@ -185,9 +185,20 @@ public final class ConfigStore: Sendable {
     }
 
     private static func defaultMigrate(rawData: Data, fromVersion: Int) throws -> Data {
-        // Placeholder for future v1 -> v2+ migrations; currently bumps schemaVersion in JSON object.
         guard var json = try JSONSerialization.jsonObject(with: rawData) as? [String: Any] else {
             return rawData
+        }
+        // v1 -> v2 migration: legacy v1 seeded `capture.lowLatencyPresent = true`, which bypassed
+        // `CAMetalDisplayLink` VSync and caused hover/video-scrubber jitter on ProMotion displays.
+        // Upgrade existing v1 profiles cleanly to `false` (users can still opt in explicitly in v2+).
+        if fromVersion < 2, var profiles = json["profiles"] as? [[String: Any]] {
+            for idx in profiles.indices {
+                if var capture = profiles[idx]["capture"] as? [String: Any] {
+                    capture["lowLatencyPresent"] = false
+                    profiles[idx]["capture"] = capture
+                }
+            }
+            json["profiles"] = profiles
         }
         json["schemaVersion"] = AppConfig.currentSchemaVersion
         return try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])

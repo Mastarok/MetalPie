@@ -1877,9 +1877,20 @@ public final class AppCoordinator {
                 repositionWindowedOverlay: !suppressWindowedOverlayMove
             )
             if let profile = activeProfile, let metrics = lastOverlayMetrics {
+                let effectiveProfile = effectiveProfileForSession(profile)
+                if let mode = activeScalingMode {
+                    renderLoopController?.updateConfiguration(RenderSessionConfiguration(
+                        targetWindowName: window.displayName,
+                        profile: effectiveProfile,
+                        scalingMode: mode,
+                        overlayMetrics: metrics,
+                        vrrDirectScanout: metrics.isVRRDirectScanoutActive,
+                        isNativeFullscreenSource: isFullscreenVideoOrGameSource(for: window)
+                    ))
+                }
                 cursorController.update(configuration: buildCursorConfiguration(
                     window: window,
-                    profile: effectiveProfileForSession(profile),
+                    profile: effectiveProfile,
                     metrics: metrics,
                     layout: lastLayout
                 ))
@@ -2073,14 +2084,55 @@ public final class AppCoordinator {
                     forPreviousWindow: currentWin,
                     allowShortSettleWait: true
                 )
-                // If we exited a native Full-Screen Space and the previous fullscreen window is
-                // no longer on screen with no replacement desktop window for the same app, stop
-                // cleanly so neither an orphan overlay nor `.accessory` policy lingers.
-                if !followed && wasNativeFS && isScalingSessionOpen && activeWindow?.windowID == currentWin.windowID {
-                    let prevStillOnScreen = WindowEnumerator.windowDescriptor(for: currentWin.windowID)?.isOnScreen ?? false
-                    let sameAppFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == currentWin.pid
-                    if !prevStillOnScreen && sameAppFront {
-                        await stopScaling(isManual: false, showToast: false)
+                if !followed && isScalingSessionOpen && activeWindow?.windowID == currentWin.windowID {
+                    if let refreshed = WindowEnumerator.windowDescriptor(for: currentWin.windowID),
+                       refreshed.isOnScreen
+                    {
+                        // Same windowID transitioned Spaces (e.g. Chrome/Safari entering or exiting
+                        // HTML5 native fullscreen while reusing the same CGWindowID): immediately sync
+                        // overlay level/policy, render fullscreen SR gating, and SCStream filter mode!
+                        activeWindow = refreshed
+                        overlayWindowController?.updateSourceWindowGeometry(
+                            refreshed.cgBounds,
+                            windowID: refreshed.windowID
+                        )
+                        if let profile = activeProfile,
+                           let mode = activeScalingMode,
+                           let overlayController = overlayWindowController
+                        {
+                            let effectiveProfile = effectiveProfileForSession(profile)
+                            let metrics = overlayController.currentDrawableMetrics()
+                            lastOverlayMetrics = metrics
+                            renderLoopController?.updateConfiguration(RenderSessionConfiguration(
+                                targetWindowName: refreshed.displayName,
+                                profile: effectiveProfile,
+                                scalingMode: mode,
+                                overlayMetrics: metrics,
+                                vrrDirectScanout: metrics.isVRRDirectScanoutActive,
+                                isNativeFullscreenSource: isFullscreenVideoOrGameSource(for: refreshed)
+                            ))
+                            try? await screenCaptureEngine?.updateConfiguration(
+                                window: refreshed,
+                                profile: effectiveProfile,
+                                scalingMode: mode
+                            )
+                            cursorController.update(configuration: buildCursorConfiguration(
+                                window: refreshed,
+                                profile: effectiveProfile,
+                                metrics: metrics,
+                                layout: lastLayout
+                            ))
+                            syncVRRCursorSnapshotIfNeeded()
+                            syncPopupMonitorSnapshot()
+                        }
+                    } else if wasNativeFS {
+                        // Exited a native Full-Screen Space and the previous fullscreen window is no longer
+                        // on screen with no replacement desktop window for the same app: stop cleanly so
+                        // neither an orphan overlay nor `.accessory` policy lingers.
+                        let sameAppFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == currentWin.pid
+                        if sameAppFront {
+                            await stopScaling(isManual: false, showToast: false)
+                        }
                     }
                 }
             }

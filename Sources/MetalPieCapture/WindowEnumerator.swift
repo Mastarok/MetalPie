@@ -84,6 +84,25 @@ public enum WindowEnumerator: Sendable {
         var refreshRateHz: Double
         var maxEDRHeadroom: Double
         var backingScaleFactor: Double
+        var safeAreaTopInset: Double
+    }
+
+    /// Pure, unit-testable top notch-band resolver for `DisplayDescriptor.safeAreaTopInset`.
+    /// - On notched displays (`safeAreaTop > 0.5`, e.g. MacBook Pro 14"/16" with 32pt notch), aligns
+    ///   with macOS's native fullscreen / menu bar boundary (`menuBarTopInset`, e.g. 33pt -> exact 1512×949)
+    ///   when within 12pt of `safeAreaTop`, falling back to `safeAreaTop` when the menu bar is auto-hidden.
+    /// - On non-notched displays (`safeAreaTop <= 0.5`), returns `0` so fullscreen fills edge-to-edge.
+    public static func resolveNotchSafeTopInset(
+        safeAreaTop: Double,
+        menuBarTopInset: Double
+    ) -> Double {
+        let clampedSafe = max(0.0, safeAreaTop)
+        guard clampedSafe > 0.5 else { return 0.0 }
+        let clampedMenu = max(0.0, menuBarTopInset)
+        if clampedMenu >= clampedSafe && clampedMenu <= clampedSafe + 12.0 {
+            return clampedMenu
+        }
+        return clampedSafe
     }
 
     // MARK: - Multi-Monitor Display Enumeration
@@ -138,6 +157,12 @@ public enum WindowEnumerator: Sendable {
             let displayName = screen.localizedName.isEmpty
                 ? "Display \(displayID)"
                 : screen.localizedName
+            let rawSafeTop = max(0.0, Double(screen.safeAreaInsets.top))
+            let menuBarTopInset = max(0.0, Double(cocoaFrame.maxY - screen.visibleFrame.maxY))
+            let safeAreaTopInset = resolveNotchSafeTopInset(
+                safeAreaTop: rawSafeTop,
+                menuBarTopInset: menuBarTopInset
+            )
 
             descriptors.append(
                 DisplayDescriptor(
@@ -148,7 +173,8 @@ public enum WindowEnumerator: Sendable {
                     backingScaleFactor: scale,
                     refreshRateHz: refreshHz,
                     maxEDRHeadroom: edrHeadroom,
-                    isPrimary: isPrimary
+                    isPrimary: isPrimary,
+                    safeAreaTopInset: safeAreaTopInset
                 )
             )
 
@@ -156,7 +182,8 @@ public enum WindowEnumerator: Sendable {
                 name: displayName,
                 refreshRateHz: refreshHz,
                 maxEDRHeadroom: edrHeadroom,
-                backingScaleFactor: scale
+                backingScaleFactor: scale,
+                safeAreaTopInset: safeAreaTopInset
             )
         }
 
@@ -250,7 +277,8 @@ public enum WindowEnumerator: Sendable {
                     backingScaleFactor: inferredScale,
                     refreshRateHz: refreshHz,
                     maxEDRHeadroom: cached?.maxEDRHeadroom ?? 1.0,
-                    isPrimary: isPrimary
+                    isPrimary: isPrimary,
+                    safeAreaTopInset: cached?.safeAreaTopInset ?? 0.0
                 )
             )
         }

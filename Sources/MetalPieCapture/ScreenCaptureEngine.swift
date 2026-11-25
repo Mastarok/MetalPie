@@ -114,6 +114,8 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         var captureMode: CaptureMode
         var windowID: CGWindowID
         var displayID: CGDirectDisplayID
+        var usesDisplayScopedWindowCapture: Bool
+        var sourceRect: CGRect?
         var pixelWidth: Int
         var pixelHeight: Int
         var backingScaleFactor: Double
@@ -135,6 +137,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         var activeProfile: Profile?
         var activeScalingMode: ScalingMode?
         var appliedConfig: AppliedStreamConfig?
+        var detectedChildWindowShrink: Bool = false
         var lastReportedScreenRect: CGRect = .zero
         var lastFrameHostTime: CFAbsoluteTime = 0
         var frameCount: UInt64 = 0
@@ -272,6 +275,67 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         state.withLock { $0.onContentResolutionChanged = handler }
     }
 
+    /// Pure, unit-testable converter returning the display-local `SCStreamConfiguration.sourceRect`
+    /// for a window on `displayCGBounds` (required by ScreenCaptureKit on both primary and secondary
+    /// negative-CG-Y monitors so `SCContentFilter(display:...)` never throws `-3812`).
+    /// Returns `nil` if the window is mostly off-display (< 50% area) or smaller than 64×64 pt.
+    public static func computeDisplayLocalSourceRect(
+        windowCGRect: CGRect,
+        displayCGBounds: CGRect
+    ) -> CGRect? {
+        let win = windowCGRect.standardized
+        let disp = displayCGBounds.standardized
+        guard win.width >= 64, win.height >= 64, disp.width >= 64, disp.height >= 64 else {
+            return nil
+        }
+        let inter = win.intersection(disp)
+        guard !inter.isNull, inter.width >= 64, inter.height >= 64 else {
+            return nil
+        }
+        let winArea = win.width * win.height
+        let interArea = inter.width * inter.height
+        guard winArea > 0, (interArea / winArea) >= 0.5 else {
+            return nil
+        }
+
+        let localX = min(max(0.0, (inter.minX - disp.minX).rounded()), max(0.0, disp.width - 1.0))
+        let localY = min(max(0.0, (inter.minY - disp.minY).rounded()), max(0.0, disp.height - 1.0))
+        let localW = min(max(1.0, inter.width.rounded()), disp.width - localX)
+        let localH = min(max(1.0, inter.height.rounded()), disp.height - localY)
+        guard localW >= 64, localH >= 64 else {
+            return nil
+        }
+        return CGRect(x: localX, y: localY, width: localW, height: localH)
+    }
+
+    /// Pure, unit-testable policy deciding whether window capture should use a display-scoped
+    /// `SCContentFilter` + `sourceRect` instead of `SCContentFilter(desktopIndependentWindow:)`.
+    ///
+    /// Chrome/Chromium/Electron native fullscreen windows attach offscreen fullscreen toolbar child
+    /// windows (e.g. `y = -113`, `y = -73`), causing `desktopIndependentWindow` to expand its composite
+    /// bounding box and shrink the captured video (`contentScale ≈ 0.867`, `1310×949` with black bars).
+    /// Display-scoped capture with display-local `sourceRect` ignores offscreen child windows completely
+    /// and delivers exact `contentScale == 1.0` full-bleed frames!
+    public static func shouldUseDisplayScopedWindowCapture(
+        windowBounds: CGRect,
+        displays: [DisplayDescriptor],
+        isFullscreenWindow: Bool,
+        didDetectChildWindowShrink: Bool,
+        captureMode: CaptureMode
+    ) -> Bool {
+        guard captureMode == .window else { return false }
+        guard isFullscreenWindow || didDetectChildWindowShrink else { return false }
+        guard let targetDisplay = ScreenGeometry.bestDisplay(forCGRect: windowBounds, in: displays)
+            ?? ScreenGeometry.primaryDisplay(in: displays)
+        else {
+            return false
+        }
+        return computeDisplayLocalSourceRect(
+            windowCGRect: windowBounds,
+            displayCGBounds: targetDisplay.cgBounds
+        ) != nil
+    }
+
     /// Pauses or resumes frame emission without tearing down the active `SCStream`
     /// (useful when the target app temporarily loses focus).
     public func setPaused(_ paused: Bool) {
@@ -303,6 +367,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                 s.onFrame = onFrame
                 s.onEvent = onEvent
                 s.isPaused = false
+                s.detectedChildWindowShrink = false
                 s.frameCount = 0
                 s.lastFrameHostTime = 0
                 s.lastReportedScreenRect = window.cgBounds
@@ -319,10 +384,25 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             }
 
             let displays = await WindowEnumerator.enumerateDisplaysAsync()
+            let isFullscreenWindow = (profile.capture.captureMode == .window)
+                && WindowEnumerator.isFullscreenVideoOrGameWindow(
+                    windowID: window.windowID,
+                    bounds: window.cgBounds,
+                    displays: displays
+                )
+            let useDisplayScoped = Self.shouldUseDisplayScopedWindowCapture(
+                windowBounds: window.cgBounds,
+                displays: displays,
+                isFullscreenWindow: isFullscreenWindow,
+                didDetectChildWindowShrink: false,
+                captureMode: profile.capture.captureMode
+            )
             let (filter, scConfig, applied) = try await self.buildFilterAndConfiguration(
                 window: window,
                 profile: profile,
-                displays: displays
+                displays: displays,
+                useDisplayScopedWindowCapture: useDisplayScoped,
+                isFullscreenWindow: isFullscreenWindow
             )
 
             // Flush texture cache before attaching new stream to guarantee clean surface tracking.
@@ -402,11 +482,46 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                 ?? ScreenGeometry.primaryDisplay(in: displays)
             let targetDisplayID = targetDisplayDescriptor?.id ?? CGMainDisplayID()
 
+            let isFullscreenWindow = (profile.capture.captureMode == .window)
+                && WindowEnumerator.isFullscreenVideoOrGameWindow(
+                    windowID: window.windowID,
+                    bounds: window.cgBounds,
+                    displays: displays
+                )
+
+            let didDetectShrink: Bool = self.state.withLock { s in
+                if let prev = s.appliedConfig, prev.windowID != window.windowID {
+                    s.detectedChildWindowShrink = false
+                } else if let prev = s.appliedConfig,
+                          prev.usesDisplayScopedWindowCapture,
+                          !isFullscreenWindow,
+                          !WindowEnumerator.isNotchInsetFullscreenBounds(window.cgBounds, displays: displays),
+                          let disp = targetDisplayDescriptor,
+                          !WindowEnumerator.boundsCoversDisplay(window.cgBounds, displayBounds: disp.cgBounds, tolerance: 4.0),
+                          (abs(Double(window.cgBounds.width) * prev.backingScaleFactor - Double(prev.pixelWidth)) > 16.0
+                           || abs(Double(window.cgBounds.height) * prev.backingScaleFactor - Double(prev.pixelHeight)) > 16.0)
+                {
+                    // Window exited fullscreen / resized back to a normal desktop window:
+                    // clear shrink flag so we cleanly return to `desktopIndependentWindow`.
+                    s.detectedChildWindowShrink = false
+                }
+                return s.detectedChildWindowShrink
+            }
+
+            let wantsDisplayScoped = Self.shouldUseDisplayScopedWindowCapture(
+                windowBounds: window.cgBounds,
+                displays: displays,
+                isFullscreenWindow: isFullscreenWindow,
+                didDetectChildWindowShrink: didDetectShrink,
+                captureMode: profile.capture.captureMode
+            )
+
             let filterChanged: Bool
             if let prev = previousApplied {
                 filterChanged = prev.captureMode != profile.capture.captureMode
                     || prev.windowID != window.windowID
-                    || (profile.capture.captureMode == .display && prev.displayID != targetDisplayID)
+                    || prev.usesDisplayScopedWindowCapture != wantsDisplayScoped
+                    || ((profile.capture.captureMode == .display || wantsDisplayScoped) && prev.displayID != targetDisplayID)
             } else {
                 filterChanged = true
             }
@@ -419,15 +534,25 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                 let built = try await self.buildFilterAndConfiguration(
                     window: window,
                     profile: profile,
-                    displays: displays
+                    displays: displays,
+                    useDisplayScopedWindowCapture: wantsDisplayScoped,
+                    isFullscreenWindow: isFullscreenWindow
                 )
                 newFilter = built.0
                 newSCConfig = built.1
                 newApplied = built.2
             } else {
-                // Fast path: stream target identity did NOT change -> SKIP SCShareableContent IPC (15-40ms)!
+                // Fast path: stream target identity & filter mode did NOT change -> SKIP SCShareableContent IPC!
                 // Build SCStreamConfiguration directly from window.cgBounds & display backingScaleFactor.
                 newFilter = nil
+                let localSourceRect: CGRect? = wantsDisplayScoped
+                    ? targetDisplayDescriptor.flatMap {
+                        Self.computeDisplayLocalSourceRect(
+                            windowCGRect: window.cgBounds,
+                            displayCGBounds: $0.cgBounds
+                        )
+                    }
+                    : nil
                 let built = await self.buildStreamConfiguration(
                     window: window,
                     profile: profile,
@@ -435,7 +560,9 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                     targetDisplayDescriptor: targetDisplayDescriptor,
                     targetDisplayID: targetDisplayID,
                     filterPointPixelScale: nil,
-                    filterContentSize: nil
+                    filterContentSize: nil,
+                    usesDisplayScopedWindowCapture: wantsDisplayScoped && localSourceRect != nil,
+                    displayLocalSourceRect: localSourceRect
                 )
                 newSCConfig = built.0
                 newApplied = built.1
@@ -453,12 +580,25 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                 return
             }
 
+            let leavingDisplayScoped = (previousApplied?.usesDisplayScopedWindowCapture == true)
+                && !newApplied.usesDisplayScopedWindowCapture
             do {
-                if let newFilter, filterChanged {
-                    try await stream.updateContentFilter(newFilter)
-                }
-                if configChanged {
-                    try await stream.updateConfiguration(newSCConfig)
+                if leavingDisplayScoped {
+                    // Clear display-local `sourceRect` BEFORE switching back to `desktopIndependentWindow`
+                    // so SCK never rejects an out-of-bounds `sourceRect` during filter transition.
+                    if configChanged {
+                        try await stream.updateConfiguration(newSCConfig)
+                    }
+                    if let newFilter, filterChanged {
+                        try await stream.updateContentFilter(newFilter)
+                    }
+                } else {
+                    if let newFilter, filterChanged {
+                        try await stream.updateContentFilter(newFilter)
+                    }
+                    if configChanged {
+                        try await stream.updateConfiguration(newSCConfig)
+                    }
                 }
             } catch {
                 PipelineLog.shared.warning(
@@ -516,6 +656,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             s.isRunning = false
             s.isPaused = false
             s.appliedConfig = nil
+            s.detectedChildWindowShrink = false
             s.activeWindow = nil
             s.activeProfile = nil
             s.activeScalingMode = nil
@@ -554,7 +695,9 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
     private func buildFilterAndConfiguration(
         window: WindowDescriptor,
         profile: Profile,
-        displays: [DisplayDescriptor]
+        displays: [DisplayDescriptor],
+        useDisplayScopedWindowCapture: Bool = false,
+        isFullscreenWindow: Bool = false
     ) async throws -> (SCContentFilter, SCStreamConfiguration, AppliedStreamConfig) {
         let content: SCShareableContent
         do {
@@ -569,14 +712,51 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         let targetDisplayDescriptor = ScreenGeometry.bestDisplay(forCGRect: window.cgBounds, in: displays)
             ?? ScreenGeometry.primaryDisplay(in: displays)
         let targetDisplayID = targetDisplayDescriptor?.id ?? CGMainDisplayID()
+        let ownPID = ProcessInfo.processInfo.processIdentifier
 
         let filter: SCContentFilter
+        var resolvedDisplayScoped = false
+        var resolvedLocalSourceRect: CGRect? = nil
+
         switch profile.capture.captureMode {
         case .window:
             guard let scWindow = content.windows.first(where: { $0.windowID == window.windowID }) else {
                 throw EngineError.targetWindowNotFound(window.windowID)
             }
-            filter = SCContentFilter(desktopIndependentWindow: scWindow)
+            if useDisplayScopedWindowCapture,
+               let scDisplay = content.displays.first(where: { $0.displayID == targetDisplayID }),
+               let localSource = Self.computeDisplayLocalSourceRect(
+                   windowCGRect: window.cgBounds,
+                   displayCGBounds: scDisplay.frame
+               )
+            {
+                // Display-scoped window capture with exact display-local `sourceRect`:
+                // completely immune to Chrome/Chromium/Electron offscreen fullscreen toolbar child
+                // windows (`y = -113` / `-73`) that shrink `desktopIndependentWindow` to ~86.7%!
+                let displayFilter: SCContentFilter
+                if isFullscreenWindow && window.pid != ownPID {
+                    if let ownApp = content.applications.first(where: { $0.processID == ownPID }) {
+                        displayFilter = SCContentFilter(
+                            display: scDisplay,
+                            excludingApplications: [ownApp],
+                            exceptingWindows: []
+                        )
+                    } else {
+                        let ownWindows = content.windows.filter { $0.owningApplication?.processID == ownPID }
+                        displayFilter = SCContentFilter(display: scDisplay, excludingWindows: ownWindows)
+                    }
+                } else {
+                    displayFilter = SCContentFilter(display: scDisplay, including: [scWindow])
+                }
+                if #available(macOS 14.2, *) {
+                    displayFilter.includeMenuBar = false
+                }
+                filter = displayFilter
+                resolvedDisplayScoped = true
+                resolvedLocalSourceRect = localSource
+            } else {
+                filter = SCContentFilter(desktopIndependentWindow: scWindow)
+            }
 
         case .display:
             guard let scDisplay = content.displays.first(where: { $0.displayID == targetDisplayID })
@@ -584,9 +764,17 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             else {
                 throw EngineError.targetWindowNotCapturable("No matching SCDisplay found for display capture.")
             }
-            let ownPID = ProcessInfo.processInfo.processIdentifier
-            let ownWindows = content.windows.filter { $0.owningApplication?.processID == ownPID }
-            let displayFilter = SCContentFilter(display: scDisplay, excludingWindows: ownWindows)
+            let displayFilter: SCContentFilter
+            if let ownApp = content.applications.first(where: { $0.processID == ownPID }) {
+                displayFilter = SCContentFilter(
+                    display: scDisplay,
+                    excludingApplications: [ownApp],
+                    exceptingWindows: []
+                )
+            } else {
+                let ownWindows = content.windows.filter { $0.owningApplication?.processID == ownPID }
+                displayFilter = SCContentFilter(display: scDisplay, excludingWindows: ownWindows)
+            }
             if #available(macOS 14.2, *) {
                 displayFilter.includeMenuBar = false
             }
@@ -602,7 +790,9 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             targetDisplayDescriptor: targetDisplayDescriptor,
             targetDisplayID: targetDisplayID,
             filterPointPixelScale: Double(filterInfo.pointPixelScale),
-            filterContentSize: filterInfo.contentRect.size
+            filterContentSize: resolvedDisplayScoped ? nil : filterInfo.contentRect.size,
+            usesDisplayScopedWindowCapture: resolvedDisplayScoped,
+            displayLocalSourceRect: resolvedLocalSourceRect
         )
         return (filter, config, applied)
     }
@@ -614,7 +804,9 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         targetDisplayDescriptor: DisplayDescriptor?,
         targetDisplayID: CGDirectDisplayID,
         filterPointPixelScale: Double?,
-        filterContentSize: CGSize?
+        filterContentSize: CGSize?,
+        usesDisplayScopedWindowCapture: Bool = false,
+        displayLocalSourceRect: CGRect? = nil
     ) async -> (SCStreamConfiguration, AppliedStreamConfig) {
         let resolvedScale = max(
             1.0,
@@ -624,7 +816,9 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         )
 
         let basePointSize: CGSize
-        if let contentSize = filterContentSize, contentSize.width >= 16 && contentSize.height >= 16 {
+        if usesDisplayScopedWindowCapture, let localSource = displayLocalSourceRect {
+            basePointSize = localSource.size
+        } else if let contentSize = filterContentSize, contentSize.width >= 16 && contentSize.height >= 16 {
             basePointSize = contentSize
         } else if profile.capture.captureMode == .display, let d = targetDisplayDescriptor {
             basePointSize = d.cgBounds.size
@@ -638,6 +832,9 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         let config = SCStreamConfiguration()
         config.width = pixelWidth
         config.height = pixelHeight
+        if usesDisplayScopedWindowCapture, let localSource = displayLocalSourceRect {
+            config.sourceRect = localSource
+        }
         config.scalesToFit = true
         config.preservesAspectRatio = true
         config.ignoreShadowsSingleWindow = profile.capture.ignoreShadows
@@ -719,6 +916,8 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             captureMode: profile.capture.captureMode,
             windowID: window.windowID,
             displayID: targetDisplayID,
+            usesDisplayScopedWindowCapture: usesDisplayScopedWindowCapture && displayLocalSourceRect != nil,
+            sourceRect: usesDisplayScopedWindowCapture ? displayLocalSourceRect : nil,
             pixelWidth: pixelWidth,
             pixelHeight: pixelHeight,
             backingScaleFactor: resolvedScale,
@@ -899,8 +1098,22 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                     textureSize: PixelSize(width: pixelWidth, height: pixelHeight)
                 ) != nil
 
+                // Detect Chrome/Chromium/Electron attached offscreen child-window shrink
+                // (e.g. fullscreen toolbar at `y = -113` causing `desktopIndependentWindow` to
+                // report `contentScale ≈ 0.867` even though buffer pixels already match `screenRect * scaleFactor`):
+                // switch immediately to display-scoped `sourceRect` capture!
+                let detectedOffscreenChildShrink = !applied.usesDisplayScopedWindowCapture
+                    && applied.ignoreShadows
+                    && contentScale < 0.98
+                    && abs(pixelWidth - expectedW) <= 4
+                    && abs(pixelHeight - expectedH) <= 4
+                if detectedOffscreenChildShrink {
+                    s.detectedChildWindowShrink = true
+                }
+
                 // Reconfigure on ANY pixel size, content scale, aspect ratio, padding, or backing scale change.
-                if contentScaleDrifted
+                if detectedOffscreenChildShrink
+                    || contentScaleDrifted
                     || aspectRatioChanged
                     || hasContentPadding
                     || abs(expectedW - applied.pixelWidth) >= 2
@@ -913,9 +1126,9 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                         win.cgBounds = screenRect
                         win.backingScaleFactor = scaleFactor
                         s.activeWindow = win
-                        // Snap quickly (40ms) on fullscreen transitions / aspect shifts / SCK padding,
+                        // Snap quickly (40ms) on fullscreen transitions / aspect shifts / SCK padding / child shrink,
                         // while keeping 180ms settle debounce for gradual drags & titlebar zooms.
-                        let debounceMs = (contentScale < 0.98 || aspectRatioChanged || hasContentPadding)
+                        let debounceMs = (detectedOffscreenChildShrink || contentScale < 0.98 || aspectRatioChanged || hasContentPadding)
                             ? Self.fastResizeDebounceMilliseconds
                             : Self.resizeDebounceMilliseconds
                         reconfigPayload = (win, prof, mode, debounceMs)

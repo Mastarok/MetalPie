@@ -1697,8 +1697,12 @@ public final class OverlayWindowController {
     }
 
     /// Pure, unit-testable multi-monitor overlay frame solver returning global AppKit (Y-up) coordinates.
-    /// When `hostVisibleCocoaFrame` is supplied in `.windowed` mode, clamps the windowed overlay strictly
-    /// inside the menu-bar-safe visible frame (`frame.maxY <= hostVisibleCocoaFrame.maxY`).
+    /// - In `.fullscreen` mode when `respectNotchSafeArea == true` (default for non-VRR sessions),
+    ///   excludes any physical camera notch strip (`DisplayDescriptor.safeAreaTopInset`) on single
+    ///   notched MacBook displays so scaled content is NEVER clipped behind the notch or overlapping
+    ///   the top Menu Bar, while filling non-notched displays 100% edge-to-edge.
+    /// - In `.windowed` mode when `hostVisibleCocoaFrame` is supplied, clamps the windowed overlay
+    ///   strictly inside the menu-bar-safe visible frame (`frame.maxY <= hostVisibleCocoaFrame.maxY`).
     public static func computeOverlayCocoaFrame(
         sourceCGRect: CGRect,
         presentationMode: PresentationMode,
@@ -1707,15 +1711,22 @@ public final class OverlayWindowController {
         aspectRatio: CGFloat,
         lastWindowedWidth: CGFloat? = nil,
         applyAntiOcclusion: Bool = true,
-        hostVisibleCocoaFrame: CGRect? = nil
+        hostVisibleCocoaFrame: CGRect? = nil,
+        respectNotchSafeArea: Bool = true
     ) -> CGRect {
         switch presentationMode {
         case .fullscreen:
-            var rect = ScreenGeometry.targetCocoaFrame(
-                forCGRect: sourceCGRect,
-                mode: multiMonitorMode,
-                in: displays
-            ) ?? NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1280, height: 720)
+            var rect = (respectNotchSafeArea
+                ? ScreenGeometry.targetFullscreenSafeCocoaFrame(
+                    forCGRect: sourceCGRect,
+                    mode: multiMonitorMode,
+                    in: displays
+                )
+                : ScreenGeometry.targetCocoaFrame(
+                    forCGRect: sourceCGRect,
+                    mode: multiMonitorMode,
+                    in: displays
+                )) ?? NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1280, height: 720)
 
             if applyAntiOcclusion {
                 rect = ScreenGeometry.antiOcclusionInset(cocoaRect: rect, insetPoints: 1.0)
@@ -2133,7 +2144,8 @@ public final class OverlayWindowController {
             aspectRatio: aspectRatio,
             lastWindowedWidth: lastWindowedWidth,
             applyAntiOcclusion: applyAntiOcclusion,
-            hostVisibleCocoaFrame: visibleCocoa
+            hostVisibleCocoaFrame: visibleCocoa,
+            respectNotchSafeArea: !isEffectiveVRRDirectScanout()
         )
     }
 

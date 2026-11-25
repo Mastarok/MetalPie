@@ -977,7 +977,8 @@ struct CaptureToRenderPipelineIntegrationTests {
         #expect(view.metalLayer.framebufferOnly == true)
         #expect(view.metalLayer.maximumDrawableCount == 3)
         if let primary = ScreenGeometry.primaryDisplay(in: displays) {
-            #expect(abs(metrics.cocoaFrame.height - (primary.cocoaFrame.height - 1.0)) <= 1.0)
+            #expect(abs(metrics.cocoaFrame.height - (primary.notchSafeCocoaFrame.height - 1.0)) <= 1.0)
+            #expect(metrics.cocoaFrame.maxY <= primary.notchSafeCocoaFrame.maxY + 0.5)
         }
 
         // 4. macOS 27 invariant: NEVER mutate maximumDrawableCount after CAMetalDisplayLink attaches!
@@ -1111,5 +1112,200 @@ struct CaptureToRenderPipelineIntegrationTests {
 
         let drops = loop.currentTelemetry.droppedFrames
         #expect(drops < totalIngested, "droppedFrames (\(drops)) cannot equal or exceed totalIngested (\(totalIngested)) — indicates double-counting!")
+    }
+
+    @Test("RollingFPSCounter eliminates Jensen-inequality FPS inflation under jittered 120Hz presentation cadence")
+    func rollingFPSCounterEliminatesJensenBias() {
+        var counter = RollingFPSCounter(windowSeconds: 0.6)
+
+        // Simulate ProMotion / non-VSync jitter alternating 4.0ms and 12.667ms (true average = 8.333ms = 120.0 fps).
+        // Naive EMA(1/dt) inflates this to ~164 fps; RollingFPSCounter must stay accurately around 120.0 fps!
+        var t = 100.0
+        counter.record(at: t)
+        for i in 0..<120 {
+            t += (i % 2 == 0) ? 0.004 : (1.0 / 60.0 - 0.004)
+            counter.record(at: t)
+        }
+        let measured = counter.fps(at: t)
+        #expect(measured >= 117.0 && measured <= 123.0, "Jittered 120 Hz cadence reported \(measured) fps (expected ~120 fps, zero Jensen bias!)")
+
+        // Out-of-order callback timestamp must not break monotonicity or produce NaN/negative FPS
+        let afterOutOfOrder = counter.record(at: t - 0.002)
+        #expect(afterOutOfOrder.isFinite && afterOutOfOrder > 0)
+
+        // Idle decay > 1.5s cleanly returns 0
+        #expect(counter.fps(at: t + 2.0) == 0)
+
+        // Resuming after a > 2s pause restarts cleanly at new 60 Hz cadence without stale pause drag
+        var tResume = t + 5.0
+        counter.record(at: tResume)
+        for _ in 0..<45 {
+            tResume += 1.0 / 60.0
+            counter.record(at: tResume)
+        }
+        let resumedFPS = counter.fps(at: tResume)
+        #expect(resumedFPS >= 58.0 && resumedFPS <= 62.0, "Post-pause 60 Hz cadence reported \(resumedFPS) fps")
+    }
+
+    @Test("ScreenCaptureEngine computes display-local sourceRects across primary & negative-CG-Y displays and neutralizes Chrome offscreen child-window shrink")
+    @MainActor
+    func displayScopedCaptureNeutralizesChromeOffscreenChildShrink() async throws {
+        let primary = DisplayDescriptor(
+            id: 1,
+            name: "Built-in Retina Display",
+            cocoaFrame: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            cgBounds: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            backingScaleFactor: 2.0,
+            refreshRateHz: 120.0,
+            maxEDRHeadroom: 16.0,
+            isPrimary: true,
+            safeAreaTopInset: 33.0
+        )
+        let dell = DisplayDescriptor(
+            id: 3,
+            name: "DELL P2422H",
+            cocoaFrame: CGRect(x: 1512, y: 982, width: 1280, height: 720),
+            cgBounds: CGRect(x: 1512, y: -720, width: 1280, height: 720),
+            backingScaleFactor: 2.0,
+            refreshRateHz: 60.0,
+            maxEDRHeadroom: 1.0,
+            isPrimary: false,
+            safeAreaTopInset: 0.0
+        )
+        let displays = [primary, dell]
+
+        // 1. Primary MacBook notch-inset fullscreen window -> display-local (0, 33, 1512, 949)
+        let primaryLocal = ScreenCaptureEngine.computeDisplayLocalSourceRect(
+            windowCGRect: CGRect(x: 0, y: 33, width: 1512, height: 949),
+            displayCGBounds: primary.cgBounds
+        )
+        #expect(primaryLocal == CGRect(x: 0, y: 33, width: 1512, height: 949))
+
+        // 2. Secondary negative-CG-Y DELL window -> display-local (100, 100, 800, 500)
+        let dellLocal = ScreenCaptureEngine.computeDisplayLocalSourceRect(
+            windowCGRect: CGRect(x: 1612, y: -620, width: 800, height: 500),
+            displayCGBounds: dell.cgBounds
+        )
+        #expect(dellLocal == CGRect(x: 100, y: 100, width: 800, height: 500))
+
+        // 3. Policy selects display-scoped capture for fullscreen windows OR after child-window shrink detection,
+        //    and keeps desktopIndependentWindow for normal desktop windows.
+        #expect(ScreenCaptureEngine.shouldUseDisplayScopedWindowCapture(
+            windowBounds: CGRect(x: 0, y: 33, width: 1512, height: 949),
+            displays: displays,
+            isFullscreenWindow: true,
+            didDetectChildWindowShrink: false,
+            captureMode: .window
+        ) == true)
+        #expect(ScreenCaptureEngine.shouldUseDisplayScopedWindowCapture(
+            windowBounds: CGRect(x: 0, y: 33, width: 1512, height: 949),
+            displays: displays,
+            isFullscreenWindow: false,
+            didDetectChildWindowShrink: true,
+            captureMode: .window
+        ) == true)
+        #expect(ScreenCaptureEngine.shouldUseDisplayScopedWindowCapture(
+            windowBounds: CGRect(x: 100, y: 120, width: 900, height: 600),
+            displays: displays,
+            isFullscreenWindow: false,
+            didDetectChildWindowShrink: false,
+            captureMode: .window
+        ) == false)
+
+        // 4. Live SCStream hardware test: reproduce Chrome's exact (0, 33, 1512, 949) window with attached
+        //    offscreen child toolbar at CG y = -113 and verify ScreenCaptureEngine delivers full 100% contentRect
+        //    (zero 1310x949 / 0.867 shrink!) when Screen Recording permission is granted and display is awake.
+        guard CGPreflightScreenCaptureAccess(),
+              CGDisplayIsAsleep(CGMainDisplayID()) == 0,
+              let device = MTLCreateSystemDefaultDevice(),
+              let primaryScreen = NSScreen.screens.first(where: { abs($0.frame.origin.x) < 0.5 && abs($0.frame.origin.y) < 0.5 }) ?? NSScreen.main
+        else {
+            return
+        }
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let safeTop = max(32.0, primaryScreen.frame.maxY - primaryScreen.visibleFrame.maxY)
+        let winW = primaryScreen.frame.width
+        let winH = primaryScreen.frame.height - safeTop
+        let parentWin = NSWindow(
+            contentRect: NSRect(x: primaryScreen.frame.minX, y: primaryScreen.frame.minY, width: winW, height: winH),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        parentWin.backgroundColor = .systemGreen
+        parentWin.orderFrontRegardless()
+
+        // Attached offscreen child window 146pt above parent (exact Chrome BrowserWindowFullScreenToolbar geometry!)
+        let childWin = NSWindow(
+            contentRect: NSRect(x: primaryScreen.frame.minX, y: primaryScreen.frame.maxY + 67, width: winW, height: 46),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        childWin.backgroundColor = .systemRed
+        parentWin.addChildWindow(childWin, ordered: .above)
+        childWin.setFrame(NSRect(x: primaryScreen.frame.minX, y: primaryScreen.frame.maxY + 67, width: winW, height: 46), display: true)
+        childWin.orderFrontRegardless()
+        defer {
+            parentWin.removeChildWindow(childWin)
+            childWin.orderOut(nil)
+            parentWin.orderOut(nil)
+        }
+
+        try await Task.sleep(for: .milliseconds(150))
+
+        let liveDisplays = WindowEnumerator.enumerateDisplaysOnMain()
+        let parentWID = CGWindowID(parentWin.windowNumber)
+        let parentCG = ScreenGeometry.cocoaToCG(rect: parentWin.frame, displays: liveDisplays)
+        let targetDesc = WindowDescriptor(
+            windowID: parentWID,
+            pid: ProcessInfo.processInfo.processIdentifier,
+            appName: "ChromeFullscreenSim",
+            title: "Bilibili Fullscreen",
+            cgBounds: parentCG,
+            isOnScreen: true,
+            backingScaleFactor: Double(primaryScreen.backingScaleFactor)
+        )
+
+        let engine = try ScreenCaptureEngine(device: device)
+        let latestFrame = OSAllocatedUnfairLock<CapturedFrame?>(initialState: nil)
+        try await engine.start(
+            window: targetDesc,
+            profile: .defaultProfile,
+            scalingMode: .defaultMode,
+            onFrame: { frame in
+                latestFrame.withLock { $0 = frame }
+            },
+            onEvent: { _ in }
+        )
+        defer {
+            Task { await engine.stop() }
+        }
+
+        let backingScale = Double(primaryScreen.backingScaleFactor)
+        let expectedMinW = Int((Double(winW) * backingScale).rounded()) - 4
+        let expectedMinH = Int((Double(winH) * backingScale).rounded()) - 4
+
+        // Wait up to 1.5s for automatic child-window shrink detection + 40ms live filter switch to settle!
+        let settled = await waitForCondition(timeoutSeconds: 1.5) {
+            guard let f = latestFrame.withLock({ $0 }) else { return false }
+            let sub = ScalingLayoutCalculator.activeContentSubRect(
+                contentPixelRect: f.contentRect,
+                textureSize: f.pixelSize
+            )
+            return f.pixelSize.width >= expectedMinW
+                && f.pixelSize.height >= expectedMinH
+                && sub == nil
+        }
+
+        await engine.stop()
+        let finalFrame = try #require(latestFrame.withLock { $0 }, "Expected ScreenCaptureEngine to deliver frames")
+        #expect(
+            settled,
+            "ScreenCaptureEngine did not recover 100% full-bleed contentRect after offscreen child-window shrink: pixelSize=\(finalFrame.pixelSize), contentRect=\(finalFrame.contentRect)"
+        )
     }
 }

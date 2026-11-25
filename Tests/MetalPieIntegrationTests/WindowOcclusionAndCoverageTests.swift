@@ -1780,4 +1780,105 @@ struct WindowOcclusionAndCoverageTests {
             displays: displays
         ) == false)
     }
+
+    @Test("Fullscreen overlay stays strictly below MacBook Pro hardware notch while filling external non-notched monitors edge-to-edge")
+    @MainActor
+    func fullscreenOverlayRespectsNotchSafeArea() throws {
+        // 1. resolveNotchSafeTopInset unit matrix
+        #expect(WindowEnumerator.resolveNotchSafeTopInset(safeAreaTop: 32.0, menuBarTopInset: 33.0) == 33.0)
+        #expect(WindowEnumerator.resolveNotchSafeTopInset(safeAreaTop: 32.0, menuBarTopInset: 0.0) == 32.0)
+        #expect(WindowEnumerator.resolveNotchSafeTopInset(safeAreaTop: 32.0, menuBarTopInset: 80.0) == 32.0)
+        #expect(WindowEnumerator.resolveNotchSafeTopInset(safeAreaTop: 0.0, menuBarTopInset: 25.0) == 0.0)
+        #expect(WindowEnumerator.resolveNotchSafeTopInset(safeAreaTop: 0.0, menuBarTopInset: 0.0) == 0.0)
+
+        let notchedPrimary = DisplayDescriptor(
+            id: 1,
+            name: "Built-in Retina Display",
+            cocoaFrame: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            cgBounds: CGRect(x: 0, y: 0, width: 1512, height: 982),
+            backingScaleFactor: 2.0,
+            refreshRateHz: 120.0,
+            maxEDRHeadroom: 16.0,
+            isPrimary: true,
+            safeAreaTopInset: 33.0
+        )
+        let displays = [notchedPrimary, Self.externalDELLNegativeCGY]
+
+        // 2. Native fullscreen video on notched MacBook -> exact (0, 0, 1512, 949) = 3024x1898 (ZERO notch overflow!)
+        let nativeFSFrame = OverlayWindowController.computeOverlayCocoaFrame(
+            sourceCGRect: CGRect(x: 0, y: 33, width: 1512, height: 949),
+            presentationMode: .fullscreen,
+            multiMonitorMode: .closest,
+            displays: displays,
+            aspectRatio: 1512.0 / 949.0,
+            applyAntiOcclusion: false,
+            respectNotchSafeArea: true
+        )
+        #expect(nativeFSFrame == CGRect(x: 0, y: 0, width: 1512, height: 949))
+        #expect(nativeFSFrame.maxY <= 949.0)
+
+        // 3. Desktop window scaled to fullscreen on notched MacBook -> (0, 1, 1512, 948), maxY == 949 (ZERO notch overflow!)
+        let desktopFSFrame = OverlayWindowController.computeOverlayCocoaFrame(
+            sourceCGRect: CGRect(x: 120, y: 120, width: 960, height: 600),
+            presentationMode: .fullscreen,
+            multiMonitorMode: .closest,
+            displays: displays,
+            aspectRatio: 960.0 / 600.0,
+            applyAntiOcclusion: true,
+            respectNotchSafeArea: true
+        )
+        #expect(desktopFSFrame == CGRect(x: 0, y: 1, width: 1512, height: 948))
+        #expect(desktopFSFrame.maxY <= 949.0)
+
+        // 4. External non-notched DELL -> fills full (1512, 982, 1280, 720) edge-to-edge!
+        let dellFSFrame = OverlayWindowController.computeOverlayCocoaFrame(
+            sourceCGRect: CGRect(x: 1620, y: -600, width: 800, height: 450),
+            presentationMode: .fullscreen,
+            multiMonitorMode: .closest,
+            displays: displays,
+            aspectRatio: 16.0 / 9.0,
+            applyAntiOcclusion: false,
+            respectNotchSafeArea: true
+        )
+        #expect(dellFSFrame == Self.externalDELLNegativeCGY.cocoaFrame)
+
+        // 5. VRR direct-scanout opt-out (`respectNotchSafeArea: false`) keeps full hardware display frame
+        let vrrFrame = OverlayWindowController.computeOverlayCocoaFrame(
+            sourceCGRect: CGRect(x: 120, y: 120, width: 960, height: 600),
+            presentationMode: .fullscreen,
+            multiMonitorMode: .closest,
+            displays: displays,
+            aspectRatio: 960.0 / 600.0,
+            applyAntiOcclusion: false,
+            respectNotchSafeArea: false
+        )
+        #expect(vrrFrame == notchedPrimary.cocoaFrame)
+
+        // 6. Live OverlayWindowController on host Mac verifies zero hardware notch intrusion!
+        if let device = MTLCreateSystemDefaultDevice(),
+           let primaryScreen = NSScreen.screens.first(where: { abs($0.frame.origin.x) < 0.5 && abs($0.frame.origin.y) < 0.5 }) ?? NSScreen.main
+        {
+            let controller = try OverlayWindowController(device: device)
+            defer { controller.close() }
+            let src = WindowDescriptor(
+                windowID: 88_019,
+                pid: 4_321,
+                appName: "NotchHostTest",
+                title: "Window",
+                cgBounds: CGRect(x: 120, y: 120, width: 800, height: 500),
+                backingScaleFactor: Double(primaryScreen.backingScaleFactor)
+            )
+            let metrics = controller.prepareOverlay(
+                sourceWindow: src,
+                profile: .defaultProfile,
+                presentationOverride: .fullscreen,
+                isNativeFullscreenSpace: false
+            )
+            let expectedMaxY = primaryScreen.frame.maxY - primaryScreen.safeAreaInsets.top
+            #expect(
+                metrics.cocoaFrame.maxY <= expectedMaxY + 0.5,
+                "Live fullscreen overlay maxY \(metrics.cocoaFrame.maxY) intruded into hardware notch above \(expectedMaxY)!"
+            )
+        }
+    }
 }
