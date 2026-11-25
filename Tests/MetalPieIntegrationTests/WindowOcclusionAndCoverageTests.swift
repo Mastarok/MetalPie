@@ -101,6 +101,23 @@ private func flushAndSleep(milliseconds: Int) async {
     CATransaction.flush()
 }
 
+/// Returns a non-nil diagnostic reason ONLY when the host display is physically asleep or on the
+/// macOS lock screen (where WindowServer pauses `CAMetalDisplayLink` vsync and marks every window
+/// occluded regardless of MetalPie's overlay). Returns `nil` whenever the display is awake & unlocked.
+private func hostDisplayUnavailableForLiveWindowServerReason() -> String? {
+    let isAsleep = CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    var isScreenLocked = false
+    if let dict = CGSessionCopyCurrentDictionary() as? [String: Any],
+       let locked = dict["CGSSessionScreenIsLocked"] as? NSNumber
+    {
+        isScreenLocked = locked.boolValue
+    }
+    if isAsleep || isScreenLocked {
+        return "host main display is unavailable for live WindowServer compositor checks (asleep=\(isAsleep), screenLocked=\(isScreenLocked))"
+    }
+    return nil
+}
+
 // MARK: - Window Occlusion & Windowed Coverage Regression Suite
 
 @Suite("Window Anti-Occlusion & Windowed Single-Window Coverage", .serialized)
@@ -188,7 +205,9 @@ struct WindowOcclusionAndCoverageTests {
         controller.close()
         await flushAndSleep(milliseconds: 100)
 
-        // 1. Reopen in Fullscreen non-VRR anti-occlusion mode and verify 200+ consecutive CAMetalDisplayLink callbacks!
+        // 1. Reopen in Fullscreen non-VRR anti-occlusion mode and verify deterministic invariants
+        //    (plus 200+ consecutive CAMetalDisplayLink callbacks whenever the host display is awake & unlocked).
+        let hardwareSkipReason = hostDisplayUnavailableForLiveWindowServerReason()
         controller.isVRRDirectScanoutEnabled = false
         _ = controller.prepareOverlay(
             sourceWindow: sourceDescriptor,
@@ -197,8 +216,11 @@ struct WindowOcclusionAndCoverageTests {
             isNativeFullscreenSpace: false
         )
         #expect(panel.isOpaque == true)
+        #expect(panel.backgroundColor == .black)
         #expect(view.metalLayer.isOpaque == true)
         #expect(view.metalLayer.framebufferOnly == true)
+        #expect(view.metalLayer.cornerRadius == 0.0)
+        #expect(view.metalLayer.masksToBounds == false)
         #expect(panel.hasShadow == false)
         #expect(abs(panel.alphaValue - OverlayWindowController.antiOcclusionAlphaValue) < 0.0001)
 
@@ -206,41 +228,56 @@ struct WindowOcclusionAndCoverageTests {
         view.markDisplayLinkAttached()
         CATransaction.flush()
 
-        let driver = try TestDisplayLinkDriver(device: device, layer: view.metalLayer)
-        driver.start()
-        defer { driver.stop() }
-
-        let fsDeadline = CFAbsoluteTimeGetCurrent() + 4.5
-        while CFAbsoluteTimeGetCurrent() < fsDeadline && driver.callbackCount < 210 {
-            await flushAndSleep(milliseconds: 50)
+        let driver: TestDisplayLinkDriver?
+        if let hardwareSkipReason {
+            print("[WindowOcclusionAndCoverageTests] Skipping live CAMetalDisplayLink vsync count assertions: \(hardwareSkipReason)")
+            driver = nil
+        } else {
+            let liveDriver = try TestDisplayLinkDriver(device: device, layer: view.metalLayer)
+            liveDriver.start()
+            driver = liveDriver
         }
-        #expect(
-            driver.callbackCount >= 200,
-            "CAMetalDisplayLink stalled in Fullscreen anti-occlusion mode: only \(driver.callbackCount) callbacks (expected >= 200)"
-        )
+        defer { driver?.stop() }
 
-        // 2. Live switch to Windowed mode (with native shadow enabled) and verify zero DisplayLink stall!
+        if let driver {
+            let fsDeadline = CFAbsoluteTimeGetCurrent() + 4.5
+            while CFAbsoluteTimeGetCurrent() < fsDeadline && driver.callbackCount < 210 {
+                await flushAndSleep(milliseconds: 50)
+            }
+            #expect(
+                driver.callbackCount >= 200,
+                "CAMetalDisplayLink stalled in Fullscreen anti-occlusion mode: only \(driver.callbackCount) callbacks (expected >= 200)"
+            )
+        }
+
+        // 2. Live switch to Windowed mode (rounded native corners + shadow, metalLayer.isOpaque = true)
+        //    and verify zero DisplayLink stall!
         let winMetrics = controller.setPresentationMode(.windowed(initialScale: 1.5), multiMonitorMode: .closest)
         #expect(panel.hasShadow == true)
-        #expect(panel.isOpaque == true)
+        #expect(panel.isOpaque == false)
+        #expect(panel.backgroundColor == .clear)
         #expect(view.metalLayer.isOpaque == true)
+        #expect(view.metalLayer.cornerRadius == OverlayWindowController.windowedCornerRadius)
+        #expect(view.metalLayer.masksToBounds == true)
         #expect(abs(panel.alphaValue - OverlayWindowController.antiOcclusionAlphaValue) < 0.0001)
         #expect(
             OverlayWindowController.overlayCoversSource(overlayRect: winMetrics.cgFrame, sourceRect: sourceCG),
             "Windowed overlay must completely cover source window"
         )
 
-        driver.resetCount()
-        let winDeadline = CFAbsoluteTimeGetCurrent() + 3.0
-        while CFAbsoluteTimeGetCurrent() < winDeadline && driver.callbackCount < 110 {
-            await flushAndSleep(milliseconds: 50)
+        if let driver {
+            driver.resetCount()
+            let winDeadline = CFAbsoluteTimeGetCurrent() + 3.0
+            while CFAbsoluteTimeGetCurrent() < winDeadline && driver.callbackCount < 110 {
+                await flushAndSleep(milliseconds: 50)
+            }
+            #expect(
+                driver.callbackCount >= 100,
+                "CAMetalDisplayLink stalled after Fullscreen -> Windowed transition: only \(driver.callbackCount) callbacks"
+            )
         }
-        #expect(
-            driver.callbackCount >= 100,
-            "CAMetalDisplayLink stalled after Fullscreen -> Windowed transition: only \(driver.callbackCount) callbacks"
-        )
 
-        // 3. Close & reopen back into Fullscreen non-VRR and confirm DisplayLink resumes cleanly with zero stall!
+        // 3. Close & reopen back into Fullscreen non-VRR and confirm deterministic invariants + DisplayLink resume!
         controller.close()
         await flushAndSleep(milliseconds: 80)
         _ = controller.prepareOverlay(
@@ -249,16 +286,26 @@ struct WindowOcclusionAndCoverageTests {
             presentationOverride: .fullscreen,
             isNativeFullscreenSpace: false
         )
+        #expect(panel.isOpaque == true)
+        #expect(panel.backgroundColor == .black)
+        #expect(panel.hasShadow == false)
+        #expect(view.metalLayer.isOpaque == true)
+        #expect(view.metalLayer.cornerRadius == 0.0)
+        #expect(view.metalLayer.masksToBounds == false)
+        #expect(abs(panel.alphaValue - OverlayWindowController.antiOcclusionAlphaValue) < 0.0001)
+
         controller.revealAfterFirstFrame()
-        driver.resetCount()
-        let reopenDeadline = CFAbsoluteTimeGetCurrent() + 3.0
-        while CFAbsoluteTimeGetCurrent() < reopenDeadline && driver.callbackCount < 110 {
-            await flushAndSleep(milliseconds: 50)
+        if let driver {
+            driver.resetCount()
+            let reopenDeadline = CFAbsoluteTimeGetCurrent() + 3.0
+            while CFAbsoluteTimeGetCurrent() < reopenDeadline && driver.callbackCount < 110 {
+                await flushAndSleep(milliseconds: 50)
+            }
+            #expect(
+                driver.callbackCount >= 100,
+                "CAMetalDisplayLink stalled after close -> reopen transition: only \(driver.callbackCount) callbacks"
+            )
         }
-        #expect(
-            driver.callbackCount >= 100,
-            "CAMetalDisplayLink stalled after close -> reopen transition: only \(driver.callbackCount) callbacks"
-        )
     }
 
     @Test("Live cross-process WindowServer occlusion check: OverlayWindowController keeps a 100%-covered separate-process NSWindow visible in Fullscreen & Windowed modes")
@@ -282,6 +329,60 @@ struct WindowOcclusionAndCoverageTests {
         let underCocoa = CGRect(x: underCocoaX, y: underCocoaY, width: underW, height: underH)
         let underCG = ScreenGeometry.cocoaToCG(rect: underCocoa, displays: displays)
         let underLevel = OverlayWindowController.normalOverlayLevel.rawValue - 2
+
+        if let hardwareSkipReason = hostDisplayUnavailableForLiveWindowServerReason() {
+            print("[WindowOcclusionAndCoverageTests] Skipping live cross-process WindowServer occlusion sampling: \(hardwareSkipReason)")
+            // Still verify all deterministic anti-occlusion, shadow, corner-radius, and VRR panel invariants!
+            let controller = try OverlayWindowController(device: device)
+            defer { controller.close() }
+
+            let sourceDescriptor = WindowDescriptor(
+                windowID: 77_202,
+                pid: ProcessInfo.processInfo.processIdentifier,
+                appName: "BrowserChild",
+                title: "Video",
+                cgBounds: underCG,
+                isOnScreen: true,
+                backingScaleFactor: primary.backingScaleFactor
+            )
+            var profile = Profile.defaultProfile
+            profile.presentationMode = .fullscreen
+            profile.multiMonitorMode = .closest
+
+            _ = controller.prepareOverlay(
+                sourceWindow: sourceDescriptor,
+                profile: profile,
+                presentationOverride: .fullscreen,
+                isNativeFullscreenSpace: false
+            )
+            let panel = try #require(controller.panel)
+            let view = try #require(controller.overlayView)
+            #expect(panel.isOpaque == true)
+            #expect(panel.hasShadow == false)
+            #expect(view.metalLayer.isOpaque == true)
+            #expect(abs(panel.alphaValue - OverlayWindowController.antiOcclusionAlphaValue) < 0.0001)
+
+            let winMetrics = controller.setPresentationMode(.windowed(initialScale: 1.5), multiMonitorMode: .closest)
+            #expect(panel.isOpaque == false)
+            #expect(panel.backgroundColor == .clear)
+            #expect(panel.hasShadow == true)
+            #expect(view.metalLayer.isOpaque == true)
+            #expect(view.metalLayer.cornerRadius == OverlayWindowController.windowedCornerRadius)
+            #expect(view.metalLayer.masksToBounds == true)
+            #expect(abs(panel.alphaValue - OverlayWindowController.antiOcclusionAlphaValue) < 0.0001)
+            #expect(OverlayWindowController.overlayCoversSource(overlayRect: winMetrics.cgFrame, sourceRect: underCG))
+
+            _ = controller.setPresentationMode(.fullscreen, multiMonitorMode: .closest)
+            controller.isVRRDirectScanoutEnabled = true
+            #expect(panel.isOpaque == true)
+            #expect(panel.hasShadow == false)
+            #expect(abs(panel.alphaValue - 1.0) < 0.0001)
+
+            controller.isVRRDirectScanoutEnabled = false
+            #expect(panel.isOpaque == true)
+            #expect(abs(panel.alphaValue - OverlayWindowController.antiOcclusionAlphaValue) < 0.0001)
+            return
+        }
 
         // Spawn a real separate-process AppKit host (just like Chrome/Safari/Edge) whose NSApplication
         // pumps WindowServer occlusion events and reports `occlusionState.contains(.visible)` every 60ms.
@@ -722,5 +823,467 @@ struct WindowOcclusionAndCoverageTests {
             OverlayWindowController.overlayCoversSource(overlayRect: enlargedMetrics.cgFrame, sourceRect: enlargedCG),
             "Windowed overlay must expand when source window grows externally"
         )
+
+        // 4. External source window SHRINK (locked inward edge drag!) MUST shrink windowed overlay
+        //    proportionally instead of remaining stuck at stale enlarged `lastWindowedWidth`!
+        let widthBeforeShrink = enlargedMetrics.cocoaFrame.width
+        let shrunkCG = CGRect(
+            x: primary.cgBounds.minX + 160,
+            y: primary.cgBounds.minY + 160,
+            width: 520,
+            height: 310
+        )
+        controller.updateSourceWindowGeometry(
+            shrunkCG,
+            windowID: sourceWin.windowID,
+            repositionWindowedOverlay: true
+        )
+        let shrunkMetrics = controller.currentDrawableMetrics()
+        #expect(
+            shrunkMetrics.cocoaFrame.width < widthBeforeShrink - 100,
+            "Locked windowed overlay must shrink proportionally when source window shrinks inward (before=\(widthBeforeShrink), after=\(shrunkMetrics.cocoaFrame.width))"
+        )
+        #expect(
+            OverlayWindowController.overlayCoversSource(overlayRect: shrunkMetrics.cgFrame, sourceRect: shrunkCG),
+            "Shrunk windowed overlay must still completely cover the shrunk source window"
+        )
+        #expect(
+            abs((controller.lastWindowedWidth ?? 0) - shrunkMetrics.cocoaFrame.width) < 1.0,
+            "lastWindowedWidth must update to the new shrunk overlay width"
+        )
+    }
+
+    // MARK: - Bug #5: Windowed Inward & Outward Resize (Unlocked Overlay Drag + Locked Source Shrink/Grow)
+
+    @Test("Windowed resize works smoothly BOTH inward and outward in unlocked overlay drag and locked source-window modes")
+    @MainActor
+    func windowedResizeInwardAndOutward() throws {
+        let displays = Self.dualDisplays
+
+        // 1. Unlocked interactive resize (`MetalOverlayView.computeInteractiveResizeFrame`):
+        //    Dragging inward shrinks below original source window size down to 320x180 (preserving aspect ratio),
+        //    and dragging outward expands smoothly up to screen bounds!
+        let start = CGRect(x: 300, y: 200, width: 960, height: 540)
+        let aspect: CGFloat = 16.0 / 9.0
+        let screenMax = Self.primaryRetina.cocoaFrame.size
+
+        // Inward drag from right edge (-480pt -> 480x270, well below e.g. 640x360 source!)
+        let inwardRight = MetalOverlayView.computeInteractiveResizeFrame(
+            startFrame: start,
+            edges: [.right],
+            delta: CGVector(dx: -480, dy: 0),
+            aspectRatio: aspect,
+            minWidth: OverlayWindowController.absoluteMinimumWindowedWidth,
+            minHeight: OverlayWindowController.absoluteMinimumWindowedHeight,
+            maxSize: screenMax
+        )
+        #expect(inwardRight.width == 480)
+        #expect(inwardRight.height == 270)
+        #expect(inwardRight.minX == start.minX)
+
+        // Deep inward drag from top-left corner clamps cleanly to 320x180 while pinning bottom-right anchor!
+        let inwardMinClamp = MetalOverlayView.computeInteractiveResizeFrame(
+            startFrame: start,
+            edges: [.left, .top],
+            delta: CGVector(dx: 800, dy: -500),
+            aspectRatio: aspect,
+            minWidth: OverlayWindowController.absoluteMinimumWindowedWidth,
+            minHeight: OverlayWindowController.absoluteMinimumWindowedHeight,
+            maxSize: screenMax
+        )
+        #expect(inwardMinClamp.width == 320)
+        #expect(inwardMinClamp.height == 180)
+        #expect(inwardMinClamp.maxX == start.maxX)
+
+        // Outward drag from bottom-right corner expands smoothly while pinning top-left anchor!
+        let outwardBR = MetalOverlayView.computeInteractiveResizeFrame(
+            startFrame: start,
+            edges: [.right, .bottom],
+            delta: CGVector(dx: 320, dy: -180),
+            aspectRatio: aspect,
+            minWidth: OverlayWindowController.absoluteMinimumWindowedWidth,
+            minHeight: OverlayWindowController.absoluteMinimumWindowedHeight,
+            maxSize: screenMax
+        )
+        #expect(outwardBR.width == 1280)
+        #expect(outwardBR.height == 720)
+        #expect(outwardBR.minX == start.minX)
+        #expect(outwardBR.maxY == start.maxY)
+
+        // Verify `OverlayWindowController.allowInwardResizeBelowSource` unlocks 320x180 minimum on live view.
+        if let device = MTLCreateSystemDefaultDevice() {
+            let controller = try OverlayWindowController(device: device)
+            defer { controller.close() }
+            let src = WindowDescriptor(
+                windowID: 88_001,
+                pid: 4_242,
+                appName: "ResizableApp",
+                title: "Doc",
+                cgBounds: CGRect(x: 100, y: 100, width: 800, height: 450),
+                backingScaleFactor: 2.0
+            )
+            controller.allowInwardResizeBelowSource = true
+            _ = controller.prepareOverlay(
+                sourceWindow: src,
+                profile: .defaultProfile,
+                presentationOverride: .windowed(initialScale: 1.25),
+                isNativeFullscreenSpace: false
+            )
+            let view = try #require(controller.overlayView)
+            #expect(view.minimumWindowedWidth == OverlayWindowController.absoluteMinimumWindowedWidth)
+            #expect(view.minimumWindowedHeight == OverlayWindowController.absoluteMinimumWindowedHeight)
+
+            controller.allowInwardResizeBelowSource = false
+            #expect(view.minimumWindowedWidth >= 800)
+            #expect(view.minimumWindowedHeight >= 450)
+        }
+
+        // 2. Locked proportional resize (`computeProportionalResizedWindowedCocoaFrame`) on Primary AND negative-CG-Y DELL:
+        //    Source 640x360 with 1.5x overlay (960x540):
+        //    - Shrink source inward to 480x270 -> overlay shrinks proportionally to 720x405!
+        //    - Grow source outward to 800x450 -> overlay grows proportionally to 1200x675!
+        let prevSourcePrimary = CGRect(x: 200, y: 200, width: 640, height: 360)
+        let prevOverlayCocoaPrimary = CGRect(x: 40, y: 332, width: 960, height: 540)
+
+        let shrunkSourcePrimary = CGRect(x: 200, y: 200, width: 480, height: 270)
+        let shrunkOverlayCocoa = OverlayWindowController.computeProportionalResizedWindowedCocoaFrame(
+            previousSourceCGRect: prevSourcePrimary,
+            newSourceCGRect: shrunkSourcePrimary,
+            currentOverlayCocoaFrame: prevOverlayCocoaPrimary,
+            displays: displays
+        )
+        #expect(abs(shrunkOverlayCocoa.width - 720) <= 1.0)
+        #expect(abs(shrunkOverlayCocoa.height - 405) <= 1.0)
+        #expect(OverlayWindowController.overlayCoversSource(
+            overlayRect: ScreenGeometry.cocoaToCG(rect: shrunkOverlayCocoa, displays: displays),
+            sourceRect: shrunkSourcePrimary
+        ))
+
+        let grownSourcePrimary = CGRect(x: 200, y: 200, width: 800, height: 450)
+        let grownOverlayCocoa = OverlayWindowController.computeProportionalResizedWindowedCocoaFrame(
+            previousSourceCGRect: shrunkSourcePrimary,
+            newSourceCGRect: grownSourcePrimary,
+            currentOverlayCocoaFrame: shrunkOverlayCocoa,
+            displays: displays
+        )
+        #expect(abs(grownOverlayCocoa.width - 1200) <= 1.0)
+        #expect(abs(grownOverlayCocoa.height - 675) <= 1.0)
+        #expect(OverlayWindowController.overlayCoversSource(
+            overlayRect: ScreenGeometry.cocoaToCG(rect: grownOverlayCocoa, displays: displays),
+            sourceRect: grownSourcePrimary
+        ))
+
+        // Negative-CG-Y DELL display inward shrink (640x360 @ 1.5x = 960x540 -> 440x248 -> ~660x372)
+        let prevSourceDELL = CGRect(x: 1700, y: -560, width: 640, height: 360)
+        let prevOverlayDELL = CGRect(x: 1600, y: 1100, width: 960, height: 540)
+        let shrunkSourceDELL = CGRect(x: 1700, y: -560, width: 440, height: 248)
+        let shrunkOverlayDELL = OverlayWindowController.computeProportionalResizedWindowedCocoaFrame(
+            previousSourceCGRect: prevSourceDELL,
+            newSourceCGRect: shrunkSourceDELL,
+            currentOverlayCocoaFrame: prevOverlayDELL,
+            displays: displays
+        )
+        #expect(shrunkOverlayDELL.width < 700 && shrunkOverlayDELL.width >= 655)
+        #expect(shrunkOverlayDELL.minX >= Self.externalDELLNegativeCGY.cocoaFrame.minX - 0.5)
+        #expect(shrunkOverlayDELL.maxX <= Self.externalDELLNegativeCGY.cocoaFrame.maxX + 0.5)
+        #expect(OverlayWindowController.overlayCoversSource(
+            overlayRect: ScreenGeometry.cocoaToCG(rect: shrunkOverlayDELL, displays: displays),
+            sourceRect: shrunkSourceDELL
+        ))
+    }
+
+    // MARK: - Bug #2 & Bug #4A: Notch-Safe Toolbar Placement & Shadow-Padded Interactive Chrome Rects
+
+    @Test("Notch-safe toolbar stays strictly below Menu Bar & MacBook Pro notch and interactive chrome rects exclude transparent shadow padding")
+    func notchSafeToolbarAndInteractiveChromeRects() {
+        let displays = Self.dualDisplays
+
+        // 1. Primary MacBook Pro Retina with 33pt Menu Bar / notch strip (`visibleFrame.maxY = 949`, `frame.maxY = 982`)
+        let primaryFullscreenOverlay = CGRect(x: 0, y: 1, width: 1512, height: 981)
+        let primaryVisibleScreen = CGRect(x: 0, y: 0, width: 1512, height: 949)
+        let primaryToolbarVisible = OverlayChromeGeometry.computeVisibleToolbarCocoaFrame(
+            for: primaryFullscreenOverlay,
+            hostScreenVisibleFrame: primaryVisibleScreen
+        )
+        #expect(
+            primaryToolbarVisible.maxY <= primaryVisibleScreen.maxY - OverlayChromeGeometry.notchSafeTopMargin + 0.5,
+            "Toolbar must sit cleanly below MacBook Pro notch / Menu Bar (maxY=\(primaryToolbarVisible.maxY), visibleMaxY=\(primaryVisibleScreen.maxY))"
+        )
+        #expect(primaryToolbarVisible.size == OverlayChromeGeometry.defaultToolbarSize)
+        #expect(abs(primaryToolbarVisible.midX - primaryFullscreenOverlay.midX) <= 1.0)
+
+        // 2. External DELL P2422H (negative CG Y; Cocoa frame 982..1702, 30pt Menu Bar -> visible maxY = 1672)
+        let dellFullscreenOverlay = CGRect(x: 1512, y: 983, width: 1280, height: 719)
+        let dellVisibleScreen = CGRect(x: 1512, y: 982, width: 1280, height: 690)
+        let dellToolbarVisible = OverlayChromeGeometry.computeVisibleToolbarCocoaFrame(
+            for: dellFullscreenOverlay,
+            hostScreenVisibleFrame: dellVisibleScreen
+        )
+        #expect(dellToolbarVisible.maxY <= dellVisibleScreen.maxY - OverlayChromeGeometry.notchSafeTopMargin + 0.5)
+        #expect(abs(dellToolbarVisible.midX - dellFullscreenOverlay.midX) <= 1.0)
+
+        // 3. Windowed overlay well below Menu Bar keeps standard 10pt top margin inside the window
+        let windowedOverlay = CGRect(x: 200, y: 120, width: 960, height: 540)
+        let windowedToolbarVisible = OverlayChromeGeometry.computeVisibleToolbarCocoaFrame(
+            for: windowedOverlay,
+            hostScreenVisibleFrame: primaryVisibleScreen
+        )
+        #expect(abs(windowedToolbarVisible.maxY - (windowedOverlay.maxY - OverlayChromeGeometry.defaultTopMargin)) <= 1.0)
+
+        // 4. Shadow padding round-trip & interactive CG rect extraction (MUST exclude 20pt transparent shadow bleed!)
+        let pad = OverlayChromeGeometry.defaultShadowPadding
+        let toolbarPanelCocoa = OverlayChromeGeometry.panelFrame(fromVisibleFrame: primaryToolbarVisible)
+        #expect(toolbarPanelCocoa.width == primaryToolbarVisible.width + pad * 2)
+        #expect(toolbarPanelCocoa.height == primaryToolbarVisible.height + pad * 2)
+
+        let hudVisibleCocoa = CGRect(x: 16, y: 720, width: 296, height: 150)
+        let hudPanelCocoa = OverlayChromeGeometry.panelFrame(fromVisibleFrame: hudVisibleCocoa)
+
+        let activeCGRects = OverlayChromeGeometry.interactiveChromeCGRects(
+            toolbarPanelCocoaFrame: toolbarPanelCocoa,
+            toolbarIsInteractive: true,
+            hudPanelCocoaFrame: hudPanelCocoa,
+            hudIsVisible: true,
+            displays: displays
+        )
+        #expect(activeCGRects.count == 2)
+        let expectedToolbarCG = ScreenGeometry.cocoaToCG(rect: primaryToolbarVisible, displays: displays)
+        let expectedHUDCG = ScreenGeometry.cocoaToCG(rect: hudVisibleCocoa, displays: displays)
+        #expect(activeCGRects[0] == expectedToolbarCG)
+        #expect(activeCGRects[1] == expectedHUDCG)
+
+        // Point inside transparent outer shadow margin MUST NOT be inside the interactive CG rect!
+        let shadowMarginPoint = CGPoint(x: expectedToolbarCG.minX - 10, y: expectedToolbarCG.midY)
+        #expect(!activeCGRects[0].contains(shadowMarginPoint))
+        #expect(ScreenGeometry.cocoaToCG(rect: toolbarPanelCocoa, displays: displays).contains(shadowMarginPoint))
+
+        // Auto-hidden toolbar (`toolbarIsInteractive: false`) must NOT be included in interactive rects
+        let hiddenToolbarRects = OverlayChromeGeometry.interactiveChromeCGRects(
+            toolbarPanelCocoaFrame: toolbarPanelCocoa,
+            toolbarIsInteractive: false,
+            hudPanelCocoaFrame: hudPanelCocoa,
+            hudIsVisible: false,
+            displays: displays
+        )
+        #expect(hiddenToolbarRects.isEmpty)
+    }
+
+    // MARK: - Bug #2 & Bug #3: Menu-Bar-Safe Window Levels & Context-Menu Deduplication Boost
+
+    @Test("Overlay window levels stay strictly below macOS Menu Bar normally and boost above NSMenu (102) ONLY for in-window context menus")
+    @MainActor
+    func overlayLevelsAndPopupMenuDedupClassifier() throws {
+        let displays = Self.dualDisplays
+        let menuBarLevel = Int(CGWindowLevelForKey(.mainMenuWindow))
+        let popUpLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
+        let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+
+        // Base overlay (21), cursor (+1 = 22), and chrome (+2 = 23) must ALL be above Dock (20)
+        // and strictly below macOS Menu Bar (24)!
+        let baseLevel = OverlayWindowController.normalOverlayLevel.rawValue
+        #expect(baseLevel > dockLevel)
+        #expect(baseLevel + 2 < menuBarLevel)
+        #expect(OverlayWindowController.popupMenuBoostOverlayLevel.rawValue == popUpLayer + 1)
+
+        let targetPID: Int32 = 4242
+        let sourceWindow = CGRect(x: 100, y: 120, width: 800, height: 500)
+        let mbHeights: [CGDirectDisplayID: CGFloat] = [1: 33, 2: 30]
+
+        // 1. In-window right-click NSMenu (layer 101, intersects source, pointer inside window) -> BOOST!
+        let contextMenu = PopupMenuWindowSnapshot(
+            windowID: 9001,
+            pid: targetPID,
+            layer: popUpLayer,
+            bounds: CGRect(x: 320, y: 280, width: 220, height: 240)
+        )
+        let evalContext = OverlayWindowController.evaluatePopupMenuLevelBoost(
+            popupWindows: [contextMenu],
+            targetPID: targetPID,
+            sourceCGRect: sourceWindow,
+            displays: displays,
+            pointerCGPosition: CGPoint(x: 320, y: 280),
+            menuBarHeightByDisplayID: mbHeights
+        )
+        #expect(evalContext.shouldBoostAbovePopupMenus == true)
+        #expect(evalContext.isMenuBarDropdownActive == false)
+
+        // 2. Submenu opening slightly outside source while already boosted -> stays boosted!
+        let submenu = PopupMenuWindowSnapshot(
+            windowID: 9002,
+            pid: targetPID,
+            layer: popUpLayer,
+            bounds: CGRect(x: 910, y: 300, width: 180, height: 140)
+        )
+        let evalSub = OverlayWindowController.evaluatePopupMenuLevelBoost(
+            popupWindows: [contextMenu, submenu],
+            targetPID: targetPID,
+            sourceCGRect: sourceWindow,
+            displays: displays,
+            pointerCGPosition: CGPoint(x: 920, y: 310),
+            menuBarHeightByDisplayID: mbHeights,
+            wasBoosted: true
+        )
+        #expect(evalSub.shouldBoostAbovePopupMenus == true)
+
+        // 3. Menu closes -> immediately drops boost!
+        let evalClosed = OverlayWindowController.evaluatePopupMenuLevelBoost(
+            popupWindows: [],
+            targetPID: targetPID,
+            sourceCGRect: sourceWindow,
+            displays: displays,
+            wasBoosted: true
+        )
+        #expect(evalClosed.shouldBoostAbovePopupMenus == false)
+        #expect(evalClosed.isMenuBarDropdownActive == false)
+
+        // 4. macOS top Menu Bar dropdown (anchored at y=33 on primary, pointer in menu bar, even over fullscreen source!)
+        //    MUST NOT boost so macOS Menu Bar dropdown stays visible above OverlayPanel!
+        let fullscreenSource = Self.primaryRetina.cgBounds
+        let menuBarDropdown = PopupMenuWindowSnapshot(
+            windowID: 9003,
+            pid: targetPID,
+            layer: popUpLayer,
+            bounds: CGRect(x: 120, y: 33, width: 240, height: 320)
+        )
+        let evalMenuBar = OverlayWindowController.evaluatePopupMenuLevelBoost(
+            popupWindows: [menuBarDropdown],
+            targetPID: targetPID,
+            sourceCGRect: fullscreenSource,
+            displays: displays,
+            pointerCGPosition: CGPoint(x: 140, y: 16),
+            menuBarHeightByDisplayID: mbHeights
+        )
+        #expect(evalMenuBar.shouldBoostAbovePopupMenus == false)
+        #expect(evalMenuBar.isMenuBarDropdownActive == true)
+
+        // 5. External DELL negative-CG-Y top Menu Bar dropdown (y = -720 + 30 = -690) MUST NOT boost!
+        let dellMenuBarDropdown = PopupMenuWindowSnapshot(
+            windowID: 9004,
+            pid: targetPID,
+            layer: popUpLayer,
+            bounds: CGRect(x: 1620, y: -690, width: 220, height: 260)
+        )
+        let evalDELLMenuBar = OverlayWindowController.evaluatePopupMenuLevelBoost(
+            popupWindows: [dellMenuBarDropdown],
+            targetPID: targetPID,
+            sourceCGRect: Self.externalDELLNegativeCGY.cgBounds,
+            displays: displays,
+            pointerCGPosition: CGPoint(x: 1640, y: -705),
+            menuBarHeightByDisplayID: mbHeights
+        )
+        #expect(evalDELLMenuBar.shouldBoostAbovePopupMenus == false)
+        #expect(evalDELLMenuBar.isMenuBarDropdownActive == true)
+
+        // 6. Live OverlayWindowController boost toggle fires `onOverlayLevelChanged` and restores base level cleanly
+        if let device = MTLCreateSystemDefaultDevice() {
+            let controller = try OverlayWindowController(device: device)
+            defer { controller.close() }
+            var observedLevels: [Int] = []
+            controller.onOverlayLevelChanged = { observedLevels.append($0.rawValue) }
+            let src = WindowDescriptor(
+                windowID: 88_002,
+                pid: targetPID,
+                appName: "FinderSim",
+                title: "Desktop",
+                cgBounds: sourceWindow,
+                backingScaleFactor: 2.0
+            )
+            _ = controller.prepareOverlay(
+                sourceWindow: src,
+                profile: .defaultProfile,
+                presentationOverride: .windowed(initialScale: 1.25),
+                isNativeFullscreenSpace: false
+            )
+            let panel = try #require(controller.panel)
+            #expect(panel.level == OverlayWindowController.windowedOverlayLevel)
+
+            controller.setPopupMenuLevelBoost(true)
+            #expect(panel.level == OverlayWindowController.popupMenuBoostOverlayLevel)
+            controller.setPopupMenuLevelBoost(false)
+            #expect(panel.level == OverlayWindowController.windowedOverlayLevel)
+            #expect(observedLevels.suffix(2) == [
+                OverlayWindowController.popupMenuBoostOverlayLevel.rawValue,
+                OverlayWindowController.windowedOverlayLevel.rawValue
+            ])
+        }
+    }
+
+    // MARK: - Bug #1: WindowEnumerator Fullscreen Video Window Priority
+
+    @Test("WindowEnumerator.selectBestTargetWindow prefers display-covering fullscreen video windows over smaller layer-0 HUD helper bars")
+    func windowEnumeratorPrefersFullscreenVideoWindow() {
+        let displays = Self.dualDisplays
+
+        // Case 1: Chrome/Safari/IINA fullscreen — small layer-0 HUD helper bar sits at zOrder=0 ABOVE
+        // the actual display-covering fullscreen video window at zOrder=1!
+        let hudHelperBar = WindowEnumerator.TargetWindowCandidate(
+            windowID: 1001,
+            layer: 0,
+            alpha: 1.0,
+            bounds: CGRect(x: 400, y: 880, width: 700, height: 72),
+            zOrder: 0
+        )
+        let fullscreenVideo = WindowEnumerator.TargetWindowCandidate(
+            windowID: 1002,
+            layer: 0,
+            alpha: 1.0,
+            bounds: Self.primaryRetina.cgBounds,
+            zOrder: 1
+        )
+        let picked1 = WindowEnumerator.selectBestTargetWindow(
+            from: [hudHelperBar, fullscreenVideo],
+            displays: displays
+        )
+        #expect(picked1?.windowID == 1002)
+
+        // Case 2: Raised-layer fullscreen game/video window (`layer > 0`) vs small layer-0 companion window
+        let raisedFullscreen = WindowEnumerator.TargetWindowCandidate(
+            windowID: 2002,
+            layer: 5,
+            alpha: 1.0,
+            bounds: Self.externalDELLNegativeCGY.cgBounds,
+            zOrder: 2
+        )
+        let picked2 = WindowEnumerator.selectBestTargetWindow(
+            from: [hudHelperBar, raisedFullscreen],
+            displays: displays
+        )
+        #expect(picked2?.windowID == 2002)
+
+        // Case 3: MacBook Pro notch-inset native fullscreen video (top inset = 33pt below notch, full width, flush bottom)
+        // vs tiny floating control strip at zOrder=0
+        let notchFullscreen = WindowEnumerator.TargetWindowCandidate(
+            windowID: 3002,
+            layer: 0,
+            alpha: 1.0,
+            bounds: CGRect(x: 0, y: 33, width: 1512, height: 949),
+            zOrder: 1
+        )
+        let picked3 = WindowEnumerator.selectBestTargetWindow(
+            from: [hudHelperBar, notchFullscreen],
+            displays: displays
+        )
+        #expect(picked3?.windowID == 3002)
+
+        // Case 4: Non-fullscreen — substantial layer-0 content window (>= 200x150) beats tiny layer-0 toolbar helper
+        let tinyBar = WindowEnumerator.TargetWindowCandidate(
+            windowID: 4001,
+            layer: 0,
+            alpha: 1.0,
+            bounds: CGRect(x: 100, y: 100, width: 180, height: 80),
+            zOrder: 0
+        )
+        let mainContent = WindowEnumerator.TargetWindowCandidate(
+            windowID: 4002,
+            layer: 0,
+            alpha: 1.0,
+            bounds: CGRect(x: 120, y: 120, width: 1024, height: 640),
+            zOrder: 1
+        )
+        let picked4 = WindowEnumerator.selectBestTargetWindow(
+            from: [tinyBar, mainContent],
+            displays: displays
+        )
+        #expect(picked4?.windowID == 4002)
     }
 }

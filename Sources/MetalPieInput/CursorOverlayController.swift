@@ -120,6 +120,23 @@ public struct CursorTapEventInput: Hashable, Sendable {
     }
 }
 
+/// Active pointer interaction regime tracked by `CursorEventTapProcessor`.
+public enum CursorPointerInteractionMode: String, Hashable, Codable, Sendable, CaseIterable {
+    /// Normal scaled tracking inside the target window (scaled sprite visible, OS cursor hidden).
+    case scaled
+    /// Pointer is hovering or dragging over MetalPie's own floating chrome (`OverlayToolbarPanel` / `ProfilerHUDPanel`).
+    /// Events deliver at 1:1 native screen coordinates with the native OS cursor visible and scaled sprite hidden.
+    case directChrome
+    /// Windowed scaling mode (`isPresentationWindowed && !threeDGameMode`): pointer moved outside `overlayRect`.
+    /// Native OS cursor is shown and all events pass 1:1 untouched to macOS Menu Bar, Dock, and other apps.
+    case outsideWindowedOverlay
+    /// Fullscreen scaling mode (`!isPresentationWindowed && !threeDGameMode`): pointer pushed up into the host
+    /// display's top macOS Menu Bar strip (or is browsing an open Menu Bar dropdown).
+    case menuBarPassthrough
+    /// Explicitly unconfined mode (`confineCursor == false && !threeDGameMode`): pointer escaped outside `sourceRect`.
+    case unconfinedOutsideSource
+}
+
 /// Deterministic decision produced by `CursorOverlayController`'s event-tap processor.
 public struct CursorTapEventDecision: Hashable, Sendable {
     /// If non-nil, `CGEvent.location` is rewritten to this confined/compensated source CG point.
@@ -141,6 +158,18 @@ public struct CursorTapEventDecision: Hashable, Sendable {
     /// was drifted or outside `sourceRect`, requiring post-warp repost so macOS WindowServer
     /// re-runs hit-testing at `effectiveSourcePoint` (ensuring even scroll notch #1 / click #1 hits!).
     public var shouldRepostAfterWarp: Bool = false
+    /// Resulting pointer interaction mode after processing this event.
+    public var interactionMode: CursorPointerInteractionMode = .scaled
+
+    /// True when this event is routed directly to MetalPie's own floating chrome at 1:1 native coordinates.
+    public var isDirectChromeInteraction: Bool {
+        interactionMode == .directChrome
+    }
+
+    /// True when the native OS cursor should be visible and events pass through at 1:1 native desktop coordinates.
+    public var isNativePassthrough: Bool {
+        interactionMode != .scaled
+    }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(rewrittenEventLocation?.x)
@@ -155,6 +184,7 @@ public struct CursorTapEventDecision: Hashable, Sendable {
         hasher.combine(isMouseGrabbedByGame)
         hasher.combine(isPointerOutsideUnconfinedSource)
         hasher.combine(shouldRepostAfterWarp)
+        hasher.combine(interactionMode)
     }
 }
 
@@ -209,6 +239,23 @@ public struct CursorEventTapProcessor: Sendable {
     public var lastMotionTimestamp: TimeInterval = 0
     public var isPointerOutsideUnconfinedSource: Bool = false
 
+    // Session configuration preserved across `reset()`:
+    /// Visible interactive MetalPie floating chrome rects (toolbar / Profiler HUD) in global CG (Y-down) coordinates.
+    public var interactiveChromeRects: [CGRect] = []
+    /// Whether the active scaling session is windowed (allows smooth outside-overlay escape to Menu Bar / Dock / desktop).
+    public var isPresentationWindowed: Bool = false
+    /// Cached per-display macOS Menu Bar heights (from `NSScreen.frame.maxY - visibleFrame.maxY`).
+    public var displayMenuBarHeights: [CGDirectDisplayID: CGFloat] = [:]
+
+    // Active interaction state cleared by `reset()`:
+    public var interactionMode: CursorPointerInteractionMode = .scaled
+    public var activeChromeDrag: Bool = false
+    public var activeWindowBorderDrag: Bool = false
+    public var lastBorderDragSyncTimestamp: TimeInterval = 0
+    public var topEdgeUpwardOverflow: CGFloat = 0
+    public var menuBarDropdownActive: Bool = false
+    public var menuBarDropdownDismissPendingOnUp: Bool = false
+
     public init() {}
 
     public mutating func reset(
@@ -224,6 +271,13 @@ public struct CursorEventTapProcessor: Sendable {
         lastWarpedTimestamp = 0
         lastMotionTimestamp = 0
         isPointerOutsideUnconfinedSource = false
+        interactionMode = .scaled
+        activeChromeDrag = false
+        activeWindowBorderDrag = false
+        lastBorderDragSyncTimestamp = 0
+        topEdgeUpwardOverflow = 0
+        menuBarDropdownActive = false
+        menuBarDropdownDismissPendingOnUp = false
     }
 
     public mutating func recordExternalWarp(
@@ -244,6 +298,30 @@ public struct CursorEventTapProcessor: Sendable {
         pointerTracker.recordSelfWarp(to: point, rawIncoming: warpFrom)
     }
 
+    /// Returns `true` if `cgPoint` lies inside any visible interactive MetalPie chrome rect. Zero heap allocations.
+    public func isPointInInteractiveChrome(_ cgPoint: CGPoint) -> Bool {
+        for rect in interactiveChromeRects {
+            if rect.contains(cgPoint) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Returns the host display's top macOS Menu Bar band in global CG (Y-down) coordinates.
+    public func hostMenuBarRect(for mapping: PointerMapping) -> CGRect {
+        let height: CGFloat
+        if let displayID = mapping.hostDisplayID,
+           let cached = displayMenuBarHeights[displayID],
+           cached > 1.0
+        {
+            height = cached
+        } else {
+            height = PointerMapping.defaultMenuBarHeight
+        }
+        return mapping.menuBarRect(height: height)
+    }
+
     /// Processes a single event-tap event. Returns `nil` ONLY when the event is a benign self-warp
     /// feedback echo (zero-delta OR warp-jump-delta `.mouseMoved` landing at our warp target).
     public mutating func process(
@@ -262,6 +340,8 @@ public struct CursorEventTapProcessor: Sendable {
         let deltaX = input.deltaX
         let deltaY = input.deltaY
         let now = input.timestamp
+
+        let hadButtonsPressedBeforeEvent = (pressedButtonsMask != 0)
 
         // Update mouse button mask (pauses idle auto-hide & hover-settle sync while dragging).
         switch type {
@@ -381,7 +461,376 @@ public struct CursorEventTapProcessor: Sendable {
             return nil
         }
 
-        // Step 2: Track FPS / 3D game mouse-grab strictly on clean motion events (never on warp echoes
+        let enforceConfinement = mapping.settings.confineCursor || mapping.threeDGameMode
+
+        // In 3D Game Mode, strictly keep scaled confinement (never windowed escape or menu-bar passthrough).
+        if mapping.threeDGameMode &&
+            (interactionMode == .outsideWindowedOverlay || interactionMode == .menuBarPassthrough)
+        {
+            interactionMode = .scaled
+            menuBarDropdownActive = false
+            menuBarDropdownDismissPendingOnUp = false
+            topEdgeUpwardOverflow = 0
+        }
+
+        // Step 2: Handle non-scaled native passthrough modes (Direct Chrome, Windowed Outside Overlay,
+        // Fullscreen Menu Bar Passthrough, and Unconfined Outside Source).
+        switch interactionMode {
+        case .directChrome:
+            // Protect against stale pre-warp events queued before our entry warp onto the toolbar landed
+            // (real WindowServer pre-warp bursts flush within ~50ms).
+            if case .preWarpQueued = warpResolution,
+               let pw = pendingWarp,
+               (now - pw.timestamp) < 0.05
+            {
+                let anchor = pw.to
+                if isButtonDownEvent { activeChromeDrag = true }
+                if isButtonUpEvent && pressedButtonsMask == 0 { activeChromeDrag = false }
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: anchor,
+                    warpTarget: nil,
+                    effectiveSourcePoint: anchor,
+                    scaledCGPosition: anchor,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: isButtonDownEvent || isScrollEvent,
+                    interactionMode: .directChrome
+                )
+            } else if let pw = pendingWarp, (now - pw.timestamp) >= 0.05 {
+                pendingWarp = nil
+            }
+
+            // Click/scroll arrived before our entry warp landed (stale physical location far from chrome target).
+            if (isButtonEvent || isScrollEvent),
+               let pw = pendingWarp,
+               hypot(incoming.x - pw.to.x, incoming.y - pw.to.y) >= 1.0
+            {
+                let anchor = pw.to
+                if isButtonDownEvent { activeChromeDrag = true }
+                if isButtonUpEvent && pressedButtonsMask == 0 { activeChromeDrag = false }
+                let alreadyWarping = (now - pw.timestamp) < 0.015
+                var wt: CGPoint? = nil
+                if !alreadyWarping {
+                    wt = anchor
+                    lastWarpedPoint = anchor
+                    lastWarpedTimestamp = now
+                    pendingWarp = PendingWarp(from: incoming, to: anchor, timestamp: now)
+                }
+                lastPhysicalLocation = incoming
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: anchor,
+                    warpTarget: wt,
+                    effectiveSourcePoint: anchor,
+                    scaledCGPosition: anchor,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: isButtonDownEvent || isScrollEvent,
+                    interactionMode: .directChrome
+                )
+            }
+
+            if isButtonDownEvent && isPointInInteractiveChrome(incoming) {
+                activeChromeDrag = true
+            }
+            let stayInChrome = isPointInInteractiveChrome(incoming)
+                || activeChromeDrag
+                || (isButtonUpEvent && hadButtonsPressedBeforeEvent)
+            if stayInChrome {
+                if isButtonUpEvent && pressedButtonsMask == 0 {
+                    activeChromeDrag = false
+                }
+                lastPhysicalLocation = incoming
+                virtualSourcePosition = incoming
+                if isMotionEvent { lastMotionTimestamp = now }
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: incoming,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .directChrome
+                )
+            }
+
+            // Exited interactive chrome with no active drag: route smoothly to destination regime.
+            activeChromeDrag = false
+            if isPresentationWindowed && !mapping.threeDGameMode && !mapping.overlayRect.contains(incoming) {
+                interactionMode = .outsideWindowedOverlay
+                lastPhysicalLocation = incoming
+                virtualSourcePosition = incoming
+                if isMotionEvent { lastMotionTimestamp = now }
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: incoming,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .outsideWindowedOverlay
+                )
+            }
+            if !isPresentationWindowed && !mapping.threeDGameMode && hostMenuBarRect(for: mapping).contains(incoming) {
+                interactionMode = .menuBarPassthrough
+                menuBarDropdownActive = isButtonDownEvent
+                menuBarDropdownDismissPendingOnUp = false
+                lastPhysicalLocation = incoming
+                virtualSourcePosition = incoming
+                if isMotionEvent { lastMotionTimestamp = now }
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: incoming,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .menuBarPassthrough
+                )
+            }
+            if !enforceConfinement && !mapping.isPointInsideSource(incoming) {
+                interactionMode = .unconfinedOutsideSource
+                isPointerOutsideUnconfinedSource = true
+                lastPhysicalLocation = incoming
+                virtualSourcePosition = incoming
+                if isMotionEvent { lastMotionTimestamp = now }
+                let scaledPos = mapping.mapSourceToScaled(incoming, clampToContent: true)
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: scaledPos,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: true,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .unconfinedOutsideSource
+                )
+            }
+            return transitionBackToScaled(
+                at: incoming,
+                input: input,
+                mapping: mapping,
+                enforceConfinement: enforceConfinement,
+                isHiddenForScreenshot: isHiddenForScreenshot,
+                isIdleHidden: isIdleHidden,
+                isButtonDownEvent: isButtonDownEvent,
+                isScrollEvent: isScrollEvent,
+                isMotionEvent: isMotionEvent
+            )
+
+        case .outsideWindowedOverlay:
+            if !isPresentationWindowed || mapping.threeDGameMode {
+                return transitionBackToScaled(
+                    at: incoming,
+                    input: input,
+                    mapping: mapping,
+                    enforceConfinement: enforceConfinement,
+                    isHiddenForScreenshot: isHiddenForScreenshot,
+                    isIdleHidden: isIdleHidden,
+                    isButtonDownEvent: isButtonDownEvent,
+                    isScrollEvent: isScrollEvent,
+                    isMotionEvent: isMotionEvent
+                )
+            }
+            if case .preWarpQueued = warpResolution {
+                let anchor = pendingWarp?.to ?? lastWarpedPoint ?? incoming
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: anchor,
+                    warpTarget: nil,
+                    effectiveSourcePoint: anchor,
+                    scaledCGPosition: anchor,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .outsideWindowedOverlay
+                )
+            }
+            if !hadButtonsPressedBeforeEvent && isPointInInteractiveChrome(incoming) {
+                interactionMode = .directChrome
+                activeChromeDrag = isButtonDownEvent
+                lastPhysicalLocation = incoming
+                virtualSourcePosition = incoming
+                if isMotionEvent { lastMotionTimestamp = now }
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: incoming,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .directChrome
+                )
+            }
+            if !hadButtonsPressedBeforeEvent && mapping.overlayRect.contains(incoming) {
+                return transitionBackToScaled(
+                    at: incoming,
+                    input: input,
+                    mapping: mapping,
+                    enforceConfinement: enforceConfinement,
+                    isHiddenForScreenshot: isHiddenForScreenshot,
+                    isIdleHidden: isIdleHidden,
+                    isButtonDownEvent: isButtonDownEvent,
+                    isScrollEvent: isScrollEvent,
+                    isMotionEvent: isMotionEvent
+                )
+            }
+            lastPhysicalLocation = incoming
+            virtualSourcePosition = incoming
+            if isMotionEvent { lastMotionTimestamp = now }
+            return CursorTapEventDecision(
+                rewrittenEventLocation: nil,
+                warpTarget: nil,
+                effectiveSourcePoint: incoming,
+                scaledCGPosition: incoming,
+                isScaledSpriteVisible: false,
+                isMouseGrabbedByGame: false,
+                isPointerOutsideUnconfinedSource: false,
+                shouldRepostAfterWarp: false,
+                interactionMode: .outsideWindowedOverlay
+            )
+
+        case .menuBarPassthrough:
+            if isPresentationWindowed || mapping.threeDGameMode {
+                if isPresentationWindowed && !mapping.threeDGameMode && !mapping.overlayRect.contains(incoming) {
+                    interactionMode = .outsideWindowedOverlay
+                    menuBarDropdownActive = false
+                    menuBarDropdownDismissPendingOnUp = false
+                    lastPhysicalLocation = incoming
+                    virtualSourcePosition = incoming
+                    if isMotionEvent { lastMotionTimestamp = now }
+                    return CursorTapEventDecision(
+                        rewrittenEventLocation: nil,
+                        warpTarget: nil,
+                        effectiveSourcePoint: incoming,
+                        scaledCGPosition: incoming,
+                        isScaledSpriteVisible: false,
+                        isMouseGrabbedByGame: false,
+                        isPointerOutsideUnconfinedSource: false,
+                        shouldRepostAfterWarp: false,
+                        interactionMode: .outsideWindowedOverlay
+                    )
+                }
+                return transitionBackToScaled(
+                    at: incoming,
+                    input: input,
+                    mapping: mapping,
+                    enforceConfinement: enforceConfinement,
+                    isHiddenForScreenshot: isHiddenForScreenshot,
+                    isIdleHidden: isIdleHidden,
+                    isButtonDownEvent: isButtonDownEvent,
+                    isScrollEvent: isScrollEvent,
+                    isMotionEvent: isMotionEvent
+                )
+            }
+            if case .preWarpQueued = warpResolution {
+                let anchor = pendingWarp?.to ?? lastWarpedPoint ?? incoming
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: anchor,
+                    warpTarget: nil,
+                    effectiveSourcePoint: anchor,
+                    scaledCGPosition: anchor,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: isButtonDownEvent,
+                    interactionMode: .menuBarPassthrough
+                )
+            }
+
+            let menuBar = hostMenuBarRect(for: mapping)
+            let inMenuBarStrip = incoming.y <= menuBar.maxY + 4.0 &&
+                incoming.x >= menuBar.minX - 2.0 &&
+                incoming.x <= menuBar.maxX + 2.0
+            let belowExitHysteresis = incoming.y > menuBar.maxY + 8.0
+
+            if isButtonDownEvent {
+                if inMenuBarStrip {
+                    menuBarDropdownActive = true
+                    menuBarDropdownDismissPendingOnUp = false
+                } else if menuBarDropdownActive {
+                    menuBarDropdownDismissPendingOnUp = true
+                }
+            } else if isButtonUpEvent && pressedButtonsMask == 0 {
+                if menuBarDropdownDismissPendingOnUp || !inMenuBarStrip {
+                    menuBarDropdownActive = false
+                    menuBarDropdownDismissPendingOnUp = false
+                }
+            }
+
+            // Moving directly from menu bar down onto MetalPie's floating toolbar transitions cleanly to `.directChrome`.
+            if !inMenuBarStrip &&
+                !menuBarDropdownActive &&
+                !hadButtonsPressedBeforeEvent &&
+                !isButtonUpEvent &&
+                isPointInInteractiveChrome(incoming)
+            {
+                interactionMode = .directChrome
+                activeChromeDrag = isButtonDownEvent
+                lastPhysicalLocation = incoming
+                virtualSourcePosition = incoming
+                if isMotionEvent { lastMotionTimestamp = now }
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: incoming,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .directChrome
+                )
+            }
+
+            let stayInMenuBar = !belowExitHysteresis
+                || menuBarDropdownActive
+                || hadButtonsPressedBeforeEvent
+                || isButtonUpEvent
+            if stayInMenuBar {
+                lastPhysicalLocation = incoming
+                virtualSourcePosition = incoming
+                if isMotionEvent { lastMotionTimestamp = now }
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: incoming,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: false,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .menuBarPassthrough
+                )
+            }
+
+            return transitionBackToScaled(
+                at: incoming,
+                input: input,
+                mapping: mapping,
+                enforceConfinement: enforceConfinement,
+                isHiddenForScreenshot: isHiddenForScreenshot,
+                isIdleHidden: isIdleHidden,
+                isButtonDownEvent: isButtonDownEvent,
+                isScrollEvent: isScrollEvent,
+                isMotionEvent: isMotionEvent
+            )
+
+        case .unconfinedOutsideSource, .scaled:
+            break
+        }
+
+        // Step 3: Track FPS / 3D game mouse-grab strictly on clean motion events (never on warp echoes
         // or stale pre-warp queued events, eliminating false-positive grab flapping during normal usage).
         let grabbed: Bool
         if mapping.settings.respectGameMouseGrab {
@@ -418,37 +867,64 @@ public struct CursorEventTapProcessor: Sendable {
             grabbed = false
         }
 
-        let enforceConfinement = mapping.settings.confineCursor || mapping.threeDGameMode
-        let wasOutsideUnconfined = isPointerOutsideUnconfinedSource
+        let wasOutsideUnconfined = isPointerOutsideUnconfinedSource || (interactionMode == .unconfinedOutsideSource)
 
-        // Step 3: When confinement is explicitly disabled and pointer already escaped outside sourceRect,
-        // keep 1:1 native OS cursor motion across other monitors until re-entering sourceRect.
-        if !enforceConfinement && wasOutsideUnconfined && !mapping.isPointInsideSource(incoming) {
-            lastPhysicalLocation = incoming
-            if isMotionEvent {
-                lastMotionTimestamp = now
+        // Step 4: When confinement is explicitly disabled and pointer already escaped outside sourceRect,
+        // keep 1:1 native OS cursor motion across other monitors until re-entering sourceRect (or chrome).
+        if !enforceConfinement && wasOutsideUnconfined {
+            if !hadButtonsPressedBeforeEvent && isPointInInteractiveChrome(incoming) {
+                interactionMode = .directChrome
+                isPointerOutsideUnconfinedSource = false
+                activeChromeDrag = isButtonDownEvent
+                lastPhysicalLocation = incoming
+                virtualSourcePosition = incoming
+                if isMotionEvent { lastMotionTimestamp = now }
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: incoming,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: grabbed,
+                    isPointerOutsideUnconfinedSource: false,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .directChrome
+                )
             }
-            virtualSourcePosition = incoming
-            isPointerOutsideUnconfinedSource = true
-            let scaledPos = mapping.mapSourceToScaled(incoming, clampToContent: true)
-            return CursorTapEventDecision(
-                rewrittenEventLocation: nil,
-                warpTarget: nil,
-                effectiveSourcePoint: incoming,
-                scaledCGPosition: scaledPos,
-                isScaledSpriteVisible: false,
-                isMouseGrabbedByGame: grabbed,
-                isPointerOutsideUnconfinedSource: true
-            )
+            if !mapping.isPointInsideSource(incoming) {
+                lastPhysicalLocation = incoming
+                if isMotionEvent {
+                    lastMotionTimestamp = now
+                }
+                virtualSourcePosition = incoming
+                isPointerOutsideUnconfinedSource = true
+                interactionMode = .unconfinedOutsideSource
+                let scaledPos = mapping.mapSourceToScaled(incoming, clampToContent: true)
+                return CursorTapEventDecision(
+                    rewrittenEventLocation: nil,
+                    warpTarget: nil,
+                    effectiveSourcePoint: incoming,
+                    scaledCGPosition: scaledPos,
+                    isScaledSpriteVisible: false,
+                    isMouseGrabbedByGame: grabbed,
+                    isPointerOutsideUnconfinedSource: true,
+                    shouldRepostAfterWarp: false,
+                    interactionMode: .unconfinedOutsideSource
+                )
+            }
         }
 
         var newEventLocation: CGPoint?
         var warpTarget: CGPoint?
         var shouldRepostAfterWarp = false
+        var wasBorderDragThisEvent = activeWindowBorderDrag
         let effectiveSourcePoint: CGPoint
 
         if grabbed || mapping.threeDGameMode {
             // Zero-delta-drift confinement: NEVER touch relative deltas or speed scaling!
+            activeWindowBorderDrag = false
+            wasBorderDragThisEvent = false
+            topEdgeUpwardOverflow = 0
             if enforceConfinement {
                 let constrained = mapping.constrainSourcePoint(incoming)
                 if constrained.wasClamped {
@@ -469,8 +945,8 @@ public struct CursorEventTapProcessor: Sendable {
             // - Measures true double-precision desktop travel from `incoming - physicalOrigin`
             //   (immune to integer delta truncation, high-DPI raw-count scaling, and warp-delta spikes!).
             // - Integrates in `Double` `virtualSourcePosition` and rewrites `event.location` on every event.
-            // - Warps the physical OS cursor ONLY when needed (confinement edge recenter or click sync),
-            //   eliminating 120–1000 Hz warp spam and WindowServer feedback loops!
+            // - Warps the physical OS cursor ONLY when needed (confinement edge recenter, click/scroll sync,
+            //   or live border-resize sync), eliminating 120–1000 Hz warp spam and WindowServer feedback loops!
             let base: CGPoint
             if wasOutsideUnconfined {
                 // Re-entering unconfined source window: start cleanly at the entry coordinate with zero snap.
@@ -534,12 +1010,81 @@ public struct CursorEventTapProcessor: Sendable {
                     }
                 }
 
-                if abs(motionDX) > 1e-6 || abs(motionDY) > 1e-6 {
-                    let comp = mapping.speedCompensationScale
-                    let rawNext = CGPoint(
-                        x: base.x + motionDX * comp.width,
-                        y: base.y + motionDY * comp.height
-                    )
+                let comp = mapping.speedCompensationScale
+                let rawNext = (abs(motionDX) > 1e-6 || abs(motionDY) > 1e-6)
+                    ? CGPoint(x: base.x + motionDX * comp.width, y: base.y + motionDY * comp.height)
+                    : base
+
+                // Mode transitions (Chrome, Windowed outside-overlay, Fullscreen Menu Bar) ONLY when
+                // no drag inside the target window is active (`pressedButtonsMask == 0`).
+                if pressedButtonsMask == 0 {
+                    let unclampedScaled = mapping.mapSourceToScaled(rawNext, clampToContent: false)
+
+                    if base.y <= mapping.confinementRect.minY + 1.5 && motionDY < -0.001 {
+                        topEdgeUpwardOverflow += CGFloat(-motionDY)
+                    } else if motionDY > 0.001 || base.y > mapping.confinementRect.minY + 2.0 {
+                        topEdgeUpwardOverflow = 0
+                    }
+
+                    // 1. Direct Chrome check (also allows crossing a top letterbox bar up into MetalPie's toolbar).
+                    if !interactiveChromeRects.isEmpty {
+                        let chromeCheckPoint: CGPoint
+                        if topEdgeUpwardOverflow > 0 && unclampedScaled.y <= mapping.contentRect.minY + 1.0 {
+                            chromeCheckPoint = CGPoint(
+                                x: unclampedScaled.x,
+                                y: mapping.contentRect.minY - topEdgeUpwardOverflow
+                            )
+                        } else {
+                            chromeCheckPoint = unclampedScaled
+                        }
+                        if isPointInInteractiveChrome(chromeCheckPoint) {
+                            return enterDirectChrome(
+                                at: chromeCheckPoint,
+                                incoming: incoming,
+                                input: input,
+                                isButtonDownEvent: isButtonDownEvent,
+                                isScrollEvent: isScrollEvent
+                            )
+                        }
+                    }
+
+                    // 2. Windowed mode smooth outside-overlay escape (releases confinement to Menu Bar / Dock / Desktop).
+                    if isPresentationWindowed {
+                        if let exitPoint = computeWindowedOverlayExitPoint(
+                            unclampedScaled: unclampedScaled,
+                            mapping: mapping
+                        ) {
+                            return enterOutsideWindowedOverlay(
+                                at: exitPoint,
+                                incoming: incoming,
+                                input: input
+                            )
+                        }
+                    }
+
+                    // 3. Fullscreen mode top Menu Bar passthrough (pushing upward at top edge into Menu Bar strip).
+                    //    Only applies when confined (`enforceConfinement == true`); unconfined mode escapes naturally.
+                    if enforceConfinement && !isPresentationWindowed {
+                        if let menuEntry = computeFullscreenMenuBarEntryPoint(
+                            candidateScaledX: unclampedScaled.x,
+                            mapping: mapping
+                        ) {
+                            return enterMenuBarPassthrough(
+                                at: menuEntry,
+                                incoming: incoming,
+                                input: input
+                            )
+                        }
+                    }
+                } else {
+                    topEdgeUpwardOverflow = 0
+                }
+
+                if activeWindowBorderDrag {
+                    // Bug #5: Allow window border-resize / titlebar move drags to travel freely BOTH
+                    // inward AND outward past old `sourceRect`, clamped only to display bounds!
+                    targetPos = mapping.clampPointToDisplays(rawNext)
+                } else if abs(motionDX) > 1e-6 || abs(motionDY) > 1e-6 {
                     targetPos = enforceConfinement ? mapping.constrainSourcePoint(rawNext).point : rawNext
                 } else {
                     targetPos = enforceConfinement ? mapping.constrainSourcePoint(base).point : base
@@ -548,7 +1093,35 @@ public struct CursorEventTapProcessor: Sendable {
             } else {
                 // Clicks (*MouseDown/*MouseUp), scrollWheel, and unconfined re-entry stay strictly locked
                 // to `virtualSourcePosition` so clicks ALWAYS hit the visual cursor hotspot!
-                targetPos = enforceConfinement ? mapping.constrainSourcePoint(base).point : base
+                if !hadButtonsPressedBeforeEvent && !interactiveChromeRects.isEmpty {
+                    let currentVisual = mapping.mapSourceToScaled(base, clampToContent: true)
+                    if isPointInInteractiveChrome(currentVisual) {
+                        return enterDirectChrome(
+                            at: currentVisual,
+                            incoming: incoming,
+                            input: input,
+                            isButtonDownEvent: isButtonDownEvent,
+                            isScrollEvent: isScrollEvent
+                        )
+                    }
+                }
+
+                if wasBorderDragThisEvent {
+                    // Keep border-resize release coordinate unclamped to old `sourceRect` so macOS commits the resize!
+                    targetPos = mapping.clampPointToDisplays(base)
+                    if type == .leftMouseUp || (pressedButtonsMask & (1 << 0)) == 0 {
+                        activeWindowBorderDrag = false
+                    }
+                } else {
+                    targetPos = enforceConfinement ? mapping.constrainSourcePoint(base).point : base
+                    if type == .leftMouseDown && mapping.isPointInWindowResizeOrTitlebarZone(targetPos) {
+                        activeWindowBorderDrag = true
+                        wasBorderDragThisEvent = true
+                        lastBorderDragSyncTimestamp = 0
+                    } else if type == .leftMouseUp || (pressedButtonsMask & (1 << 0)) == 0 {
+                        activeWindowBorderDrag = false
+                    }
+                }
             }
 
             virtualSourcePosition = targetPos
@@ -560,13 +1133,13 @@ public struct CursorEventTapProcessor: Sendable {
             let physicalOutsideSource = !mapping.isPointInsideSource(incoming)
             let drift = hypot(incoming.x - targetPos.x, incoming.y - targetPos.y)
 
-            if enforceConfinement || targetInsideSource {
+            if enforceConfinement || targetInsideSource || wasBorderDragThisEvent {
                 if isButtonEvent || isScrollEvent {
                     // Sync hidden physical OS cursor onto `targetPos` before button presses/releases AND
                     // scroll-wheel / trackpad 2-finger scroll events whenever drifted >= 1pt or outside
                     // `sourceRect` so macOS WindowServer hit-testing, scroll views, context menus, and
                     // `[NSEvent mouseLocation]` agree 100% with the rendered scaled cursor!
-                    if drift >= 1.0 || physicalOutsideSource {
+                    if drift >= 1.0 || (physicalOutsideSource && !wasBorderDragThisEvent) {
                         let alreadyWarpingToTarget: Bool = {
                             guard let pw = pendingWarp else { return false }
                             return (now - pw.timestamp) < 0.015 &&
@@ -579,7 +1152,14 @@ public struct CursorEventTapProcessor: Sendable {
                             shouldRepostAfterWarp = true
                         }
                     }
-                } else if isMotionEvent && enforceConfinement && pendingWarp == nil {
+                } else if type == .leftMouseDragged && activeWindowBorderDrag {
+                    // Bug #5: Keep macOS WindowServer's live window resize / titlebar drag loop synced
+                    // to `targetPos` cleanly at throttled intervals (never stacking on an in-flight warp!).
+                    if drift >= 1.5 && pendingWarp == nil && (now - lastBorderDragSyncTimestamp) >= 0.012 {
+                        warpTarget = targetPos
+                        lastBorderDragSyncTimestamp = now
+                    }
+                } else if isMotionEvent && enforceConfinement && !activeWindowBorderDrag && pendingWarp == nil {
                     // Zero-hitch full-display physical cursor roaming:
                     // While the physical hardware cursor is hidden in `adjustCursorSpeed` mode, let it
                     // roam freely across the entire host display (`physicalRoamingRect`, inset 20pt from
@@ -604,7 +1184,80 @@ public struct CursorEventTapProcessor: Sendable {
         } else {
             // Standard zero-delta-drift confinement (`adjustCursorSpeed == false`):
             // Physical cursor moves natively inside `confinementRect`, warping ONLY on boundary exit.
-            if enforceConfinement {
+            let unclampedScaled = mapping.mapSourceToScaled(incoming, clampToContent: false)
+
+            if !hadButtonsPressedBeforeEvent && !interactiveChromeRects.isEmpty {
+                if isPointInInteractiveChrome(unclampedScaled) {
+                    return enterDirectChrome(
+                        at: unclampedScaled,
+                        incoming: incoming,
+                        input: input,
+                        isButtonDownEvent: isButtonDownEvent,
+                        isScrollEvent: isScrollEvent
+                    )
+                }
+            }
+
+            if pressedButtonsMask == 0 && isMotionEvent {
+                if incoming.y <= mapping.confinementRect.minY + 1.5 && (deltaY < -0.001 || incoming.y < mapping.confinementRect.minY) {
+                    let push = max(
+                        deltaY < 0 ? CGFloat(-deltaY) : 0,
+                        max(0, mapping.confinementRect.minY - incoming.y) * CGFloat(mapping.scaleY)
+                    )
+                    topEdgeUpwardOverflow += push
+                } else if deltaY > 0.001 || incoming.y > mapping.confinementRect.minY + 2.0 {
+                    topEdgeUpwardOverflow = 0
+                }
+
+                if !interactiveChromeRects.isEmpty && topEdgeUpwardOverflow > 0 && unclampedScaled.y <= mapping.contentRect.minY + 1.0 {
+                    let chromeCheck = CGPoint(x: unclampedScaled.x, y: mapping.contentRect.minY - topEdgeUpwardOverflow)
+                    if isPointInInteractiveChrome(chromeCheck) {
+                        return enterDirectChrome(
+                            at: chromeCheck,
+                            incoming: incoming,
+                            input: input,
+                            isButtonDownEvent: isButtonDownEvent,
+                            isScrollEvent: isScrollEvent
+                        )
+                    }
+                }
+
+                if isPresentationWindowed && !mapping.isPointInsideSource(incoming) {
+                    if let exitPoint = computeWindowedOverlayExitPoint(
+                        unclampedScaled: unclampedScaled,
+                        mapping: mapping
+                    ) {
+                        return enterOutsideWindowedOverlay(
+                            at: exitPoint,
+                            incoming: incoming,
+                            input: input
+                        )
+                    }
+                }
+
+                if enforceConfinement && !isPresentationWindowed {
+                    if let menuEntry = computeFullscreenMenuBarEntryPoint(
+                        candidateScaledX: unclampedScaled.x,
+                        mapping: mapping
+                    ) {
+                        return enterMenuBarPassthrough(
+                            at: menuEntry,
+                            incoming: incoming,
+                            input: input
+                        )
+                    }
+                }
+            } else {
+                topEdgeUpwardOverflow = 0
+            }
+
+            if wasBorderDragThisEvent {
+                // Bug #5: Allow inward & outward border resize drags even when `adjustCursorSpeed == false`!
+                effectiveSourcePoint = mapping.clampPointToDisplays(incoming)
+                if type == .leftMouseUp || (pressedButtonsMask & (1 << 0)) == 0 {
+                    activeWindowBorderDrag = false
+                }
+            } else if enforceConfinement {
                 let constrained = mapping.constrainSourcePoint(incoming)
                 if constrained.wasClamped {
                     newEventLocation = constrained.point
@@ -614,8 +1267,16 @@ public struct CursorEventTapProcessor: Sendable {
                     }
                 }
                 effectiveSourcePoint = constrained.point
+                if type == .leftMouseDown && mapping.isPointInWindowResizeOrTitlebarZone(effectiveSourcePoint) {
+                    activeWindowBorderDrag = true
+                    wasBorderDragThisEvent = true
+                }
             } else {
                 effectiveSourcePoint = incoming
+                if type == .leftMouseDown && mapping.isPointInWindowResizeOrTitlebarZone(effectiveSourcePoint) {
+                    activeWindowBorderDrag = true
+                    wasBorderDragThisEvent = true
+                }
             }
             virtualSourcePosition = effectiveSourcePoint
             lastPhysicalLocation = incoming
@@ -625,6 +1286,7 @@ public struct CursorEventTapProcessor: Sendable {
         }
 
         isPointerOutsideUnconfinedSource = !enforceConfinement && !mapping.isPointInsideSource(effectiveSourcePoint)
+        interactionMode = isPointerOutsideUnconfinedSource ? .unconfinedOutsideSource : .scaled
 
         if let wt = warpTarget {
             lastWarpedPoint = wt
@@ -633,7 +1295,14 @@ public struct CursorEventTapProcessor: Sendable {
             pointerTracker.recordSelfWarp(to: wt, rawIncoming: incoming)
         }
 
-        let scaledPos = mapping.mapSourceToScaled(effectiveSourcePoint, clampToContent: true)
+        let scaledPos: CGPoint
+        if wasBorderDragThisEvent {
+            scaledPos = mapping.clampPointToDisplays(
+                mapping.mapSourceToScaled(effectiveSourcePoint, clampToContent: false)
+            )
+        } else {
+            scaledPos = mapping.mapSourceToScaled(effectiveSourcePoint, clampToContent: true)
+        }
         let spriteVisible = mapping.requiresScaledOverlayCursor
             && !isHiddenForScreenshot
             && !isIdleHidden
@@ -648,8 +1317,267 @@ public struct CursorEventTapProcessor: Sendable {
             isScaledSpriteVisible: spriteVisible,
             isMouseGrabbedByGame: grabbed,
             isPointerOutsideUnconfinedSource: isPointerOutsideUnconfinedSource,
-            shouldRepostAfterWarp: shouldRepostAfterWarp
+            shouldRepostAfterWarp: shouldRepostAfterWarp,
+            interactionMode: interactionMode
         )
+    }
+
+    // MARK: - Interaction Mode Transition Helpers
+
+    private mutating func enterDirectChrome(
+        at chromePoint: CGPoint,
+        incoming: CGPoint,
+        input: CursorTapEventInput,
+        isButtonDownEvent: Bool,
+        isScrollEvent: Bool
+    ) -> CursorTapEventDecision {
+        interactionMode = .directChrome
+        isPointerOutsideUnconfinedSource = false
+        activeChromeDrag = isButtonDownEvent
+        activeWindowBorderDrag = false
+        topEdgeUpwardOverflow = 0
+        menuBarDropdownActive = false
+        menuBarDropdownDismissPendingOnUp = false
+
+        virtualSourcePosition = chromePoint
+        lastPhysicalLocation = incoming
+        if input.type == .mouseMoved || input.type == .leftMouseDragged ||
+            input.type == .rightMouseDragged || input.type == .otherMouseDragged
+        {
+            lastMotionTimestamp = input.timestamp
+        }
+
+        var warpTarget: CGPoint? = nil
+        var shouldRepost = false
+        let drift = hypot(incoming.x - chromePoint.x, incoming.y - chromePoint.y)
+        if drift >= 1.0 {
+            let alreadyWarping: Bool = {
+                guard let pw = pendingWarp else { return false }
+                return (input.timestamp - pw.timestamp) < 0.015 &&
+                    hypot(pw.to.x - chromePoint.x, pw.to.y - chromePoint.y) < 1.0
+            }()
+            if !alreadyWarping {
+                warpTarget = chromePoint
+                lastWarpedPoint = chromePoint
+                lastWarpedTimestamp = input.timestamp
+                pendingWarp = PendingWarp(from: incoming, to: chromePoint, timestamp: input.timestamp)
+                pointerTracker.recordSelfWarp(to: chromePoint, rawIncoming: incoming)
+            }
+            if isButtonDownEvent || isScrollEvent {
+                shouldRepost = true
+            }
+        }
+
+        return CursorTapEventDecision(
+            rewrittenEventLocation: chromePoint,
+            warpTarget: warpTarget,
+            effectiveSourcePoint: chromePoint,
+            scaledCGPosition: chromePoint,
+            isScaledSpriteVisible: false,
+            isMouseGrabbedByGame: false,
+            isPointerOutsideUnconfinedSource: false,
+            shouldRepostAfterWarp: shouldRepost,
+            interactionMode: .directChrome
+        )
+    }
+
+    private mutating func enterOutsideWindowedOverlay(
+        at exitPoint: CGPoint,
+        incoming: CGPoint,
+        input: CursorTapEventInput
+    ) -> CursorTapEventDecision {
+        interactionMode = .outsideWindowedOverlay
+        isPointerOutsideUnconfinedSource = false
+        activeChromeDrag = false
+        activeWindowBorderDrag = false
+        topEdgeUpwardOverflow = 0
+        menuBarDropdownActive = false
+        menuBarDropdownDismissPendingOnUp = false
+
+        virtualSourcePosition = exitPoint
+        lastPhysicalLocation = incoming
+        lastMotionTimestamp = input.timestamp
+
+        var warpTarget: CGPoint? = nil
+        if hypot(incoming.x - exitPoint.x, incoming.y - exitPoint.y) >= 1.0 {
+            warpTarget = exitPoint
+            lastWarpedPoint = exitPoint
+            lastWarpedTimestamp = input.timestamp
+            pendingWarp = PendingWarp(from: incoming, to: exitPoint, timestamp: input.timestamp)
+            pointerTracker.recordSelfWarp(to: exitPoint, rawIncoming: incoming)
+        }
+
+        return CursorTapEventDecision(
+            rewrittenEventLocation: exitPoint,
+            warpTarget: warpTarget,
+            effectiveSourcePoint: exitPoint,
+            scaledCGPosition: exitPoint,
+            isScaledSpriteVisible: false,
+            isMouseGrabbedByGame: false,
+            isPointerOutsideUnconfinedSource: false,
+            shouldRepostAfterWarp: false,
+            interactionMode: .outsideWindowedOverlay
+        )
+    }
+
+    private mutating func enterMenuBarPassthrough(
+        at entryPoint: CGPoint,
+        incoming: CGPoint,
+        input: CursorTapEventInput
+    ) -> CursorTapEventDecision {
+        interactionMode = .menuBarPassthrough
+        isPointerOutsideUnconfinedSource = false
+        activeChromeDrag = false
+        activeWindowBorderDrag = false
+        topEdgeUpwardOverflow = 0
+        menuBarDropdownActive = false
+        menuBarDropdownDismissPendingOnUp = false
+
+        virtualSourcePosition = entryPoint
+        lastPhysicalLocation = incoming
+        lastMotionTimestamp = input.timestamp
+
+        var warpTarget: CGPoint? = nil
+        if hypot(incoming.x - entryPoint.x, incoming.y - entryPoint.y) >= 1.0 {
+            warpTarget = entryPoint
+            lastWarpedPoint = entryPoint
+            lastWarpedTimestamp = input.timestamp
+            pendingWarp = PendingWarp(from: incoming, to: entryPoint, timestamp: input.timestamp)
+            pointerTracker.recordSelfWarp(to: entryPoint, rawIncoming: incoming)
+        }
+
+        return CursorTapEventDecision(
+            rewrittenEventLocation: entryPoint,
+            warpTarget: warpTarget,
+            effectiveSourcePoint: entryPoint,
+            scaledCGPosition: entryPoint,
+            isScaledSpriteVisible: false,
+            isMouseGrabbedByGame: false,
+            isPointerOutsideUnconfinedSource: false,
+            shouldRepostAfterWarp: false,
+            interactionMode: .menuBarPassthrough
+        )
+    }
+
+    private mutating func transitionBackToScaled(
+        at incoming: CGPoint,
+        input: CursorTapEventInput,
+        mapping: PointerMapping,
+        enforceConfinement: Bool,
+        isHiddenForScreenshot: Bool,
+        isIdleHidden: Bool,
+        isButtonDownEvent: Bool,
+        isScrollEvent: Bool,
+        isMotionEvent: Bool
+    ) -> CursorTapEventDecision {
+        let mappedSource = mapping.mapScaledToSource(incoming, clampToSource: true)
+        let entrySource = enforceConfinement ? mapping.constrainSourcePoint(mappedSource).point : mappedSource
+
+        interactionMode = .scaled
+        isPointerOutsideUnconfinedSource = false
+        activeChromeDrag = false
+        activeWindowBorderDrag = (
+            input.type == .leftMouseDown &&
+                !mapping.threeDGameMode &&
+                mapping.isPointInWindowResizeOrTitlebarZone(entrySource)
+        )
+        lastBorderDragSyncTimestamp = 0
+        topEdgeUpwardOverflow = 0
+        menuBarDropdownActive = false
+        menuBarDropdownDismissPendingOnUp = false
+
+        virtualSourcePosition = entrySource
+        lastPhysicalLocation = incoming
+        if isMotionEvent {
+            lastMotionTimestamp = input.timestamp
+        }
+
+        var warpTarget: CGPoint? = nil
+        var shouldRepost = false
+        let drift = hypot(incoming.x - entrySource.x, incoming.y - entrySource.y)
+        let needsSyncWarp = (!mapping.settings.adjustCursorSpeed && drift >= 1.0)
+            || ((isButtonDownEvent || isScrollEvent) && (drift >= 1.0 || !mapping.isPointInsideSource(incoming)))
+
+        if needsSyncWarp {
+            warpTarget = entrySource
+            lastWarpedPoint = entrySource
+            lastWarpedTimestamp = input.timestamp
+            pendingWarp = PendingWarp(from: incoming, to: entrySource, timestamp: input.timestamp)
+            pointerTracker.recordSelfWarp(to: entrySource, rawIncoming: incoming)
+            if isButtonDownEvent || isScrollEvent {
+                shouldRepost = true
+            }
+        } else {
+            pointerTracker.recordSelfWarp(to: incoming, rawIncoming: nil)
+        }
+
+        let scaledPos = mapping.mapSourceToScaled(entrySource, clampToContent: true)
+        let spriteVisible = mapping.requiresScaledOverlayCursor
+            && !isHiddenForScreenshot
+            && !isIdleHidden
+            && !(mapping.settings.respectGameMouseGrab && pointerTracker.isGrabbed)
+
+        return CursorTapEventDecision(
+            rewrittenEventLocation: entrySource,
+            warpTarget: warpTarget,
+            effectiveSourcePoint: entrySource,
+            scaledCGPosition: scaledPos,
+            isScaledSpriteVisible: spriteVisible,
+            isMouseGrabbedByGame: pointerTracker.isGrabbed,
+            isPointerOutsideUnconfinedSource: false,
+            shouldRepostAfterWarp: shouldRepost,
+            interactionMode: .scaled
+        )
+    }
+
+    private func computeWindowedOverlayExitPoint(
+        unclampedScaled: CGPoint,
+        mapping: PointerMapping
+    ) -> CGPoint? {
+        let overlay = mapping.overlayRect
+        let content = mapping.contentRect
+        let crossedOverlay = !overlay.contains(unclampedScaled)
+        let crossedContent = mapping.hasLetterboxBars && !content.contains(unclampedScaled)
+        guard crossedOverlay || crossedContent else { return nil }
+
+        var projected = unclampedScaled
+        let exitMargin: CGFloat = 2.0
+        if unclampedScaled.x < content.minX || unclampedScaled.x < overlay.minX {
+            projected.x = min(unclampedScaled.x, overlay.minX - exitMargin)
+        } else if unclampedScaled.x >= content.maxX || unclampedScaled.x >= overlay.maxX {
+            projected.x = max(unclampedScaled.x, overlay.maxX + exitMargin)
+        }
+        if unclampedScaled.y < content.minY || unclampedScaled.y < overlay.minY {
+            projected.y = min(unclampedScaled.y, overlay.minY - exitMargin)
+        } else if unclampedScaled.y >= content.maxY || unclampedScaled.y >= overlay.maxY {
+            projected.y = max(unclampedScaled.y, overlay.maxY + exitMargin)
+        }
+
+        let clampedExit = mapping.clampPointToDisplays(projected, edgeInset: 0.0)
+        // Only escape if the resulting desktop point lies strictly outside `overlayRect`
+        // (prevents futile escape on edges flush against an outer monitor bezel with no adjacent display).
+        return overlay.contains(clampedExit) ? nil : clampedExit
+    }
+
+    private func computeFullscreenMenuBarEntryPoint(
+        candidateScaledX: CGFloat,
+        mapping: PointerMapping
+    ) -> CGPoint? {
+        let menuBar = hostMenuBarRect(for: mapping)
+        guard !menuBar.isEmpty, mapping.overlayRect.minY <= menuBar.maxY + 4.0 else {
+            return nil
+        }
+        let requiredPush = max(6.0, mapping.contentRect.minY - menuBar.maxY + 4.0)
+        guard topEdgeUpwardOverflow >= requiredPush else {
+            return nil
+        }
+        let entryX = min(max(candidateScaledX, menuBar.minX + 1.0), max(menuBar.minX + 1.0, menuBar.maxX - 1.0))
+        let entryY = menuBar.minY + min(12.0, max(1.0, menuBar.height * 0.5))
+        let entryPoint = CGPoint(x: entryX, y: entryY)
+        guard !isPointInInteractiveChrome(entryPoint) else {
+            return nil
+        }
+        return entryPoint
     }
 }
 
@@ -1490,6 +2418,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         var recoveryToken: RunGuardWatchdog.RecoveryToken?
         var overlayWindowID: CGWindowID?
         var preferredWindowLevelRawValue: Int = Int(CGWindowLevelForKey(.popUpMenuWindow))
+        var isPresentationWindowed: Bool = false
     }
 
     private struct TapRuntime {
@@ -1535,6 +2464,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         self.state = OSAllocatedUnfairLock(
             initialState: ControllerState(presentationMode: presentationMode)
         )
+        refreshDisplayMenuBarHeights()
     }
 
     deinit {
@@ -1624,12 +2554,16 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
 
     /// Updates the attached display list used for reachable confinement and `ScreenGeometry` conversions.
     public func updateDisplays(_ displays: [DisplayDescriptor]) {
+        refreshDisplayMenuBarHeights()
         let updatedConfig = state.withLock { s -> CursorMappingConfiguration? in
             s.displays = displays
             guard let config = s.configuration else { return nil }
             let mapping = PointerMapping(configuration: config, displays: displays)
             s.mapping = mapping
-            if let currentVirtual = s.tapProcessor.virtualSourcePosition {
+            if s.tapProcessor.interactionMode == .scaled,
+               !s.tapProcessor.activeWindowBorderDrag,
+               let currentVirtual = s.tapProcessor.virtualSourcePosition
+            {
                 let effective = mapping.settings.confineCursor && !mapping.isIdentity
                     ? mapping.constrainSourcePoint(currentVirtual).point
                     : currentVirtual
@@ -1641,6 +2575,167 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
         if updatedConfig != nil {
             scheduleVisualPositionUpdate()
+        }
+    }
+
+    /// Updates visible interactive MetalPie floating chrome rects (toolbar / HUD) in global CG (Y-down)
+    /// logical coordinates so clicks/drags on MetalPie's own buttons bypass source-window remapping.
+    public func updateInteractiveChromeRects(_ cgRects: [CGRect]) {
+        let normalized = cgRects.map(\.standardized).filter { !$0.isEmpty }
+        let now = ProcessInfo.processInfo.systemUptime
+
+        let transition = state.withLock { s -> (
+            osCursorHide: Bool?,
+            warpTarget: CGPoint?,
+            reassociate: Bool,
+            visibilityChanged: Bool
+        ) in
+            s.tapProcessor.interactiveChromeRects = normalized
+            guard s.isActive, !s.isSuspended, s.isUsingEventTap,
+                  let mapping = s.mapping, mapping.isValid, !mapping.isIdentity
+            else {
+                return (nil, nil, true, false)
+            }
+
+            let prevVisible = s.currentState.isVisible
+            let prevNative = (s.tapProcessor.interactionMode != .scaled)
+            var warpTarget: CGPoint? = nil
+
+            if s.tapProcessor.interactionMode == .directChrome,
+               !s.tapProcessor.activeChromeDrag,
+               s.tapProcessor.pressedButtonsMask == 0
+            {
+                let ptr = s.tapProcessor.lastPhysicalLocation ?? s.currentState.scaledCGPosition
+                if !s.tapProcessor.isPointInInteractiveChrome(ptr) {
+                    let enforceConfinement = mapping.settings.confineCursor || mapping.threeDGameMode
+                    if s.isPresentationWindowed && !mapping.threeDGameMode && !mapping.overlayRect.contains(ptr) {
+                        s.tapProcessor.interactionMode = .outsideWindowedOverlay
+                    } else if !s.isPresentationWindowed && !mapping.threeDGameMode && s.tapProcessor.hostMenuBarRect(for: mapping).contains(ptr) {
+                        s.tapProcessor.interactionMode = .menuBarPassthrough
+                    } else if !enforceConfinement && !mapping.isPointInsideSource(ptr) {
+                        s.tapProcessor.interactionMode = .unconfinedOutsideSource
+                        s.tapProcessor.isPointerOutsideUnconfinedSource = true
+                    } else {
+                        let mapped = mapping.mapScaledToSource(ptr, clampToSource: true)
+                        let entry = enforceConfinement ? mapping.constrainSourcePoint(mapped).point : mapped
+                        s.tapProcessor.interactionMode = .scaled
+                        s.tapProcessor.isPointerOutsideUnconfinedSource = false
+                        s.tapProcessor.virtualSourcePosition = entry
+                        s.tapProcessor.lastPhysicalLocation = ptr
+                        s.currentState.scaledCGPosition = mapping.mapSourceToScaled(entry, clampToContent: true)
+                        if !mapping.settings.adjustCursorSpeed && hypot(ptr.x - entry.x, ptr.y - entry.y) >= 1.0 {
+                            s.tapProcessor.recordExternalWarp(from: ptr, to: entry, timestamp: now)
+                            warpTarget = entry
+                        }
+                    }
+                }
+            } else if s.tapProcessor.interactionMode == .scaled,
+                      s.tapProcessor.pressedButtonsMask == 0,
+                      !s.currentState.isMouseGrabbedByGame,
+                      !mapping.threeDGameMode,
+                      !normalized.isEmpty
+            {
+                let visualPos = s.currentState.scaledCGPosition
+                if s.tapProcessor.isPointInInteractiveChrome(visualPos) {
+                    let fromPt = s.tapProcessor.lastPhysicalLocation ?? visualPos
+                    s.tapProcessor.interactionMode = .directChrome
+                    s.tapProcessor.virtualSourcePosition = visualPos
+                    if hypot(fromPt.x - visualPos.x, fromPt.y - visualPos.y) >= 1.0 {
+                        s.tapProcessor.recordExternalWarp(from: fromPt, to: visualPos, timestamp: now)
+                        warpTarget = visualPos
+                    }
+                }
+            }
+
+            Self.recomputeVisibilityLocked(&s)
+            s.latestRenderSnapshot.state = s.currentState
+            let newNative = (s.tapProcessor.interactionMode != .scaled)
+            let osHide: Bool? = (prevNative != newNative) ? !newNative : nil
+            return (osHide, warpTarget, !mapping.threeDGameMode, prevVisible != s.currentState.isVisible)
+        }
+
+        if let wt = transition.warpTarget {
+            performCursorWarp(to: wt, reassociateMouse: transition.reassociate)
+        }
+        if let shouldHide = transition.osCursorHide {
+            if shouldHide {
+                cursorHider.hide()
+            } else {
+                cursorHider.show()
+            }
+        }
+        if transition.visibilityChanged {
+            scheduleVisualPositionUpdate()
+            notifyStateChange()
+        }
+    }
+
+    /// Configures whether the active scaling session is windowed (not fullscreen). In windowed mode
+    /// (outside 3D Game Mode), moving outside the scaled overlay releases confinement smoothly so the
+    /// user can freely click macOS's Menu Bar, Dock, and other windows.
+    public func setPresentationIsWindowed(_ isWindowed: Bool) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let transition = state.withLock { s -> (
+            osCursorHide: Bool?,
+            warpTarget: CGPoint?,
+            reassociate: Bool,
+            visibilityChanged: Bool
+        ) in
+            s.isPresentationWindowed = isWindowed
+            s.tapProcessor.isPresentationWindowed = isWindowed
+
+            guard s.isActive, !s.isSuspended, s.isUsingEventTap,
+                  let mapping = s.mapping, mapping.isValid, !mapping.isIdentity
+            else {
+                return (nil, nil, true, false)
+            }
+
+            let prevVisible = s.currentState.isVisible
+            let prevNative = (s.tapProcessor.interactionMode != .scaled)
+            var warpTarget: CGPoint? = nil
+
+            if !isWindowed && s.tapProcessor.interactionMode == .outsideWindowedOverlay {
+                let ptr = s.tapProcessor.lastPhysicalLocation ?? Self.currentCGPointerLocation()
+                let placed = mapping.safeInitialSourcePoint(from: ptr)
+                s.tapProcessor.interactionMode = .scaled
+                s.tapProcessor.isPointerOutsideUnconfinedSource = false
+                s.tapProcessor.virtualSourcePosition = placed.point
+                s.tapProcessor.lastPhysicalLocation = ptr
+                s.currentState.scaledCGPosition = mapping.mapSourceToScaled(placed.point, clampToContent: true)
+                if placed.shouldWarp {
+                    s.tapProcessor.recordExternalWarp(from: ptr, to: placed.point, timestamp: now)
+                    warpTarget = placed.point
+                }
+            } else if isWindowed && !mapping.threeDGameMode &&
+                        s.tapProcessor.interactionMode == .menuBarPassthrough &&
+                        !s.tapProcessor.menuBarDropdownActive
+            {
+                let ptr = s.tapProcessor.lastPhysicalLocation ?? s.currentState.scaledCGPosition
+                if !mapping.overlayRect.contains(ptr) {
+                    s.tapProcessor.interactionMode = .outsideWindowedOverlay
+                }
+            }
+
+            Self.recomputeVisibilityLocked(&s)
+            s.latestRenderSnapshot.state = s.currentState
+            let newNative = (s.tapProcessor.interactionMode != .scaled)
+            let osHide: Bool? = (prevNative != newNative) ? !newNative : nil
+            return (osHide, warpTarget, !mapping.threeDGameMode, prevVisible != s.currentState.isVisible)
+        }
+
+        if let wt = transition.warpTarget {
+            performCursorWarp(to: wt, reassociateMouse: transition.reassociate)
+        }
+        if let shouldHide = transition.osCursorHide {
+            if shouldHide {
+                cursorHider.hide()
+            } else {
+                cursorHider.show()
+            }
+        }
+        if transition.visibilityChanged {
+            scheduleVisualPositionUpdate()
+            notifyStateChange()
         }
     }
 
@@ -1678,6 +2773,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
 
         let existingDisplays = state.withLock(\.displays)
         let displays = existingDisplays.isEmpty ? Self.snapshotCurrentDisplays() : existingDisplays
+        refreshDisplayMenuBarHeights()
         let mapping = PointerMapping(configuration: configuration, displays: displays)
         let axGranted = AXIsProcessTrusted()
 
@@ -1691,13 +2787,35 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
 
         let now = ProcessInfo.processInfo.systemUptime
         let initialPointer = Self.currentCGPointerLocation()
+        let isWindowed = state.withLock(\.isPresentationWindowed)
+        let initialMode: CursorPointerInteractionMode
         let initialPlacement: (point: CGPoint, shouldWarp: Bool)
-        if (mapping.settings.confineCursor || configuration.threeDGameMode) && !mapping.isIdentity {
+        if isWindowed && !configuration.threeDGameMode && !mapping.isIdentity {
+            if state.withLock({ $0.tapProcessor.isPointInInteractiveChrome(initialPointer) }) {
+                initialMode = .directChrome
+                initialPlacement = (initialPointer, false)
+            } else if !mapping.overlayRect.contains(initialPointer) {
+                initialMode = .outsideWindowedOverlay
+                initialPlacement = (initialPointer, false)
+            } else {
+                initialMode = .scaled
+                let mapped = mapping.mapScaledToSource(initialPointer, clampToSource: true)
+                let entry = mapping.settings.confineCursor ? mapping.constrainSourcePoint(mapped).point : mapped
+                let needsWarp = !mapping.settings.adjustCursorSpeed && hypot(initialPointer.x - entry.x, initialPointer.y - entry.y) >= 1.0
+                initialPlacement = (entry, needsWarp)
+            }
+        } else if (mapping.settings.confineCursor || configuration.threeDGameMode) && !mapping.isIdentity {
+            initialMode = .scaled
             initialPlacement = mapping.safeInitialSourcePoint(from: initialPointer)
         } else {
+            initialMode = (!mapping.settings.confineCursor && !configuration.threeDGameMode && !mapping.isPointInsideSource(initialPointer))
+                ? .unconfinedOutsideSource
+                : .scaled
             initialPlacement = (initialPointer, false)
         }
-        let scaledInitial = mapping.mapSourceToScaled(initialPlacement.point, clampToContent: true)
+        let scaledInitial = (initialMode == .scaled)
+            ? mapping.mapSourceToScaled(initialPlacement.point, clampToContent: true)
+            : initialPlacement.point
 
         state.withLock { s in
             s.isActive = true
@@ -1706,10 +2824,13 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.configuration = configuration
             s.displays = displays
             s.mapping = mapping
+            s.tapProcessor.isPresentationWindowed = s.isPresentationWindowed
             s.tapProcessor.reset(
                 initialSourcePosition: initialPlacement.point,
                 physicalLocation: initialPointer
             )
+            s.tapProcessor.interactionMode = initialMode
+            s.tapProcessor.isPointerOutsideUnconfinedSource = (initialMode == .unconfinedOutsideSource)
             s.onStateChange = onStateChange
             s.lastActivityUptime = now
             s.recoveryToken = recoveryToken
@@ -1767,8 +2888,12 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.alignmentMode = resolvedMode
             s.latestRenderSnapshot.alignmentMode = resolvedMode
             if didStartTap && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode) {
-                if !mapping.settings.confineCursor && !configuration.threeDGameMode {
-                    s.tapProcessor.isPointerOutsideUnconfinedSource = !mapping.isPointInsideSource(initialPlacement.point)
+                if !mapping.settings.confineCursor && !configuration.threeDGameMode && s.tapProcessor.interactionMode == .scaled {
+                    let outside = !mapping.isPointInsideSource(initialPlacement.point)
+                    s.tapProcessor.isPointerOutsideUnconfinedSource = outside
+                    if outside {
+                        s.tapProcessor.interactionMode = .unconfinedOutsideSource
+                    }
                 }
                 Self.recomputeVisibilityLocked(&s)
             } else {
@@ -1779,13 +2904,15 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         if didStartTap && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode) {
-            let outsideUnconfined = state.withLock(\.tapProcessor.isPointerOutsideUnconfinedSource)
-            if !outsideUnconfined {
+            let isNativeMode = state.withLock { $0.tapProcessor.interactionMode != .scaled }
+            if !isNativeMode {
                 cursorHider.hide()
-            }
-            if (mapping.settings.confineCursor || configuration.threeDGameMode) && initialPlacement.shouldWarp {
-                recordWarp(from: initialPointer, to: initialPlacement.point)
-                performCursorWarp(to: initialPlacement.point, reassociateMouse: !configuration.threeDGameMode)
+                if (mapping.settings.confineCursor || configuration.threeDGameMode) && initialPlacement.shouldWarp {
+                    recordWarp(from: initialPointer, to: initialPlacement.point)
+                    performCursorWarp(to: initialPlacement.point, reassociateMouse: !configuration.threeDGameMode)
+                }
+            } else {
+                cursorHider.show()
             }
         } else {
             cursorHider.show()
@@ -1877,42 +3004,77 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             var pendingWarpSpec: (from: CGPoint, to: CGPoint)? = nil
             if tapActive && !s.isSuspended && !mapping.isIdentity {
                 let currentPhysical = Self.currentCGPointerLocation()
-                let currentRef = startedTapNow
-                    ? currentPhysical
-                    : (s.tapProcessor.virtualSourcePosition ?? currentPhysical)
-
-                if enforceConfinement {
-                    if startedTapNow {
-                        let placed = mapping.safeInitialSourcePoint(from: currentRef)
-                        s.tapProcessor.reset(
-                            initialSourcePosition: placed.point,
-                            physicalLocation: currentPhysical
-                        )
-                        if placed.shouldWarp {
-                            pendingWarpSpec = (from: currentPhysical, to: placed.point)
-                        }
-                    } else {
-                        let constrained = mapping.constrainSourcePoint(currentRef)
-                        s.tapProcessor.virtualSourcePosition = constrained.point
-                        if constrained.wasClamped {
-                            let fromPt = s.tapProcessor.lastPhysicalLocation ?? currentPhysical
-                            pendingWarpSpec = (from: fromPt, to: constrained.point)
-                        }
-                    }
-                    s.tapProcessor.isPointerOutsideUnconfinedSource = false
-                } else {
-                    s.tapProcessor.virtualSourcePosition = currentRef
-                    s.tapProcessor.isPointerOutsideUnconfinedSource = !mapping.isPointInsideSource(currentRef)
+                if configuration.threeDGameMode &&
+                    (s.tapProcessor.interactionMode == .outsideWindowedOverlay || s.tapProcessor.interactionMode == .menuBarPassthrough)
+                {
+                    s.tapProcessor.interactionMode = .scaled
+                    s.tapProcessor.menuBarDropdownActive = false
+                    s.tapProcessor.menuBarDropdownDismissPendingOnUp = false
                 }
 
-                let finalSource = s.tapProcessor.virtualSourcePosition ?? currentRef
-                s.currentState.scaledCGPosition = mapping.mapSourceToScaled(finalSource, clampToContent: true)
-                Self.recomputeVisibilityLocked(&s)
+                if s.tapProcessor.interactionMode != .scaled && !startedTapNow {
+                    // Preserve active native chrome / menu-bar / outside-windowed interaction across layout updates!
+                    s.currentState.isVisible = false
+                } else if s.tapProcessor.activeWindowBorderDrag && !startedTapNow {
+                    // Bug #5: Never clamp or warp `virtualSourcePosition` back into `confinementRect` mid-resize!
+                    let currentRef = s.tapProcessor.virtualSourcePosition ?? currentPhysical
+                    let clampedDisplay = mapping.clampPointToDisplays(currentRef)
+                    s.tapProcessor.virtualSourcePosition = clampedDisplay
+                    s.currentState.scaledCGPosition = mapping.clampPointToDisplays(
+                        mapping.mapSourceToScaled(clampedDisplay, clampToContent: false)
+                    )
+                    Self.recomputeVisibilityLocked(&s)
+                } else {
+                    let currentRef = startedTapNow
+                        ? currentPhysical
+                        : (s.tapProcessor.virtualSourcePosition ?? currentPhysical)
+
+                    if enforceConfinement {
+                        if startedTapNow {
+                            if s.isPresentationWindowed && !configuration.threeDGameMode && !mapping.overlayRect.contains(currentPhysical) {
+                                s.tapProcessor.reset(
+                                    initialSourcePosition: currentPhysical,
+                                    physicalLocation: currentPhysical
+                                )
+                                s.tapProcessor.interactionMode = .outsideWindowedOverlay
+                            } else {
+                                let placed = mapping.safeInitialSourcePoint(from: currentRef)
+                                s.tapProcessor.reset(
+                                    initialSourcePosition: placed.point,
+                                    physicalLocation: currentPhysical
+                                )
+                                if placed.shouldWarp {
+                                    pendingWarpSpec = (from: currentPhysical, to: placed.point)
+                                }
+                            }
+                        } else {
+                            let constrained = mapping.constrainSourcePoint(currentRef)
+                            s.tapProcessor.virtualSourcePosition = constrained.point
+                            if constrained.wasClamped {
+                                let fromPt = s.tapProcessor.lastPhysicalLocation ?? currentPhysical
+                                pendingWarpSpec = (from: fromPt, to: constrained.point)
+                            }
+                        }
+                        s.tapProcessor.isPointerOutsideUnconfinedSource = false
+                    } else {
+                        s.tapProcessor.virtualSourcePosition = currentRef
+                        let outside = !mapping.isPointInsideSource(currentRef)
+                        s.tapProcessor.isPointerOutsideUnconfinedSource = outside
+                        s.tapProcessor.interactionMode = outside ? .unconfinedOutsideSource : .scaled
+                    }
+
+                    let finalSource = s.tapProcessor.virtualSourcePosition ?? currentRef
+                    s.currentState.scaledCGPosition = (s.tapProcessor.interactionMode == .scaled)
+                        ? mapping.mapSourceToScaled(finalSource, clampToContent: true)
+                        : finalSource
+                    Self.recomputeVisibilityLocked(&s)
+                }
             } else {
                 let curPtr = Self.currentCGPointerLocation()
                 s.tapProcessor.virtualSourcePosition = curPtr
                 s.tapProcessor.lastPhysicalLocation = curPtr
                 s.tapProcessor.isPointerOutsideUnconfinedSource = false
+                s.tapProcessor.interactionMode = .scaled
                 s.currentState.scaledCGPosition = mapping.mapSourceToScaled(curPtr, clampToContent: true)
                 s.currentState.isVisible = false
             }
@@ -1928,8 +3090,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             return pendingWarpSpec
         }
 
-        let outsideUnconfined = state.withLock(\.tapProcessor.isPointerOutsideUnconfinedSource)
-        if transition.shouldHideOS && tapActive && !outsideUnconfined {
+        let isNativeMode = state.withLock { $0.tapProcessor.interactionMode != .scaled }
+        if transition.shouldHideOS && tapActive && !isNativeMode {
             cursorHider.hide()
             if let wp = warpSpec {
                 recordWarp(from: wp.from, to: wp.to)
@@ -1987,15 +3149,42 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
 
             let currentPtr = Self.currentCGPointerLocation()
             let enforceConfinement = (mapping.settings.confineCursor || mapping.threeDGameMode) && !mapping.isIdentity
-            let placement: (point: CGPoint, shouldWarp: Bool) = enforceConfinement
-                ? mapping.safeInitialSourcePoint(from: currentPtr)
-                : (point: currentPtr, shouldWarp: false)
+            let resumeMode: CursorPointerInteractionMode
+            let placement: (point: CGPoint, shouldWarp: Bool)
+            if s.isPresentationWindowed && !mapping.threeDGameMode && !mapping.isIdentity {
+                if s.tapProcessor.isPointInInteractiveChrome(currentPtr) {
+                    resumeMode = .directChrome
+                    placement = (point: currentPtr, shouldWarp: false)
+                } else if !mapping.overlayRect.contains(currentPtr) {
+                    resumeMode = .outsideWindowedOverlay
+                    placement = (point: currentPtr, shouldWarp: false)
+                } else {
+                    resumeMode = .scaled
+                    let mapped = mapping.mapScaledToSource(currentPtr, clampToSource: true)
+                    let entry = enforceConfinement ? mapping.constrainSourcePoint(mapped).point : mapped
+                    let needsWarp = !mapping.settings.adjustCursorSpeed && hypot(currentPtr.x - entry.x, currentPtr.y - entry.y) >= 1.0
+                    placement = (point: entry, shouldWarp: needsWarp)
+                }
+            } else if enforceConfinement {
+                resumeMode = .scaled
+                placement = mapping.safeInitialSourcePoint(from: currentPtr)
+            } else {
+                resumeMode = (!mapping.settings.confineCursor && !mapping.threeDGameMode && !mapping.isPointInsideSource(currentPtr))
+                    ? .unconfinedOutsideSource
+                    : .scaled
+                placement = (point: currentPtr, shouldWarp: false)
+            }
 
+            s.tapProcessor.isPresentationWindowed = s.isPresentationWindowed
             s.tapProcessor.reset(
                 initialSourcePosition: placement.point,
                 physicalLocation: currentPtr
             )
-            s.currentState.scaledCGPosition = mapping.mapSourceToScaled(placement.point, clampToContent: true)
+            s.tapProcessor.interactionMode = resumeMode
+            s.tapProcessor.isPointerOutsideUnconfinedSource = (resumeMode == .unconfinedOutsideSource)
+            s.currentState.scaledCGPosition = (resumeMode == .scaled)
+                ? mapping.mapSourceToScaled(placement.point, clampToContent: true)
+                : placement.point
 
             let axGranted = AXIsProcessTrusted()
             let shouldTap = mapping.requiresEventTap && axGranted
@@ -2029,8 +3218,12 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         state.withLock { s in
             s.alignmentMode = resolvedMode
             s.latestRenderSnapshot.alignmentMode = resolvedMode
-            if !resumeInfo.mapping.settings.confineCursor && !resumeInfo.mapping.threeDGameMode {
-                s.tapProcessor.isPointerOutsideUnconfinedSource = !resumeInfo.mapping.isPointInsideSource(resumeInfo.placement.point)
+            if !resumeInfo.mapping.settings.confineCursor && !resumeInfo.mapping.threeDGameMode && s.tapProcessor.interactionMode == .scaled {
+                let outside = !resumeInfo.mapping.isPointInsideSource(resumeInfo.placement.point)
+                s.tapProcessor.isPointerOutsideUnconfinedSource = outside
+                if outside {
+                    s.tapProcessor.interactionMode = .unconfinedOutsideSource
+                }
             }
             if resumeInfo.shouldHideOS && tapActive {
                 Self.recomputeVisibilityLocked(&s)
@@ -2040,8 +3233,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.latestRenderSnapshot.state = s.currentState
         }
 
-        let outsideUnconfined = state.withLock(\.tapProcessor.isPointerOutsideUnconfinedSource)
-        if resumeInfo.shouldHideOS && tapActive && !outsideUnconfined {
+        let isNativeMode = state.withLock { $0.tapProcessor.interactionMode != .scaled }
+        if resumeInfo.shouldHideOS && tapActive && !isNativeMode {
             cursorHider.hide()
             if (resumeInfo.mapping.settings.confineCursor || resumeInfo.mapping.threeDGameMode) && resumeInfo.placement.shouldWarp {
                 recordWarp(from: resumeInfo.currentPtr, to: resumeInfo.placement.point)
@@ -2372,7 +3565,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 return .passthrough
             }
 
-            let wasOutsideUnconfined = s.tapProcessor.isPointerOutsideUnconfinedSource
+            let wasNativePassthrough = (s.tapProcessor.interactionMode != .scaled)
             let prevVisible = s.currentState.isVisible
             let prevGrabbed = s.currentState.isMouseGrabbedByGame
             let prevIdleHidden = s.currentState.isIdleHidden
@@ -2403,9 +3596,10 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 )
             }
 
+            let isNativePassthrough = decision.isNativePassthrough
             let osCursorHideTransition: Bool?
-            if wasOutsideUnconfined != decision.isPointerOutsideUnconfinedSource {
-                osCursorHideTransition = !decision.isPointerOutsideUnconfinedSource
+            if wasNativePassthrough != isNativePassthrough {
+                osCursorHideTransition = !isNativePassthrough
             } else {
                 osCursorHideTransition = nil
             }
@@ -2476,7 +3670,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 notifyStateChange()
             }
             if shouldRepostAfterWarp,
-               let loc = newEventLocation,
+               let loc = newEventLocation ?? warpTarget,
                repostEventAfterWarp(event, at: loc)
             {
                 // Drop stale pre-warp event; the freshly hit-tested copy at `loc` was posted to `.cghidEventTap`.
@@ -2552,8 +3746,11 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 return (false, false, false, nil)
             }
 
+            let isScaledMode = (s.tapProcessor.interactionMode == .scaled)
+
             var idleChanged = false
-            if let idleTimeout = mapping.settings.hideOnIdleSeconds,
+            if isScaledMode,
+               let idleTimeout = mapping.settings.hideOnIdleSeconds,
                s.tapProcessor.pressedButtonsMask == 0,
                !s.currentState.isIdleHidden
             {
@@ -2566,17 +3763,19 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             }
 
             // Quiet hover-settle sync: ONLY after >= 300ms of true stillness (no buttons pressed,
-            // no active glide, no pending warp), perform ONE silent OS cursor sync onto
+            // no active glide, no pending warp, in `.scaled` mode), perform ONE silent OS cursor sync onto
             // `virtualSourcePosition` so tooltips / `NSCursor.currentSystem` shapes stay accurate
             // without EVER calling `CGWarpMouseCursorPosition` during active glides or micro-pauses!
             var hoverSettleWarp: CGPoint?
-            if s.isUsingEventTap,
+            if isScaledMode,
+               s.isUsingEventTap,
                mapping.settings.adjustCursorSpeed,
                mapping.settings.confineCursor,
                !mapping.isIdentity,
                !mapping.threeDGameMode,
                !s.currentState.isMouseGrabbedByGame,
                !s.tapProcessor.isPointerOutsideUnconfinedSource,
+               !s.tapProcessor.activeWindowBorderDrag,
                s.tapProcessor.pressedButtonsMask == 0,
                s.tapProcessor.pendingWarp == nil,
                s.tapProcessor.lastMotionTimestamp > 0,
@@ -2590,10 +3789,12 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 hoverSettleWarp = target
             }
 
-            let shouldCheckDrift = s.isUsingEventTap
+            let shouldCheckDrift = isScaledMode
+                && s.isUsingEventTap
                 && !s.tapProcessor.isPointerOutsideUnconfinedSource
                 && (mapping.requiresScaledOverlayCursor || mapping.threeDGameMode)
-            let shouldPollCursorShape = s.isUsingEventTap
+            let shouldPollCursorShape = isScaledMode
+                && s.isUsingEventTap
                 && mapping.requiresScaledOverlayCursor
                 && !s.tapProcessor.isPointerOutsideUnconfinedSource
                 && !s.currentState.isMouseGrabbedByGame
@@ -2961,6 +4162,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
               mapping.requiresScaledOverlayCursor,
               !s.isHiddenForScreenshot,
               !s.currentState.isIdleHidden,
+              s.tapProcessor.interactionMode == .scaled,
               !s.tapProcessor.isPointerOutsideUnconfinedSource
         else {
             s.currentState.isVisible = false
@@ -2973,6 +4175,39 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         s.currentState.isVisible = true
+    }
+
+    /// Refreshes per-display macOS top Menu Bar heights (`NSScreen.frame.maxY - visibleFrame.maxY`)
+    /// safely on the MainActor without ever touching AppKit from the background `CGEventTap` thread.
+    private func refreshDisplayMenuBarHeights() {
+        if Thread.isMainThread {
+            let heights = MainActor.assumeIsolated {
+                Self.snapshotDisplayMenuBarHeightsOnMain()
+            }
+            state.withLock { $0.tapProcessor.displayMenuBarHeights = heights }
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let heights = MainActor.assumeIsolated {
+                    Self.snapshotDisplayMenuBarHeightsOnMain()
+                }
+                self.state.withLock { $0.tapProcessor.displayMenuBarHeights = heights }
+            }
+        }
+    }
+
+    @MainActor
+    internal static func snapshotDisplayMenuBarHeightsOnMain() -> [CGDirectDisplayID: CGFloat] {
+        var result: [CGDirectDisplayID: CGFloat] = [:]
+        for screen in NSScreen.screens {
+            guard let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                continue
+            }
+            let displayID = CGDirectDisplayID(num.uint32Value)
+            let topInset = screen.frame.maxY - screen.visibleFrame.maxY
+            result[displayID] = topInset > 1.0 ? topInset : PointerMapping.defaultMenuBarHeight
+        }
+        return result
     }
 
     private static func currentCGPointerLocation() -> CGPoint {

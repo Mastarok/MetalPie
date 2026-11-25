@@ -599,6 +599,20 @@ struct SettingsView: View {
                         ))
 
                         GridRow {
+                            Text(l10n.tr("Fullscreen Video Input", "全屏视频输入"))
+                                .font(.system(size: 12.5))
+                            Picker("", selection: binding(profileID, \.capture.fullscreenVideoInput)) {
+                                Text(l10n.tr("Auto", "自动")).tag(FullscreenVideoInputMode.auto)
+                                Text("720p").tag(FullscreenVideoInputMode.p720)
+                                Text("1080p").tag(FullscreenVideoInputMode.p1080)
+                                Text(l10n.tr("Native", "原生")).tag(FullscreenVideoInputMode.native)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 240)
+                        }
+
+                        GridRow {
                             Text(l10n.tr("Frame Rate Limit", "帧率上限"))
                                 .font(.system(size: 12.5))
                             HStack(spacing: 10) {

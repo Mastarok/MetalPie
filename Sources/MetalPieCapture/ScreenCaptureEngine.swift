@@ -155,11 +155,18 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
     private static let benignSCKStopCodes: Set<Int> = [-3808, -3817]
     private static let cacheFlushIntervalFrames: UInt64 = 120
     private static let maxNonRetinaProbes = 3
+    private static let resizeDebounceMilliseconds = 180
+
+    private struct PendingResizeState: Sendable {
+        var task: Task<Void, Never>?
+        var generation: UInt64 = 0
+    }
 
     private let device: any MTLDevice
     private let pipelineDepth: Int
     private let gate = AsyncSerialGate()
     private let state = OSAllocatedUnfairLock(initialState: RuntimeState())
+    private let pendingResizeLock = OSAllocatedUnfairLock(initialState: PendingResizeState())
 
     private let sampleQueue = DispatchQueue(
         label: "com.metalpie.capture.sample",
@@ -175,7 +182,6 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
     private var textureCache: CVMetalTextureCache?
     private var surfaceRegistry: [IOSurfaceID: SurfaceKey] = [:]
     private var staleMonitorTimer: DispatchSourceTimer?
-    private var pendingResizeTask: Task<Void, Never>?
 
     // Lazy GPU-only probe resources (zero CPU pixel lock).
     private let probeQueue: (any MTLCommandQueue)?
@@ -217,7 +223,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
     deinit {
         staleMonitorTimer?.cancel()
-        pendingResizeTask?.cancel()
+        cancelPendingResizeTask()
         if let cache = textureCache {
             CVMetalTextureCacheFlush(cache, 0)
         }
@@ -354,7 +360,32 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         }
     }
 
+    /// Coalesced live resize reconfiguration (180ms settle debounce) so macOS titlebar zoom animations
+    /// and edge drags never trigger mid-animation SCShareableContent / IOSurface pool storms.
+    public func requestDebouncedResizeReconfiguration(
+        window: WindowDescriptor,
+        profile: Profile,
+        scalingMode: ScalingMode
+    ) {
+        guard state.withLock(\.isRunning) else { return }
+        scheduleDebouncedResizeReconfig(window: window, profile: profile, scalingMode: scalingMode)
+    }
+
     public func updateConfiguration(
+        window: WindowDescriptor,
+        profile: Profile,
+        scalingMode: ScalingMode
+    ) async throws {
+        // Explicit reconfiguration supersedes any queued debounced resize task.
+        cancelPendingResizeTask()
+        try await applyConfigurationUpdate(
+            window: window,
+            profile: profile,
+            scalingMode: scalingMode
+        )
+    }
+
+    private func applyConfigurationUpdate(
         window: WindowDescriptor,
         profile: Profile,
         scalingMode: ScalingMode
@@ -366,22 +397,54 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
             let previousApplied = self.state.withLock(\.appliedConfig)
             let displays = await WindowEnumerator.enumerateDisplaysAsync()
-            let (newFilter, newSCConfig, newApplied) = try await self.buildFilterAndConfiguration(
-                window: window,
-                profile: profile,
-                displays: displays
-            )
+            let targetDisplayDescriptor = ScreenGeometry.bestDisplay(forCGRect: window.cgBounds, in: displays)
+                ?? ScreenGeometry.primaryDisplay(in: displays)
+            let targetDisplayID = targetDisplayDescriptor?.id ?? CGMainDisplayID()
+
+            let filterChanged: Bool
+            if let prev = previousApplied {
+                filterChanged = prev.captureMode != profile.capture.captureMode
+                    || prev.windowID != window.windowID
+                    || (profile.capture.captureMode == .display && prev.displayID != targetDisplayID)
+            } else {
+                filterChanged = true
+            }
+
+            let newFilter: SCContentFilter?
+            let newSCConfig: SCStreamConfiguration
+            let newApplied: AppliedStreamConfig
+
+            if filterChanged {
+                let built = try await self.buildFilterAndConfiguration(
+                    window: window,
+                    profile: profile,
+                    displays: displays
+                )
+                newFilter = built.0
+                newSCConfig = built.1
+                newApplied = built.2
+            } else {
+                // Fast path: stream target identity did NOT change -> SKIP SCShareableContent IPC (15-40ms)!
+                // Build SCStreamConfiguration directly from window.cgBounds & display backingScaleFactor.
+                newFilter = nil
+                let built = await self.buildStreamConfiguration(
+                    window: window,
+                    profile: profile,
+                    displays: displays,
+                    targetDisplayDescriptor: targetDisplayDescriptor,
+                    targetDisplayID: targetDisplayID,
+                    filterPointPixelScale: nil,
+                    filterContentSize: nil
+                )
+                newSCConfig = built.0
+                newApplied = built.1
+            }
 
             self.state.withLock { s in
                 s.activeWindow = window
                 s.activeProfile = profile
                 s.activeScalingMode = scalingMode
             }
-
-            let filterChanged = previousApplied == nil
-                || previousApplied?.captureMode != newApplied.captureMode
-                || previousApplied?.windowID != newApplied.windowID
-                || (newApplied.captureMode == .display && previousApplied?.displayID != newApplied.displayID)
 
             let configChanged = previousApplied != newApplied
 
@@ -390,7 +453,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             }
 
             do {
-                if filterChanged {
+                if let newFilter, filterChanged {
                     try await stream.updateContentFilter(newFilter)
                 }
                 if configChanged {
@@ -424,7 +487,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
             PipelineLog.shared.info(
                 .capture,
-                "Updated SCStream live: \(newApplied.pixelWidth)x\(newApplied.pixelHeight) @ \(newApplied.backingScaleFactor)x, fpsCap=\(newApplied.frameRateLimit.map(String.init) ?? "auto(\(newApplied.effectiveFrameRateCap)Hz)"), hdr=\(newApplied.dynamicRange == .hdr), showsCursor=\(newApplied.showsCursor)."
+                "Updated SCStream live (filterChanged=\(filterChanged)): \(newApplied.pixelWidth)x\(newApplied.pixelHeight) @ \(newApplied.backingScaleFactor)x, fpsCap=\(newApplied.frameRateLimit.map(String.init) ?? "auto(\(newApplied.effectiveFrameRateCap)Hz)"), hdr=\(newApplied.dynamicRange == .hdr), showsCursor=\(newApplied.showsCursor)."
             )
         }
     }
@@ -438,8 +501,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
     // MARK: - Internal Stream Construction & Teardown
 
     private func stopInternal(emitEvent: Bool, reason: String? = nil) async {
-        pendingResizeTask?.cancel()
-        pendingResizeTask = nil
+        cancelPendingResizeTask()
 
         staleMonitorTimer?.cancel()
         staleMonitorTimer = nil
@@ -532,16 +594,37 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
         // Resolve accurate pixel dimensions from ScreenCaptureKit's own filter info (macOS 14.0+).
         let filterInfo = SCShareableContent.info(for: filter)
+        let (config, applied) = await buildStreamConfiguration(
+            window: window,
+            profile: profile,
+            displays: displays,
+            targetDisplayDescriptor: targetDisplayDescriptor,
+            targetDisplayID: targetDisplayID,
+            filterPointPixelScale: Double(filterInfo.pointPixelScale),
+            filterContentSize: filterInfo.contentRect.size
+        )
+        return (filter, config, applied)
+    }
+
+    private func buildStreamConfiguration(
+        window: WindowDescriptor,
+        profile: Profile,
+        displays: [DisplayDescriptor],
+        targetDisplayDescriptor: DisplayDescriptor?,
+        targetDisplayID: CGDirectDisplayID,
+        filterPointPixelScale: Double?,
+        filterContentSize: CGSize?
+    ) async -> (SCStreamConfiguration, AppliedStreamConfig) {
         let resolvedScale = max(
             1.0,
-            Double(filterInfo.pointPixelScale) > 0
-                ? Double(filterInfo.pointPixelScale)
+            (filterPointPixelScale ?? 0) > 0
+                ? filterPointPixelScale!
                 : (targetDisplayDescriptor?.backingScaleFactor ?? window.backingScaleFactor)
         )
 
         let basePointSize: CGSize
-        if filterInfo.contentRect.width >= 16 && filterInfo.contentRect.height >= 16 {
-            basePointSize = filterInfo.contentRect.size
+        if let contentSize = filterContentSize, contentSize.width >= 16 && contentSize.height >= 16 {
+            basePointSize = contentSize
         } else if profile.capture.captureMode == .display, let d = targetDisplayDescriptor {
             basePointSize = d.cgBounds.size
         } else {
@@ -649,7 +732,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             queueDepth: queueDepth
         )
 
-        return (filter, config, applied)
+        return (config, applied)
     }
 
     @MainActor
@@ -851,18 +934,35 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         }
     }
 
+    private func cancelPendingResizeTask() {
+        let taskToCancel = pendingResizeLock.withLock { s -> Task<Void, Never>? in
+            s.generation &+= 1
+            let prev = s.task
+            s.task = nil
+            return prev
+        }
+        taskToCancel?.cancel()
+    }
+
     private func scheduleDebouncedResizeReconfig(
         window: WindowDescriptor,
         profile: Profile,
         scalingMode: ScalingMode
     ) {
-        pendingResizeTask?.cancel()
-        pendingResizeTask = Task { [weak self] in
-            // Short 60 ms debounce coalesces interactive window drag storms without perceptible lag.
-            try? await Task.sleep(for: .milliseconds(60))
+        let scheduledGen = pendingResizeLock.withLock { s -> UInt64 in
+            s.generation &+= 1
+            return s.generation
+        }
+
+        let nextTask = Task { [weak self] in
+            // 180 ms settle debounce coalesces macOS titlebar zoom animations (250-350 ms)
+            // and live edge resize drags into a single post-settle SCStream update.
+            try? await Task.sleep(for: .milliseconds(Self.resizeDebounceMilliseconds))
             guard !Task.isCancelled, let self else { return }
+            let stillCurrent = self.pendingResizeLock.withLock { $0.generation == scheduledGen }
+            guard stillCurrent, self.state.withLock(\.isRunning) else { return }
             do {
-                try await self.updateConfiguration(
+                try await self.applyConfigurationUpdate(
                     window: window,
                     profile: profile,
                     scalingMode: scalingMode
@@ -874,6 +974,17 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
                 )
             }
         }
+
+        let previousTask = pendingResizeLock.withLock { s -> Task<Void, Never>? in
+            guard s.generation == scheduledGen else {
+                nextTask.cancel()
+                return nil
+            }
+            let prev = s.task
+            s.task = nextTask
+            return prev
+        }
+        previousTask?.cancel()
     }
 
     // MARK: - Stale-Frame Monitor

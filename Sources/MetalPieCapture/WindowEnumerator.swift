@@ -347,8 +347,137 @@ public enum WindowEnumerator: Sendable {
         )
     }
 
-    /// Finds the best capturable window owned by a given process ID, handling Wine / CrossOver
-    /// raised-layer borderless fullscreen windows (MetalGoose `TargetWindowFinder` rule).
+    /// Pure, unit-testable candidate metadata for `selectBestTargetWindow(from:displays:)`.
+    public struct TargetWindowCandidate: Hashable, Sendable {
+        public var windowID: CGWindowID
+        public var layer: Int
+        public var alpha: Double
+        public var bounds: CGRect
+        public var zOrder: Int
+
+        public init(
+            windowID: CGWindowID,
+            layer: Int,
+            alpha: Double = 1.0,
+            bounds: CGRect,
+            zOrder: Int
+        ) {
+            self.windowID = windowID
+            self.layer = layer
+            self.alpha = alpha
+            self.bounds = bounds.standardized
+            self.zOrder = zOrder
+        }
+
+        public func hash(into hasher: inout Hasher) {
+            hasher.combine(windowID)
+            hasher.combine(layer)
+            hasher.combine(alpha)
+            hasher.combine(bounds.origin.x)
+            hasher.combine(bounds.origin.y)
+            hasher.combine(bounds.size.width)
+            hasher.combine(bounds.size.height)
+            hasher.combine(zOrder)
+        }
+    }
+
+    /// Pure, unit-testable target selection rule shared by `bestTargetWindow(forPID:displays:)`.
+    ///
+    /// Priority:
+    /// 1. Display-covering fullscreen window (largest visible area among `layer == 0` and valid raised
+    ///    fullscreen windows, including MacBook Pro notch-inset fullscreen windows) — prevents selecting
+    ///    tiny browser/video-player HUD helper bars over the actual fullscreen video window!
+    /// 2. Topmost substantial `layer == 0` window (`>= 200×150`) over tiny helper strips (`64×64..199×149`).
+    /// 3. Topmost `layer == 0` window (`>= 64×64`).
+    public static func selectBestTargetWindow(
+        from candidates: [TargetWindowCandidate],
+        displays: [DisplayDescriptor]
+    ) -> TargetWindowCandidate? {
+        let visible = candidates.filter {
+            $0.alpha > 0.01
+                && $0.bounds.width >= minimumWindowDimension
+                && $0.bounds.height >= minimumWindowDimension
+        }
+        guard !visible.isEmpty else { return nil }
+
+        // 1. Prefer display-covering fullscreen windows (strict full-display first, then notch-inset fullscreen).
+        let strictFullscreen = visible.filter { candidate in
+            let isEligibleLayer = (candidate.layer == 0)
+                || isRaisedFullscreenWindow(
+                    layer: candidate.layer,
+                    alpha: candidate.alpha,
+                    bounds: candidate.bounds,
+                    displays: displays
+                )
+            guard isEligibleLayer else { return false }
+            return displays.contains {
+                boundsCoversDisplay(candidate.bounds, displayBounds: $0.cgBounds, tolerance: 4.0)
+            }
+        }
+        if let bestStrict = strictFullscreen.max(by: { lhs, rhs in
+            let lArea = lhs.bounds.width * lhs.bounds.height
+            let rArea = rhs.bounds.width * rhs.bounds.height
+            if abs(lArea - rArea) > 1.0 {
+                return lArea < rArea
+            }
+            return lhs.zOrder > rhs.zOrder
+        }) {
+            return bestStrict
+        }
+
+        let notchFullscreen = visible.filter { candidate in
+            let maxAllowedLayer = Int(CGWindowLevelForKey(.screenSaverWindow))
+            guard candidate.layer >= 0 && candidate.layer < maxAllowedLayer else { return false }
+            return isNotchInsetFullscreenBounds(candidate.bounds, displays: displays)
+        }
+        if let bestNotch = notchFullscreen.max(by: { lhs, rhs in
+            let lArea = lhs.bounds.width * lhs.bounds.height
+            let rArea = rhs.bounds.width * rhs.bounds.height
+            if abs(lArea - rArea) > 1.0 {
+                return lArea < rArea
+            }
+            return lhs.zOrder > rhs.zOrder
+        }) {
+            return bestNotch
+        }
+
+        // 2. Among normal layer-0 windows, prefer substantial content windows over tiny helper bars.
+        let normalCandidates = visible.filter { $0.layer == 0 }
+        let substantial = normalCandidates.filter { $0.bounds.width >= 200.0 && $0.bounds.height >= 150.0 }
+        if let topSubstantial = substantial.min(by: { $0.zOrder < $1.zOrder }) {
+            return topSubstantial
+        }
+        if let topNormal = normalCandidates.min(by: { $0.zOrder < $1.zOrder }) {
+            return topNormal
+        }
+        return nil
+    }
+
+    /// Returns `true` when `bounds` matches a macOS native fullscreen window sitting flush below a
+    /// MacBook Pro camera notch (edge-to-edge horizontally, flush to bottom, top inset `<= 44pt`).
+    public static func isNotchInsetFullscreenBounds(
+        _ bounds: CGRect,
+        displays: [DisplayDescriptor],
+        maxTopInset: CGFloat = 44.0,
+        tolerance: CGFloat = 4.0
+    ) -> Bool {
+        let normalized = bounds.standardized
+        guard !normalized.isEmpty else { return false }
+        return displays.contains { display in
+            let db = display.cgBounds.standardized
+            guard db.width > 0 && db.height > 0 else { return false }
+            let topInset = normalized.minY - db.minY
+            return normalized.minX <= db.minX + tolerance
+                && normalized.maxX >= db.maxX - tolerance
+                && normalized.maxY >= db.maxY - tolerance
+                && topInset >= -tolerance
+                && topInset <= maxTopInset
+        }
+    }
+
+    /// Finds the best capturable window owned by a given process ID, preferring display-covering
+    /// fullscreen video/game windows over smaller helper/HUD bars, and handling Wine / CrossOver
+    /// raised-layer borderless fullscreen windows.
     public static func bestTargetWindow(
         forPID pid: Int32,
         displays: [DisplayDescriptor]? = nil
@@ -362,32 +491,21 @@ public enum WindowEnumerator: Sendable {
         let appName = app?.localizedName ?? allCG[0].ownerName
         let appPath = app?.bundleURL?.path ?? app?.executableURL?.path
 
-        // Prefer standard layer-0 windows >= 64x64 with visible alpha.
-        let normalCandidates = allCG.filter { meta in
-            meta.layer == 0
-                && meta.alpha > 0.01
-                && meta.bounds.width >= minimumWindowDimension
-                && meta.bounds.height >= minimumWindowDimension
+        let candidates = allCG.map {
+            TargetWindowCandidate(
+                windowID: $0.windowID,
+                layer: $0.layer,
+                alpha: $0.alpha,
+                bounds: $0.bounds,
+                zOrder: $0.zOrder
+            )
+        }
+        guard let chosen = selectBestTargetWindow(from: candidates, displays: resolvedDisplays),
+              let meta = allCG.first(where: { $0.windowID == chosen.windowID })
+        else {
+            return nil
         }
 
-        let chosenMeta: CGWindowMeta?
-        if let topNormal = normalCandidates.min(by: { $0.zOrder < $1.zOrder }) {
-            chosenMeta = topNormal
-        } else {
-            // Wine / CrossOver raised borderless fullscreen fallback:
-            // topmost raised window (layer > 0) covering an entire display.
-            let raisedFullscreen = allCG.filter { meta in
-                isRaisedFullscreenWindow(
-                    layer: meta.layer,
-                    alpha: meta.alpha,
-                    bounds: meta.bounds,
-                    displays: resolvedDisplays
-                )
-            }
-            chosenMeta = raisedFullscreen.min(by: { $0.zOrder < $1.zOrder })
-        }
-
-        guard let meta = chosenMeta else { return nil }
         let display = ScreenGeometry.bestDisplay(forCGRect: meta.bounds, in: resolvedDisplays)
         return WindowDescriptor(
             windowID: meta.windowID,

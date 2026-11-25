@@ -1,5 +1,57 @@
 import CoreGraphics
 import Foundation
+import Metal
+
+/// Clamps a Metal 2D texture width or height into the guaranteed Apple Silicon valid range `1...maxDimension`
+/// (capped at `ScalingLayoutCalculator.maxMetalTextureDimension = 16_384`).
+@inlinable
+public func clampMetalTextureDimension(
+    _ value: Int,
+    maxDimension: Int = ScalingLayoutCalculator.maxMetalTextureDimension
+) -> Int {
+    let cap = min(max(1, maxDimension), ScalingLayoutCalculator.maxMetalTextureDimension)
+    return min(cap, max(1, value))
+}
+
+/// Normalizes a Metal pixel format into a compute-writable (`MTLTextureUsage.shaderWrite`) format so
+/// `device.makeTexture(descriptor:)` NEVER fails `-[MTLTextureDescriptorInternal validateWithDevice:]` (`SIGABRT`).
+///
+/// Maps sRGB views (`.bgra8Unorm_srgb`, `.rgba8Unorm_srgb`, XR sRGB) to their linear compute-writable
+/// equivalents and `.invalid` / unsupported formats to `.bgra8Unorm`.
+public func sanitizedComputeTextureFormat(_ format: MTLPixelFormat) -> MTLPixelFormat {
+    switch format {
+    case .bgra8Unorm, .rgba8Unorm, .bgr10a2Unorm, .rgb10a2Unorm,
+         .rgba16Float, .rgba32Float,
+         .r8Unorm, .rg8Unorm,
+         .r16Unorm, .rg16Unorm, .rgba16Unorm,
+         .r16Float, .rg16Float,
+         .r32Float, .rg32Float,
+         .r32Uint, .rg32Uint, .rgba32Uint,
+         .bgr10_xr, .bgra10_xr:
+        return format
+    case .bgra8Unorm_srgb:
+        return .bgra8Unorm
+    case .rgba8Unorm_srgb:
+        return .rgba8Unorm
+    case .bgr10_xr_srgb:
+        return .bgr10_xr
+    case .bgra10_xr_srgb:
+        return .bgra10_xr
+    case .invalid:
+        return .bgra8Unorm
+    default:
+        return .bgra8Unorm
+    }
+}
+
+/// Optional capability adopted by effect renderers that perform GPU 1x demagnification and/or
+/// fullscreen video super-resolution pre-downscaling before the effect chain.
+public protocol EffectPreScaleConfigurable: AnyObject, Sendable {
+    /// True when 1x Non-Retina demagnification (nearest or bilinear) is active.
+    var isDemagnifyActive: Bool { get }
+    /// Target pixel dimensions for fullscreen video super-resolution pre-downscaling (`nil` = disabled).
+    var fullscreenVideoPreDownscaleSize: PixelSize? { get set }
+}
 
 /// Scaling geometry mode controlling how an effect computes its target pixel dimensions.
 public enum ScalingType: String, Codable, Sendable, CaseIterable, Identifiable {
@@ -131,6 +183,27 @@ public struct CropInsets: Hashable, Codable, Sendable {
             y: c.top,
             width: max(1, sourceSize.width - c.left - c.right),
             height: max(1, sourceSize.height - c.top - c.bottom)
+        )
+    }
+
+    /// Proportionally scales pixel crop insets when the captured frame is pre-downscaled / demagnified
+    /// from `rawSourceSize` to `effectiveSourceSize` before entering the effect chain.
+    public func scaled(from rawSourceSize: PixelSize, to effectiveSourceSize: PixelSize) -> CropInsets {
+        guard enabled,
+              rawSourceSize.isValid,
+              effectiveSourceSize.isValid,
+              rawSourceSize != effectiveSourceSize
+        else {
+            return self
+        }
+        let scaleX = Double(effectiveSourceSize.width) / Double(rawSourceSize.width)
+        let scaleY = Double(effectiveSourceSize.height) / Double(rawSourceSize.height)
+        return CropInsets(
+            enabled: true,
+            left: max(0, Int((Double(left) * scaleX).rounded())),
+            top: max(0, Int((Double(top) * scaleY).rounded())),
+            right: max(0, Int((Double(right) * scaleX).rounded())),
+            bottom: max(0, Int((Double(bottom) * scaleY).rounded()))
         )
     }
 
@@ -320,8 +393,112 @@ public struct ScalingLayoutResult: Hashable, Codable, Sendable {
 
 /// Pure, deterministic layout calculator for MetalPie's multi-pass scaling graph.
 public enum ScalingLayoutCalculator: Sendable {
+    /// Maximum 2D texture width/height supported by Apple Silicon Metal GPUs (`MTLDevice`).
+    public static let maxMetalTextureDimension: Int = 16_384
+
     /// Stable UUID used for auto-inserted Bicubic Catmull-Rom fallback passes.
     public static let autoBicubicPassID = UUID(uuidString: "A10B1C0B-1C00-4000-8000-000000000001")!
+
+    /// Clamps `size` into `1...maxDimension` while preserving aspect ratio whenever either axis exceeds `maxDimension`.
+    public static func clampAspectPreserving(
+        _ size: PixelSize,
+        maxDimension: Int = maxMetalTextureDimension
+    ) -> PixelSize {
+        guard size.isValid else { return .zero }
+        let cap = min(max(1, maxDimension), maxMetalTextureDimension)
+        let w = max(1, size.width)
+        let h = max(1, size.height)
+        guard w > cap || h > cap else {
+            return PixelSize(width: w, height: h)
+        }
+        let scale = Double(cap) / Double(max(w, h))
+        let clampedW = max(1, min(cap, Int((Double(w) * scale).rounded())))
+        let clampedH = max(1, min(cap, Int((Double(h) * scale).rounded())))
+        return PixelSize(width: clampedW, height: clampedH)
+    }
+
+    /// Computes an optional GPU pre-downscale target size for fullscreen / display-filling video windows
+    /// so upscalers (Anime4K, MetalFX, FSR 1.0, CuNNy, FSRCNNX, Lanczos, Jinc) perform genuine ~2x
+    /// super-resolution instead of 1:1 no-op passthrough on bilinearly stretched fullscreen video.
+    public static func computeFullscreenVideoPreDownscaleSize(
+        rawSourceSize: PixelSize,
+        targetPixelSize: PixelSize,
+        presentationMode: PresentationMode,
+        mode: FullscreenVideoInputMode
+    ) -> PixelSize? {
+        guard rawSourceSize.isValid, targetPixelSize.isValid, mode != .native else {
+            return nil
+        }
+
+        let coversTarget = Double(rawSourceSize.width) >= Double(targetPixelSize.width) * 0.85
+            && Double(rawSourceSize.height) >= Double(targetPixelSize.height) * 0.85
+        guard presentationMode.isFullscreen || coversTarget else {
+            return nil
+        }
+
+        let srcW = rawSourceSize.width
+        let srcH = rawSourceSize.height
+
+        switch mode {
+        case .native:
+            return nil
+
+        case .auto:
+            // Retina 2.5K / 3K / 4K fullscreen window -> exact 50% per axis (inverse of 2x bilinear stretch).
+            guard srcW >= 2200 || srcH >= 1300 else { return nil }
+            let outW = min(srcW, max(640, srcW / 2))
+            let outH = min(srcH, max(360, srcH / 2))
+            guard outW < srcW || outH < srcH else { return nil }
+            return clampAspectPreserving(PixelSize(width: outW, height: outH))
+
+        case .p720:
+            guard srcH > 760 else { return nil }
+            let scale = 720.0 / Double(srcH)
+            let outW = max(1, Int((Double(srcW) * scale).rounded()))
+            let candidate = clampAspectPreserving(PixelSize(width: outW, height: 720))
+            return (candidate.width < srcW || candidate.height < srcH) ? candidate : nil
+
+        case .p1080:
+            guard srcH > 1120 else { return nil }
+            let scale = 1080.0 / Double(srcH)
+            let outW = max(1, Int((Double(srcW) * scale).rounded()))
+            let candidate = clampAspectPreserving(PixelSize(width: outW, height: 1080))
+            return (candidate.width < srcW || candidate.height < srcH) ? candidate : nil
+        }
+    }
+
+    /// Resolves the exact post-pre-scale source dimensions that will enter `ScalingLayoutCalculator.calculate`
+    /// and the effect chain, coalescing `demagnifyActive` and `fullscreenVideoInput` so content is NEVER
+    /// double-halved and effect pass sizes ALWAYS match the post-pre-scale texture (preventing 1/4 shrinking).
+    public static func resolveEffectiveSourceSize(
+        rawSourceSize: PixelSize,
+        targetPixelSize: PixelSize,
+        presentationMode: PresentationMode,
+        fullscreenVideoInput: FullscreenVideoInputMode,
+        demagnifyActive: Bool
+    ) -> (effectiveSize: PixelSize, videoPreDownscaleSize: PixelSize?) {
+        guard rawSourceSize.isValid else { return (rawSourceSize, nil) }
+        let clampedRaw = clampAspectPreserving(rawSourceSize)
+
+        if let videoSize = computeFullscreenVideoPreDownscaleSize(
+            rawSourceSize: clampedRaw,
+            targetPixelSize: targetPixelSize,
+            presentationMode: presentationMode,
+            mode: fullscreenVideoInput
+        ) {
+            return (effectiveSize: videoSize, videoPreDownscaleSize: videoSize)
+        }
+
+        if demagnifyActive, clampedRaw.width >= 64, clampedRaw.height >= 64 {
+            let demagSize = PixelSize(
+                width: max(1, clampedRaw.width / 2),
+                height: max(1, clampedRaw.height / 2)
+            )
+            return (effectiveSize: demagSize, videoPreDownscaleSize: nil)
+        }
+
+        return (effectiveSize: clampedRaw, videoPreDownscaleSize: nil)
+    }
 
     /// Computes exact cropped source rect, per-effect intermediate pixel sizes, optional auto-Bicubic
     /// fallback pass, aligned destination rect, and cursor-mapping content rect.
@@ -347,18 +524,21 @@ public enum ScalingLayoutCalculator: Sendable {
         alignment: OutputAlignment = .center
     ) -> ScalingLayoutResult {
         let safeScale = max(1.0, backingScaleFactor)
+        let safeTargetSize = targetPixelSize.isValid
+            ? clampAspectPreserving(targetPixelSize)
+            : targetPixelSize
         let resolvedTargetCGRect = targetCGRect?.standardized ?? CGRect(
             x: 0,
             y: 0,
-            width: Double(targetPixelSize.width) / safeScale,
-            height: Double(targetPixelSize.height) / safeScale
+            width: Double(safeTargetSize.width) / safeScale,
+            height: Double(safeTargetSize.height) / safeScale
         )
 
-        guard sourcePixelSize.isValid, targetPixelSize.isValid else {
+        guard sourcePixelSize.isValid, safeTargetSize.isValid else {
             return ScalingLayoutResult(
                 sourcePixelSize: sourcePixelSize,
                 croppedSourceRect: .zero,
-                targetPixelSize: targetPixelSize,
+                targetPixelSize: safeTargetSize,
                 targetCGRect: resolvedTargetCGRect,
                 backingScaleFactor: safeScale,
                 effectPasses: [],
@@ -373,8 +553,15 @@ public enum ScalingLayoutCalculator: Sendable {
         }
 
         let croppedRect = crop.croppedRect(in: sourcePixelSize)
-        var currentSize = croppedRect.size
+        var currentSize = clampAspectPreserving(croppedRect.size)
         let enabledEffects = effects.filter(\.enabled)
+
+        // Cap intermediate fixed/discrete upscalers cleanly so 2x/4x neural & pixel shaders on Retina
+        // or dual-display captures never explode VRAM or exceed Metal's 16,384px 2D texture limit.
+        let intermediateFixedCap = min(
+            maxMetalTextureDimension,
+            max(max(safeTargetSize.width, safeTargetSize.height) * 2, 8192)
+        )
 
         var passes: [EffectPassLayout] = []
         passes.reserveCapacity(enabledEffects.count + 1)
@@ -387,35 +574,36 @@ public enum ScalingLayoutCalculator: Sendable {
 
         for instance in enabledEffects {
             let descriptor = EffectCatalog.descriptor(for: instance.effectID)
-            let desiredForThisPass = computeDesiredSize(
+            let desiredForThisPass = clampAspectPreserving(computeDesiredSize(
                 inputSize: currentSize,
-                targetPixelSize: targetPixelSize,
+                targetPixelSize: safeTargetSize,
                 scalingType: instance.scalingType,
                 scaleFactorX: instance.scaleFactorX,
                 scaleFactorY: instance.scaleFactorY,
                 absoluteWidth: instance.absoluteWidth,
                 absoluteHeight: instance.absoluteHeight
-            )
+            ))
 
             let actualOutput: PixelSize
             switch descriptor.scaleCapability {
             case .sameSize:
-                actualOutput = currentSize
+                actualOutput = clampAspectPreserving(currentSize)
             case .fixed(let factor):
-                actualOutput = PixelSize(
+                let rawFixed = PixelSize(
                     width: max(1, Int((Double(currentSize.width) * factor).rounded())),
                     height: max(1, Int((Double(currentSize.height) * factor).rounded()))
                 )
+                actualOutput = clampAspectPreserving(rawFixed, maxDimension: intermediateFixedCap)
                 if instance.scalingType != .normal {
-                    desiredFinalSize = computeDesiredSize(
+                    desiredFinalSize = clampAspectPreserving(computeDesiredSize(
                         inputSize: actualOutput,
-                        targetPixelSize: targetPixelSize,
+                        targetPixelSize: safeTargetSize,
                         scalingType: instance.scalingType,
                         scaleFactorX: instance.scaleFactorX,
                         scaleFactorY: instance.scaleFactorY,
                         absoluteWidth: instance.absoluteWidth,
                         absoluteHeight: instance.absoluteHeight
-                    )
+                    ))
                     explicitFillOverflowAllowed = (instance.scalingType == .fill)
                 }
             case .discreteScales(let factors):
@@ -427,27 +615,28 @@ public enum ScalingLayoutCalculator: Sendable {
                 let chosenFactor = factors.min { lhs, rhs in
                     abs(lhs - desiredScale) < abs(rhs - desiredScale)
                 } ?? 1.5
-                actualOutput = PixelSize(
+                let rawDiscrete = PixelSize(
                     width: max(1, Int((Double(currentSize.width) * chosenFactor).rounded())),
                     height: max(1, Int((Double(currentSize.height) * chosenFactor).rounded()))
                 )
+                actualOutput = clampAspectPreserving(rawDiscrete, maxDimension: intermediateFixedCap)
                 if instance.scalingType != .normal {
-                    desiredFinalSize = computeDesiredSize(
+                    desiredFinalSize = clampAspectPreserving(computeDesiredSize(
                         inputSize: actualOutput,
-                        targetPixelSize: targetPixelSize,
+                        targetPixelSize: safeTargetSize,
                         scalingType: instance.scalingType,
                         scaleFactorX: instance.scaleFactorX,
                         scaleFactorY: instance.scaleFactorY,
                         absoluteWidth: instance.absoluteWidth,
                         absoluteHeight: instance.absoluteHeight
-                    )
+                    ))
                     explicitFillOverflowAllowed = (instance.scalingType == .fill)
                 }
             case .downscaleOnly:
                 if desiredForThisPass.width <= currentSize.width && desiredForThisPass.height <= currentSize.height {
                     actualOutput = desiredForThisPass
                 } else {
-                    actualOutput = currentSize
+                    actualOutput = clampAspectPreserving(currentSize)
                     desiredFinalSize = desiredForThisPass
                     explicitFillOverflowAllowed = (instance.scalingType == .fill)
                 }
@@ -473,15 +662,15 @@ public enum ScalingLayoutCalculator: Sendable {
         if passes.isEmpty {
             // Empty chain: default to fitting inside target (or filling window).
             let target = presentationMode.isWindowed
-                ? targetPixelSize
-                : computeFitSize(inputSize: currentSize, targetPixelSize: targetPixelSize)
+                ? safeTargetSize
+                : computeFitSize(inputSize: currentSize, targetPixelSize: safeTargetSize)
             if target != currentSize {
                 fallbackTargetSize = target
             }
         } else if presentationMode.isWindowed {
             // In windowed scaling mode, always conform final output to the live window size.
-            if currentSize != targetPixelSize {
-                fallbackTargetSize = targetPixelSize
+            if currentSize != safeTargetSize {
+                fallbackTargetSize = safeTargetSize
             }
         } else {
             // Fullscreen mode:
@@ -490,30 +679,35 @@ public enum ScalingLayoutCalculator: Sendable {
             if let desired = desiredFinalSize, desired != currentSize {
                 fallbackTargetSize = desired
             } else if !explicitFillOverflowAllowed &&
-                (currentSize.width > targetPixelSize.width || currentSize.height > targetPixelSize.height)
+                (currentSize.width > safeTargetSize.width || currentSize.height > safeTargetSize.height)
             {
                 // 2. If output exceeds the display bounds (e.g. 2x neural scaler on 1080p -> 1440p monitor),
                 //    automatically fit-downscale via Bicubic Catmull-Rom.
-                fallbackTargetSize = computeFitSize(inputSize: currentSize, targetPixelSize: targetPixelSize)
+                fallbackTargetSize = computeFitSize(inputSize: currentSize, targetPixelSize: safeTargetSize)
             }
         }
 
         var needsAutoBicubicFallback = false
-        if let fallbackTarget = fallbackTargetSize, fallbackTarget.isValid, fallbackTarget != currentSize {
-            passes.append(EffectPassLayout(
-                effectInstanceID: autoBicubicPassID,
-                effectID: .bicubic,
-                inputSize: currentSize,
-                outputSize: fallbackTarget,
-                isAutoInsertedFallback: true
-            ))
-            currentSize = fallbackTarget
-            needsAutoBicubicFallback = true
+        if let rawFallback = fallbackTargetSize, rawFallback.isValid {
+            let clampedFallback = clampAspectPreserving(rawFallback)
+            if clampedFallback.isValid && clampedFallback != currentSize {
+                passes.append(EffectPassLayout(
+                    effectInstanceID: autoBicubicPassID,
+                    effectID: .bicubic,
+                    inputSize: currentSize,
+                    outputSize: clampedFallback,
+                    isAutoInsertedFallback: true
+                ))
+                currentSize = clampedFallback
+                needsAutoBicubicFallback = true
+            }
         }
 
+        currentSize = clampAspectPreserving(currentSize)
+
         // Align final output inside target canvas pixels (Y-down).
-        let destX = Int((Double(targetPixelSize.width - currentSize.width) * alignment.horizontalFraction).rounded())
-        let destY = Int((Double(targetPixelSize.height - currentSize.height) * alignment.verticalFractionYDown).rounded())
+        let destX = Int((Double(safeTargetSize.width - currentSize.width) * alignment.horizontalFraction).rounded())
+        let destY = Int((Double(safeTargetSize.height - currentSize.height) * alignment.verticalFractionYDown).rounded())
         let destinationPixelRect = PixelRect(
             x: destX,
             y: destY,
@@ -521,7 +715,7 @@ public enum ScalingLayoutCalculator: Sendable {
             height: currentSize.height
         )
 
-        let canvasBounds = PixelRect(origin: (0, 0), size: targetPixelSize)
+        let canvasBounds = PixelRect(origin: (0, 0), size: safeTargetSize)
         let visibleContentPixelRect = destinationPixelRect.intersection(canvasBounds)
 
         // Compute normalized texture UV crop rectangle corresponding to the visible portion of the output.
@@ -537,8 +731,8 @@ public enum ScalingLayoutCalculator: Sendable {
         }
 
         // Map pixel rects into target global CG logical point coordinates.
-        let pointsPerPixelX = resolvedTargetCGRect.width / Double(targetPixelSize.width)
-        let pointsPerPixelY = resolvedTargetCGRect.height / Double(targetPixelSize.height)
+        let pointsPerPixelX = resolvedTargetCGRect.width / Double(safeTargetSize.width)
+        let pointsPerPixelY = resolvedTargetCGRect.height / Double(safeTargetSize.height)
 
         let destinationRect = CGRect(
             x: resolvedTargetCGRect.origin.x + Double(destinationPixelRect.x) * pointsPerPixelX,
@@ -557,7 +751,7 @@ public enum ScalingLayoutCalculator: Sendable {
         return ScalingLayoutResult(
             sourcePixelSize: sourcePixelSize,
             croppedSourceRect: croppedRect,
-            targetPixelSize: targetPixelSize,
+            targetPixelSize: safeTargetSize,
             targetCGRect: resolvedTargetCGRect,
             backingScaleFactor: safeScale,
             effectPasses: passes,
@@ -571,7 +765,7 @@ public enum ScalingLayoutCalculator: Sendable {
         )
     }
 
-    /// Pure size computation for a single scaling rule.
+    /// Pure size computation for a single scaling rule (always aspect-preserving clamped to Metal's 16,384px max).
     public static func computeDesiredSize(
         inputSize: PixelSize,
         targetPixelSize: PixelSize,
@@ -583,44 +777,46 @@ public enum ScalingLayoutCalculator: Sendable {
     ) -> PixelSize {
         guard inputSize.isValid, targetPixelSize.isValid else { return .zero }
 
+        let raw: PixelSize
         switch scalingType {
         case .fit:
             let base = computeFitSize(inputSize: inputSize, targetPixelSize: targetPixelSize)
             if abs(scaleFactorX - 1.0) < 1e-6 && abs(scaleFactorY - 1.0) < 1e-6 {
-                return base
+                raw = base
+            } else {
+                let sx = max(0.01, scaleFactorX)
+                let sy = max(0.01, scaleFactorY)
+                raw = PixelSize(
+                    width: max(1, Int((Double(base.width) * sx).rounded())),
+                    height: max(1, Int((Double(base.height) * sy).rounded()))
+                )
             }
-            let sx = max(0.01, scaleFactorX)
-            let sy = max(0.01, scaleFactorY)
-            return PixelSize(
-                width: max(1, Int((Double(base.width) * sx).rounded())),
-                height: max(1, Int((Double(base.height) * sy).rounded()))
-            )
 
         case .fill:
             let scaleX = Double(targetPixelSize.width) / Double(inputSize.width)
             let scaleY = Double(targetPixelSize.height) / Double(inputSize.height)
             let coverScale = max(scaleX, scaleY)
-            return PixelSize(
+            raw = PixelSize(
                 width: max(1, Int((Double(inputSize.width) * coverScale).rounded())),
                 height: max(1, Int((Double(inputSize.height) * coverScale).rounded()))
             )
 
         case .stretch:
-            return targetPixelSize
+            raw = targetPixelSize
 
         case .integerFit:
             let scaleX = Double(targetPixelSize.width) / Double(inputSize.width)
             let scaleY = Double(targetPixelSize.height) / Double(inputSize.height)
             let k = max(1, Int(floor(min(scaleX, scaleY))))
-            return PixelSize(
-                width: inputSize.width * k,
-                height: inputSize.height * k
+            raw = PixelSize(
+                width: max(1, Int((Double(inputSize.width) * Double(k)).rounded())),
+                height: max(1, Int((Double(inputSize.height) * Double(k)).rounded()))
             )
 
         case .normal:
             let sx = max(0.01, scaleFactorX)
             let sy = max(0.01, scaleFactorY)
-            return PixelSize(
+            raw = PixelSize(
                 width: max(1, Int((Double(inputSize.width) * sx).rounded())),
                 height: max(1, Int((Double(inputSize.height) * sy).rounded()))
             )
@@ -628,19 +824,22 @@ public enum ScalingLayoutCalculator: Sendable {
         case .absolute:
             let w = max(1, absoluteWidth ?? targetPixelSize.width)
             let h = max(1, absoluteHeight ?? targetPixelSize.height)
-            return PixelSize(width: w, height: h)
+            raw = PixelSize(width: w, height: h)
         }
+
+        return clampAspectPreserving(raw)
     }
 
     public static func computeFitSize(inputSize: PixelSize, targetPixelSize: PixelSize) -> PixelSize {
         guard inputSize.isValid, targetPixelSize.isValid else { return .zero }
-        let scaleX = Double(targetPixelSize.width) / Double(inputSize.width)
-        let scaleY = Double(targetPixelSize.height) / Double(inputSize.height)
+        let safeTarget = clampAspectPreserving(targetPixelSize)
+        let scaleX = Double(safeTarget.width) / Double(inputSize.width)
+        let scaleY = Double(safeTarget.height) / Double(inputSize.height)
         let fitScale = min(scaleX, scaleY)
-        return PixelSize(
+        return clampAspectPreserving(PixelSize(
             width: max(1, Int((Double(inputSize.width) * fitScale).rounded())),
             height: max(1, Int((Double(inputSize.height) * fitScale).rounded()))
-        )
+        ))
     }
 
     // MARK: - Fencepost-Accurate Cursor Mapping (Magpie (N - 1) Convention)

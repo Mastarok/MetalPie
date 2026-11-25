@@ -172,15 +172,20 @@ public final class MetalOverlayView: NSView {
         layer.zPosition = 900
         layer.borderWidth = 1.5
         layer.borderColor = NSColor.white.withAlphaComponent(0.28).cgColor
-        layer.cornerRadius = 6.0
+        layer.cornerRadius = OverlayWindowController.windowedCornerRadius
+        layer.cornerCurve = .continuous
         layer.actions = [
             "bounds": NSNull(),
             "position": NSNull(),
             "hidden": NSNull(),
-            "borderColor": NSNull()
+            "borderColor": NSNull(),
+            "cornerRadius": NSNull()
         ]
         return layer
     }()
+
+    /// Active rounded corner radius applied to `metalLayer` (10pt in windowed mode, 0pt in fullscreen).
+    private var appliedCornerRadius: CGFloat = 0.0
 
     /// Callback fired whenever `drawableSize` or `contentsScale` changes.
     public var onGeometryChanged: ((PixelSize, Double) -> Void)?
@@ -215,12 +220,13 @@ public final class MetalOverlayView: NSView {
         case resize(edges: ResizeEdges)
     }
 
-    private struct ResizeEdges: OptionSet {
-        let rawValue: UInt8
-        static let left   = ResizeEdges(rawValue: 1 << 0)
-        static let right  = ResizeEdges(rawValue: 1 << 1)
-        static let top    = ResizeEdges(rawValue: 1 << 2)
-        static let bottom = ResizeEdges(rawValue: 1 << 3)
+    public struct ResizeEdges: OptionSet, Sendable {
+        public let rawValue: UInt8
+        public init(rawValue: UInt8) { self.rawValue = rawValue }
+        public static let left   = ResizeEdges(rawValue: 1 << 0)
+        public static let right  = ResizeEdges(rawValue: 1 << 1)
+        public static let top    = ResizeEdges(rawValue: 1 << 2)
+        public static let bottom = ResizeEdges(rawValue: 1 << 3)
     }
 
     private var activeDrag: DragOperation?
@@ -294,6 +300,7 @@ public final class MetalOverlayView: NSView {
 
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        reapplyCornerRadius()
         syncDrawableGeometry()
     }
 
@@ -302,8 +309,30 @@ public final class MetalOverlayView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         windowedBorderLayer.frame = bounds
+        metalLayer.cornerRadius = appliedCornerRadius
+        metalLayer.cornerCurve = .continuous
+        metalLayer.masksToBounds = appliedCornerRadius > 0.0
+        windowedBorderLayer.cornerRadius = appliedCornerRadius
         CATransaction.commit()
         syncDrawableGeometry()
+    }
+
+    /// Applies continuous native macOS rounded corners to `metalLayer` (re-asserted on attach/layout
+    /// because AppKit can reset `masksToBounds` when attaching a backing `CAMetalLayer`).
+    public func setRoundedCornerRadius(_ radius: CGFloat) {
+        appliedCornerRadius = max(0.0, radius)
+        reapplyCornerRadius()
+    }
+
+    private func reapplyCornerRadius() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        metalLayer.cornerRadius = appliedCornerRadius
+        metalLayer.cornerCurve = .continuous
+        metalLayer.masksToBounds = appliedCornerRadius > 0.0
+        windowedBorderLayer.cornerRadius = appliedCornerRadius
+        windowedBorderLayer.cornerCurve = .continuous
+        CATransaction.commit()
     }
 
     /// Host-display backing scale override used while the overlay panel is off-screen (before first-frame
@@ -436,64 +465,100 @@ public final class MetalOverlayView: NSView {
             newFrame.origin.y += dy
 
         case .resize(let edges):
-            let aspect = max(0.1, lockedAspectRatio)
-            let baseMinW = max(160.0, minimumWindowedWidth)
-            let baseMinH = max(90.0, minimumWindowedHeight)
-            let minW = max(baseMinW, baseMinH * aspect)
-            let minH = max(baseMinH, minW / aspect)
-
-            var proposedW = dragStartWindowFrame.width
-            var proposedH = dragStartWindowFrame.height
-
-            if edges.contains(.right) {
-                proposedW += dx
-            } else if edges.contains(.left) {
-                proposedW -= dx
-            }
-
-            if edges.contains(.top) {
-                proposedH += dy
-            } else if edges.contains(.bottom) {
-                proposedH -= dy
-            }
-
-            // Enforce aspect ratio lock based on the dominant drag axis.
-            let hasHorizontal = edges.contains(.left) || edges.contains(.right)
-            let hasVertical = edges.contains(.top) || edges.contains(.bottom)
-
-            if hasHorizontal && hasVertical {
-                let widthFromH = proposedH * aspect
-                if abs(proposedW - dragStartWindowFrame.width) >= abs(widthFromH - dragStartWindowFrame.width) {
-                    proposedW = max(minW, proposedW)
-                    proposedH = max(minH, proposedW / aspect)
-                } else {
-                    proposedH = max(minH, proposedH)
-                    proposedW = max(minW, proposedH * aspect)
-                }
-            } else if hasHorizontal {
-                proposedW = max(minW, proposedW)
-                proposedH = max(minH, proposedW / aspect)
-            } else if hasVertical {
-                proposedH = max(minH, proposedH)
-                proposedW = max(minW, proposedH * aspect)
-            }
-
-            // Never allow resizing smaller than the underlying source window on either axis.
-            proposedW = max(baseMinW, proposedW)
-            proposedH = max(baseMinH, proposedH)
-
-            if edges.contains(.left) {
-                newFrame.origin.x = dragStartWindowFrame.maxX - proposedW
-            }
-            if edges.contains(.bottom) {
-                newFrame.origin.y = dragStartWindowFrame.maxY - proposedH
-            }
-            newFrame.size = CGSize(width: proposedW.rounded(), height: proposedH.rounded())
+            let hostScreenSize = win.screen?.frame.size ?? NSScreen.main?.frame.size
+            newFrame = Self.computeInteractiveResizeFrame(
+                startFrame: dragStartWindowFrame,
+                edges: edges,
+                delta: CGVector(dx: dx, dy: dy),
+                aspectRatio: lockedAspectRatio,
+                minWidth: minimumWindowedWidth,
+                minHeight: minimumWindowedHeight,
+                maxSize: hostScreenSize
+            )
         }
 
         win.setFrame(newFrame, display: true, animate: false)
         syncDrawableGeometry()
         onInteractiveFrameUpdate?(win.frame)
+    }
+
+    /// Pure, unit-testable aspect-locked 8-direction interactive resize solver supporting BOTH
+    /// inward shrinking (down to `minWidth`/`minHeight`) and outward expansion (up to `maxSize`).
+    public static func computeInteractiveResizeFrame(
+        startFrame: CGRect,
+        edges: ResizeEdges,
+        delta: CGVector,
+        aspectRatio: CGFloat,
+        minWidth: CGFloat,
+        minHeight: CGFloat,
+        maxSize: CGSize? = nil
+    ) -> CGRect {
+        let aspect = max(0.1, aspectRatio)
+        let baseMinW = max(160.0, minWidth)
+        let baseMinH = max(90.0, minHeight)
+        let minW = max(baseMinW, baseMinH * aspect)
+        let minH = max(baseMinH, minW / aspect)
+
+        let maxW: CGFloat
+        let maxH: CGFloat
+        if let maxSize, maxSize.width > 0, maxSize.height > 0 {
+            let aspectFitW = min(maxSize.width, maxSize.height * aspect)
+            maxW = max(minW, aspectFitW)
+            maxH = max(minH, maxW / aspect)
+        } else {
+            maxW = .greatestFiniteMagnitude
+            maxH = .greatestFiniteMagnitude
+        }
+
+        var proposedW = startFrame.width
+        var proposedH = startFrame.height
+
+        if edges.contains(.right) {
+            proposedW += delta.dx
+        } else if edges.contains(.left) {
+            proposedW -= delta.dx
+        }
+
+        if edges.contains(.top) {
+            proposedH += delta.dy
+        } else if edges.contains(.bottom) {
+            proposedH -= delta.dy
+        }
+
+        let hasHorizontal = edges.contains(.left) || edges.contains(.right)
+        let hasVertical = edges.contains(.top) || edges.contains(.bottom)
+
+        if hasHorizontal && hasVertical {
+            let widthFromH = proposedH * aspect
+            if abs(proposedW - startFrame.width) >= abs(widthFromH - startFrame.width) {
+                proposedW = min(maxW, max(minW, proposedW))
+                proposedH = min(maxH, max(minH, proposedW / aspect))
+            } else {
+                proposedH = min(maxH, max(minH, proposedH))
+                proposedW = min(maxW, max(minW, proposedH * aspect))
+            }
+        } else if hasHorizontal {
+            proposedW = min(maxW, max(minW, proposedW))
+            proposedH = min(maxH, max(minH, proposedW / aspect))
+        } else if hasVertical {
+            proposedH = min(maxH, max(minH, proposedH))
+            proposedW = min(maxW, max(minW, proposedH * aspect))
+        }
+
+        proposedW = min(maxW, max(baseMinW, proposedW))
+        proposedH = min(maxH, max(baseMinH, proposedH))
+
+        var newFrame = startFrame
+        let roundedW = proposedW.rounded()
+        let roundedH = proposedH.rounded()
+        if edges.contains(.left) {
+            newFrame.origin.x = startFrame.maxX - roundedW
+        }
+        if edges.contains(.bottom) {
+            newFrame.origin.y = startFrame.maxY - roundedH
+        }
+        newFrame.size = CGSize(width: roundedW, height: roundedH)
+        return newFrame
     }
 
     public override func mouseUp(with event: NSEvent) {
@@ -515,26 +580,180 @@ public final class MetalOverlayView: NSView {
     }
 }
 
+// MARK: - Popup Menu Context Classifier Types
+
+/// Snapshot of an on-screen popup menu window used to discriminate in-window right-click
+/// context menus (which macOS 27 `SCContentFilter(desktopIndependentWindow:)` captures inside
+/// the scaled stream) from macOS top Menu Bar dropdowns (which must stay visible above the overlay).
+public struct PopupMenuWindowSnapshot: Hashable, Sendable {
+    public var windowID: CGWindowID
+    public var pid: Int32
+    public var layer: Int
+    public var bounds: CGRect
+    public var alpha: Double
+
+    public init(
+        windowID: CGWindowID,
+        pid: Int32,
+        layer: Int,
+        bounds: CGRect,
+        alpha: Double = 1.0
+    ) {
+        self.windowID = windowID
+        self.pid = pid
+        self.layer = layer
+        self.bounds = bounds.standardized
+        self.alpha = alpha
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(windowID)
+        hasher.combine(pid)
+        hasher.combine(layer)
+        hasher.combine(bounds.origin.x)
+        hasher.combine(bounds.origin.y)
+        hasher.combine(bounds.size.width)
+        hasher.combine(bounds.size.height)
+        hasher.combine(alpha)
+    }
+}
+
+/// Decision returned by `OverlayWindowController.evaluatePopupMenuLevelBoost(...)`.
+public struct PopupMenuLevelEvaluation: Equatable, Sendable {
+    public var shouldBoostAbovePopupMenus: Bool
+    public var isMenuBarDropdownActive: Bool
+
+    public init(shouldBoostAbovePopupMenus: Bool, isMenuBarDropdownActive: Bool) {
+        self.shouldBoostAbovePopupMenus = shouldBoostAbovePopupMenus
+        self.isMenuBarDropdownActive = isMenuBarDropdownActive
+    }
+}
+
+// MARK: - OverlayChromeGeometry (Notch-Safe Placement & Shadow Bleed Padding)
+
+/// Pure, unit-testable layout solver for floating overlay chrome (toolbar, profiler HUD, toast)
+/// guaranteeing MacBook Pro notch / macOS Menu Bar clearance and transparent shadow-bleed padding
+/// (so SwiftUI drop shadows never clip into rectangular boxes and empty shadow margins never hijack clicks).
+public enum OverlayChromeGeometry: Sendable {
+    public static let defaultToolbarSize = CGSize(width: 420, height: 42)
+    public static let defaultShadowPadding: CGFloat = 20
+    public static let defaultTopMargin: CGFloat = 10
+    public static let notchSafeTopMargin: CGFloat = 6
+
+    /// Computes the visible toolbar pill frame in global AppKit (Cocoa Y-up) coordinates,
+    /// clamping below `hostScreenVisibleFrame.maxY` whenever `overlayCocoaFrame` extends into
+    /// the macOS Menu Bar or MacBook Pro camera notch strip.
+    public static func computeVisibleToolbarCocoaFrame(
+        for overlayCocoaFrame: CGRect,
+        hostScreenVisibleFrame: CGRect?,
+        toolbarSize: CGSize = defaultToolbarSize,
+        topMargin: CGFloat = defaultTopMargin,
+        notchSafeTopMargin: CGFloat = notchSafeTopMargin
+    ) -> CGRect {
+        let w = min(toolbarSize.width, max(380, overlayCocoaFrame.width - 16))
+        let h = toolbarSize.height
+        let x = (overlayCocoaFrame.midX - w * 0.5).rounded()
+        let desiredTop = overlayCocoaFrame.maxY - topMargin
+        let safeTop: CGFloat
+        if let visible = hostScreenVisibleFrame, overlayCocoaFrame.maxY > visible.maxY {
+            safeTop = min(desiredTop, visible.maxY - notchSafeTopMargin)
+        } else {
+            safeTop = desiredTop
+        }
+        let y = max(overlayCocoaFrame.minY + 6, safeTop - h).rounded()
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    /// Expands a visible pill/card frame by `shadowPadding` on all four sides so SwiftUI drop shadows
+    /// fade smoothly to 0% alpha well inside the transparent borderless `NSPanel` bounds.
+    public static func panelFrame(
+        fromVisibleFrame visibleFrame: CGRect,
+        shadowPadding: CGFloat = defaultShadowPadding
+    ) -> CGRect {
+        visibleFrame.insetBy(dx: -shadowPadding, dy: -shadowPadding)
+    }
+
+    /// Strips transparent `shadowPadding` from a chrome `NSPanel` frame to recover the exact visible
+    /// interactive rect so empty transparent shadow margins never intercept mouse clicks.
+    public static func visibleFrame(
+        fromPanelFrame panelFrame: CGRect,
+        shadowPadding: CGFloat = defaultShadowPadding
+    ) -> CGRect {
+        panelFrame.insetBy(dx: shadowPadding, dy: shadowPadding)
+    }
+
+    /// Converts visible interactive floating chrome panel frames (excluding transparent shadow padding)
+    /// into global CoreGraphics (Y-down) rects for `CursorOverlayController.updateInteractiveChromeRects(_:)`.
+    public static func interactiveChromeCGRects(
+        toolbarPanelCocoaFrame: CGRect?,
+        toolbarIsInteractive: Bool,
+        hudPanelCocoaFrame: CGRect?,
+        hudIsVisible: Bool,
+        displays: [DisplayDescriptor],
+        shadowPadding: CGFloat = defaultShadowPadding
+    ) -> [CGRect] {
+        var cgRects: [CGRect] = []
+        if toolbarIsInteractive, let toolbarPanel = toolbarPanelCocoaFrame {
+            let visible = visibleFrame(fromPanelFrame: toolbarPanel, shadowPadding: shadowPadding)
+            if !visible.isEmpty {
+                cgRects.append(ScreenGeometry.cocoaToCG(rect: visible, displays: displays))
+            }
+        }
+        if hudIsVisible, let hudPanel = hudPanelCocoaFrame {
+            let visible = visibleFrame(fromPanelFrame: hudPanel, shadowPadding: shadowPadding)
+            if !visible.isEmpty {
+                cgRects.append(ScreenGeometry.cocoaToCG(rect: visible, displays: displays))
+            }
+        }
+        return cgRects
+    }
+}
+
 // MARK: - OverlayWindowController
 
 /// Manages the lifecycle, window level, multi-monitor geometry, color space/EDR, windowed resize state,
 /// VRR direct-scanout mode, and reveal-on-first-frame gating of MetalPie's scaling overlay panel.
 @MainActor
 public final class OverlayWindowController {
-    /// Normal overlay window level: 1 below `popUpMenuWindow` (level 100) so Menu Bar, Cmd+Tab,
-    /// Spotlight, and Force Quit always remain accessible (never `.screenSaver` or `maximumWindow + 1`!).
+    /// Normal overlay window level: 3 below `mainMenuWindow` (level 21 — strictly above normal apps `0`,
+    /// floating palettes `3`, modal panels `8`, and Dock `20`, while keeping overlay `21`, cursor `22`,
+    /// and toolbar/HUD `23` ALL strictly below the macOS Menu Bar `24` and Status Bar `25`!).
     public static let normalOverlayLevel = NSWindow.Level(
-        rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) - 1
+        rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) - 3
     )
+
+    /// Windowed overlay window level (same menu-bar-safe level `21`).
+    public static let windowedOverlayLevel = normalOverlayLevel
 
     /// Native macOS Full-Screen Space overlay level: level 19 (above full-screen app, below auto-hiding Dock/Menu Bar).
     public static let nativeFullscreenOverlayLevel = NSWindow.Level(rawValue: 19)
 
-    /// Empirically verified on macOS 27.0.1 (Apple M4 Pro): keeping `panel.isOpaque = true` and
-    /// `metalLayer.isOpaque = true` while setting `panel.alphaValue = 0.999` prevents macOS
-    /// WindowServer from marking underlying browser/app windows as occluded (`occlusionState = []`),
-    /// keeping `<video>` playback & Blink/WebKit compositing running at full 60/120 Hz with
-    /// zero visual bleed (< 0.26 LSB in 8-bit SDR) and zero `CAMetalDisplayLink` stalls (250+ frames).
+    /// Fullscreen VRR direct-scanout overlay level (`popUpMenuWindow - 1` = 100) for unobstructed ProMotion scanout.
+    public static let vrrFullscreenOverlayLevel = NSWindow.Level(
+        rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) - 1
+    )
+
+    /// Temporary level boost (`popUpMenuWindow + 1` = 102) engaged ONLY while an in-window `NSMenu`
+    /// context menu of the scaled app is open, hiding the unscaled duplicate `layer == 101` menu behind
+    /// the overlay so only the single scaled context menu captured by `SCStream` is visible.
+    public static let popupMenuBoostOverlayLevel = NSWindow.Level(
+        rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) + 1
+    )
+
+    /// Native continuous corner radius applied in Windowed mode (`panel.isOpaque = false, backgroundColor = .clear`
+    /// with `metalLayer.isOpaque = true`, empirically verified zero black corners, zero DisplayLink stall, and
+    /// zero WindowServer occlusion).
+    public static let windowedCornerRadius: CGFloat = 10.0
+
+    /// Absolute minimum interactive resize dimensions when AX source shrinking is available.
+    public static let absoluteMinimumWindowedWidth: CGFloat = 320.0
+    public static let absoluteMinimumWindowedHeight: CGFloat = 180.0
+
+    /// Empirically verified on macOS 27.0.1 (Apple M4 Pro): setting `panel.alphaValue = 0.999` while
+    /// keeping `metalLayer.isOpaque = true` prevents macOS WindowServer from marking underlying
+    /// browser/app windows as occluded (`occlusionState = []`), keeping `<video>` playback & Blink/WebKit
+    /// compositing running at full 60/120 Hz with zero visual bleed (< 0.26 LSB in 8-bit SDR) and zero
+    /// `CAMetalDisplayLink` stalls (220+ frames).
     public static let antiOcclusionAlphaValue: CGFloat = 0.999
 
     public let device: any MTLDevice
@@ -558,6 +777,25 @@ public final class OverlayWindowController {
 
     /// True when covering a native macOS Full-Screen Space using level 19 + `.accessory` policy.
     public private(set) var isCoveringNativeFullscreenSpace: Bool = false
+
+    /// True while temporarily boosted above `popUpMenuWindow` (`level 102`) to hide a duplicate unscaled
+    /// right-click `NSMenu` that `SCContentFilter(desktopIndependentWindow:)` is already rendering scaled.
+    public private(set) var isPopupMenuLevelBoostActive: Bool = false
+
+    /// When `true` (Accessibility trusted), unlocked windowed edge-dragging may shrink inward down to
+    /// `320×180` while `AppCoordinator` shrinks the underlying source window via AX to match.
+    public var allowInwardResizeBelowSource: Bool = false {
+        didSet {
+            if allowInwardResizeBelowSource != oldValue && isSessionOpen {
+                let displays = WindowEnumerator.enumerateDisplaysOnMain()
+                syncMinimumWindowedBounds(for: currentSourceCGRect, displays: displays)
+            }
+        }
+    }
+
+    /// Fired whenever `panel.level` changes (e.g. popup-menu boost on/off or fullscreen/windowed switch)
+    /// so cursor and floating chrome stay strictly layered `(base, base+1, base+2)`.
+    public var onOverlayLevelChanged: ((NSWindow.Level) -> Void)?
 
     /// Prevents macOS WindowServer / App Nap from marking underlying browser/Electron windows as
     /// occluded in normal (non-VRR) mode (`panel.alphaValue = 0.999` + 1-pt bottom inset in fullscreen).
@@ -726,6 +964,7 @@ public final class OverlayWindowController {
         isSessionOpen = true
         isRevealed = false
         isSuspended = false
+        isPopupMenuLevelBoostActive = false
 
         view.lockedAspectRatio = currentAspectRatio
         syncMinimumWindowedBounds(for: sourceRect, displays: displays)
@@ -760,6 +999,7 @@ public final class OverlayWindowController {
         guard isSessionOpen else { return }
         isSuspended = true
         isRevealed = false
+        isPopupMenuLevelBoostActive = false
         overlayView?.hideCursorSprite()
         panel?.orderOut(nil)
         for child in childOverlayWindows {
@@ -788,12 +1028,25 @@ public final class OverlayWindowController {
         isRevealed = false
         isSuspended = false
         isCoveringNativeFullscreenSpace = false
+        isPopupMenuLevelBoostActive = false
 
         overlayView?.hideCursorSprite()
         detachAllChildWindows()
         panel?.orderOut(nil)
         restoreActivationPolicyIfNeeded()
         PipelineLog.shared.info(.render, "Overlay closed.")
+    }
+
+    /// Temporarily boosts or restores `OverlayPanel.level` relative to `kCGPopUpMenuWindowLevelKey` (101)
+    /// when an in-window right-click `NSMenu` opens/closes, eliminating duplicate scaled + unscaled menus.
+    public func setPopupMenuLevelBoost(_ active: Bool) {
+        guard isSessionOpen, !isSuspended else {
+            isPopupMenuLevelBoostActive = false
+            return
+        }
+        guard isPopupMenuLevelBoostActive != active else { return }
+        isPopupMenuLevelBoostActive = active
+        applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: isCoveringNativeFullscreenSpace)
     }
 
     // MARK: - Live Updates (Display Move, Source Resize, Mode Toggle, HDR/Format)
@@ -868,14 +1121,13 @@ public final class OverlayWindowController {
             || abs(previousSourceCGRect.height - currentSourceCGRect.height) >= 1.0
         let targetCocoaRect: CGRect
         if sizeChanged {
-            targetCocoaRect = computeOverlayCocoaFrame(
-                sourceCGRect: currentSourceCGRect,
-                presentationMode: currentPresentationMode,
-                multiMonitorMode: currentMultiMonitorMode,
-                displays: displays,
-                aspectRatio: currentAspectRatio,
-                applyAntiOcclusion: false
+            targetCocoaRect = Self.computeProportionalResizedWindowedCocoaFrame(
+                previousSourceCGRect: previousSourceCGRect,
+                newSourceCGRect: currentSourceCGRect,
+                currentOverlayCocoaFrame: panel.frame,
+                displays: displays
             )
+            lastWindowedWidth = targetCocoaRect.width
         } else {
             let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: currentSourceCGRect, in: displays)
                 ?? ScreenGeometry.primaryDisplay(in: displays)
@@ -1177,6 +1429,139 @@ public final class OverlayWindowController {
         }
     }
 
+    /// Computes the proportionally scaled Windowed overlay Cocoa frame when the underlying source
+    /// window is resized externally (inward OR outward) while locked in Windowed mode.
+    /// Preserves the live scale ratio (`overlayWidth / previousSourceWidth >= 1.0`) so dragging the
+    /// source window border inward smoothly shrinks the overlay instead of sticking at stale `lastWindowedWidth`.
+    public static func computeProportionalResizedWindowedCocoaFrame(
+        previousSourceCGRect: CGRect,
+        newSourceCGRect: CGRect,
+        currentOverlayCocoaFrame: CGRect,
+        displays: [DisplayDescriptor]
+    ) -> CGRect {
+        let prevSource = previousSourceCGRect.standardized
+        let newSource = newSourceCGRect.standardized
+        let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: newSource, in: displays)
+            ?? ScreenGeometry.primaryDisplay(in: displays)
+        let screenCocoa = hostDisplay?.cocoaFrame
+            ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        let sourceCocoa = ScreenGeometry.cgToCocoa(rect: newSource, displays: displays).standardized
+
+        let safeAspect: CGFloat = newSource.height > 0
+            ? max(0.1, newSource.width / newSource.height)
+            : max(0.1, currentOverlayCocoaFrame.width / max(1.0, currentOverlayCocoaFrame.height))
+
+        let liveRatio: CGFloat
+        if prevSource.width >= 1.0 && currentOverlayCocoaFrame.width >= 1.0 {
+            liveRatio = max(1.0, currentOverlayCocoaFrame.width / prevSource.width)
+        } else {
+            liveRatio = 1.0
+        }
+
+        let desiredW = sourceCocoa.width * liveRatio
+        let minCoverW = min(screenCocoa.width, max(absoluteMinimumWindowedWidth, ceil(sourceCocoa.width)))
+        let minCoverH = min(screenCocoa.height, max(absoluteMinimumWindowedHeight, ceil(sourceCocoa.height)))
+        let maxAspectFitW = min(screenCocoa.width, screenCocoa.height * safeAspect)
+        let minAspectCoverW = min(maxAspectFitW, max(minCoverW, minCoverH * safeAspect))
+
+        var finalW = min(maxAspectFitW, max(minAspectCoverW, desiredW))
+        var finalH = finalW / safeAspect
+        finalW = min(screenCocoa.width, max(finalW.rounded(), minCoverW))
+        finalH = min(screenCocoa.height, max(finalH.rounded(), minCoverH))
+
+        let centered = CGRect(
+            x: (sourceCocoa.midX - finalW * 0.5).rounded(),
+            y: (sourceCocoa.midY - finalH * 0.5).rounded(),
+            width: finalW,
+            height: finalH
+        )
+        return ensureOverlayCoversSource(
+            overlayCocoaRect: centered,
+            sourceCocoaRect: sourceCocoa,
+            hostScreenCocoa: screenCocoa
+        )
+    }
+
+    /// Pure, unit-testable classifier deciding whether `OverlayPanel` should temporarily boost above
+    /// `kCGPopUpMenuWindowLevelKey` (101) to hide an unscaled duplicate `NSMenu` already being rendered
+    /// scaled by `SCStream`, while leaving top macOS Menu Bar dropdowns visible above the overlay.
+    public nonisolated static func evaluatePopupMenuLevelBoost(
+        popupWindows: [PopupMenuWindowSnapshot],
+        targetPID: Int32,
+        sourceCGRect: CGRect,
+        displays: [DisplayDescriptor],
+        pointerCGPosition: CGPoint? = nil,
+        menuBarHeightByDisplayID: [CGDirectDisplayID: CGFloat] = [:],
+        wasBoosted: Bool = false,
+        wasMenuBarDropdownActive: Bool = false
+    ) -> PopupMenuLevelEvaluation {
+        let popUpLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
+        let targetPopups = popupWindows.filter {
+            $0.pid == targetPID
+                && $0.layer == popUpLayer
+                && $0.alpha > 0.01
+                && $0.bounds.width >= 20
+                && $0.bounds.height >= 20
+        }
+        guard !targetPopups.isEmpty else {
+            return PopupMenuLevelEvaluation(
+                shouldBoostAbovePopupMenus: false,
+                isMenuBarDropdownActive: false
+            )
+        }
+        if wasMenuBarDropdownActive {
+            return PopupMenuLevelEvaluation(
+                shouldBoostAbovePopupMenus: false,
+                isMenuBarDropdownActive: true
+            )
+        }
+        if wasBoosted {
+            return PopupMenuLevelEvaluation(
+                shouldBoostAbovePopupMenus: true,
+                isMenuBarDropdownActive: false
+            )
+        }
+
+        let expandedSource = sourceCGRect.standardized.insetBy(dx: -4, dy: -4)
+        var anyIntersectsSource = false
+
+        for popup in targetPopups {
+            let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: popup.bounds, in: displays)
+                ?? ScreenGeometry.primaryDisplay(in: displays)
+            let menuBarHeight: CGFloat
+            if let display = hostDisplay, let known = menuBarHeightByDisplayID[display.id], known > 0 {
+                menuBarHeight = known
+            } else if hostDisplay?.isPrimary == true {
+                menuBarHeight = 33.0
+            } else {
+                menuBarHeight = 30.0
+            }
+
+            let isAnchoredToMenuBar = hostDisplay.map {
+                popup.bounds.minY <= $0.cgBounds.minY + menuBarHeight + 8.0
+            } ?? false
+            let pointerNearMenuBar = pointerCGPosition.flatMap { pt in
+                hostDisplay.map { pt.y <= $0.cgBounds.minY + menuBarHeight + 6.0 }
+            } ?? false
+            let intersectsSource = !expandedSource.isEmpty && popup.bounds.intersects(expandedSource)
+
+            if isAnchoredToMenuBar && (pointerNearMenuBar || !intersectsSource) {
+                return PopupMenuLevelEvaluation(
+                    shouldBoostAbovePopupMenus: false,
+                    isMenuBarDropdownActive: true
+                )
+            }
+            if intersectsSource {
+                anyIntersectsSource = true
+            }
+        }
+
+        return PopupMenuLevelEvaluation(
+            shouldBoostAbovePopupMenus: anyIntersectsSource,
+            isMenuBarDropdownActive: false
+        )
+    }
+
     /// Returns `true` when `overlayRect` completely covers `sourceRect` (within `tolerance` points).
     public static func overlayCoversSource(
         overlayRect: CGRect,
@@ -1368,17 +1753,42 @@ public final class OverlayWindowController {
         isCoveringNativeFullscreenSpace = nativeFullscreenSpace
 
         let app = NSApplication.shared
-        if nativeFullscreenSpace {
-            panel.level = Self.nativeFullscreenOverlayLevel
+        let previousLevel = panel.level
+        let targetLevel: NSWindow.Level
+
+        if isPopupMenuLevelBoostActive && !isEffectiveVRRDirectScanout() {
+            targetLevel = Self.popupMenuBoostOverlayLevel
+            if nativeFullscreenSpace {
+                if savedActivationPolicy == nil {
+                    savedActivationPolicy = app.activationPolicy()
+                }
+                if app.activationPolicy() != .accessory {
+                    app.setActivationPolicy(.accessory)
+                }
+            } else {
+                restoreActivationPolicyIfNeeded()
+            }
+        } else if nativeFullscreenSpace {
+            targetLevel = Self.nativeFullscreenOverlayLevel
             if savedActivationPolicy == nil {
                 savedActivationPolicy = app.activationPolicy()
             }
             if app.activationPolicy() != .accessory {
                 app.setActivationPolicy(.accessory)
             }
-        } else {
-            panel.level = Self.normalOverlayLevel
+        } else if isEffectiveVRRDirectScanout() {
+            targetLevel = Self.vrrFullscreenOverlayLevel
             restoreActivationPolicyIfNeeded()
+        } else {
+            targetLevel = currentPresentationMode.isWindowed
+                ? Self.windowedOverlayLevel
+                : Self.normalOverlayLevel
+            restoreActivationPolicyIfNeeded()
+        }
+
+        panel.level = targetLevel
+        if targetLevel != previousLevel {
+            onOverlayLevelChanged?(targetLevel)
         }
     }
 
@@ -1405,26 +1815,39 @@ public final class OverlayWindowController {
     private func applyOcclusionAndShadowState() {
         guard let panel else { return }
         let useAntiOcclusionAlpha = antiOcclusionEnabled && !isEffectiveVRRDirectScanout()
-        panel.isOpaque = true
-        panel.backgroundColor = .black
+        let isWindowed = currentPresentationMode.isWindowed
+
+        panel.isOpaque = !isWindowed
+        panel.backgroundColor = isWindowed ? .clear : .black
         panel.alphaValue = useAntiOcclusionAlpha ? Self.antiOcclusionAlphaValue : 1.0
-        panel.hasShadow = currentPresentationMode.isWindowed
+        panel.hasShadow = isWindowed
+
+        overlayView?.setRoundedCornerRadius(isWindowed ? Self.windowedCornerRadius : 0.0)
+        if isWindowed {
+            panel.invalidateShadow()
+        }
     }
 
     private func syncMinimumWindowedBounds(for sourceCGRect: CGRect, displays: [DisplayDescriptor]) {
         guard let view = overlayView else { return }
+        if allowInwardResizeBelowSource {
+            view.minimumWindowedWidth = Self.absoluteMinimumWindowedWidth
+            view.minimumWindowedHeight = Self.absoluteMinimumWindowedHeight
+            return
+        }
         let normalized = sourceCGRect.standardized
         let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: normalized, in: displays)
             ?? ScreenGeometry.primaryDisplay(in: displays)
-        let maxW = hostDisplay?.cocoaFrame.width ?? max(320.0, normalized.width)
-        let maxH = hostDisplay?.cocoaFrame.height ?? max(180.0, normalized.height)
-        view.minimumWindowedWidth = min(maxW, max(320.0, ceil(normalized.width)))
-        view.minimumWindowedHeight = min(maxH, max(180.0, ceil(normalized.height)))
+        let maxW = hostDisplay?.cocoaFrame.width ?? max(Self.absoluteMinimumWindowedWidth, normalized.width)
+        let maxH = hostDisplay?.cocoaFrame.height ?? max(Self.absoluteMinimumWindowedHeight, normalized.height)
+        view.minimumWindowedWidth = min(maxW, max(Self.absoluteMinimumWindowedWidth, ceil(normalized.width)))
+        view.minimumWindowedHeight = min(maxH, max(Self.absoluteMinimumWindowedHeight, ceil(normalized.height)))
     }
 
     private func applyVRRModeState() {
         guard let view = overlayView else { return }
         let vrrActive = isEffectiveVRRDirectScanout()
+        applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: isCoveringNativeFullscreenSpace)
         applyOcclusionAndShadowState()
         if vrrActive {
             view.hideCursorSprite()

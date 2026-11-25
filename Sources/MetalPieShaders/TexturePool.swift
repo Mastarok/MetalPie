@@ -18,9 +18,10 @@ public struct TexturePoolKey: Hashable, Sendable {
         usage: MTLTextureUsage,
         storageMode: MTLStorageMode
     ) {
-        self.width = max(1, width)
-        self.height = max(1, height)
-        self.pixelFormatRaw = pixelFormat.rawValue
+        self.width = clampMetalTextureDimension(width)
+        self.height = clampMetalTextureDimension(height)
+        let safeFormat = sanitizedComputeTextureFormat(pixelFormat)
+        self.pixelFormatRaw = safeFormat.rawValue
         self.usageRaw = usage.rawValue
         self.storageModeRaw = storageMode.rawValue
     }
@@ -129,12 +130,13 @@ public final class TexturePool: @unchecked Sendable {
         storageMode: MTLStorageMode = .private,
         label: String? = nil
     ) throws -> PooledTexture {
-        let safeW = max(1, width)
-        let safeH = max(1, height)
+        let safeW = clampMetalTextureDimension(width)
+        let safeH = clampMetalTextureDimension(height)
+        let safeFormat = sanitizedComputeTextureFormat(pixelFormat)
         let key = TexturePoolKey(
             width: safeW,
             height: safeH,
-            pixelFormat: pixelFormat,
+            pixelFormat: safeFormat,
             usage: usage,
             storageMode: storageMode
         )
@@ -161,7 +163,7 @@ public final class TexturePool: @unchecked Sendable {
         }
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: pixelFormat,
+            pixelFormat: safeFormat,
             width: safeW,
             height: safeH,
             mipmapped: false
@@ -173,11 +175,11 @@ public final class TexturePool: @unchecked Sendable {
         }
 
         guard let created = device.makeTexture(descriptor: desc) else {
-            let msg = "MTLDevice.makeTexture failed for \(safeW)x\(safeH) format=\(pixelFormat.rawValue)"
+            let msg = "MTLDevice.makeTexture failed for \(safeW)x\(safeH) format=\(safeFormat.rawValue)"
             PipelineLog.shared.error(.shader, msg)
             throw EngineError.metalDeviceUnavailable
         }
-        created.label = label ?? "MetalPiePool_\(safeW)x\(safeH)_\(pixelFormat.rawValue)"
+        created.label = label ?? "MetalPiePool_\(safeW)x\(safeH)_\(safeFormat.rawValue)"
 
         state.withLockUnchecked { s in
             s.totalAllocations += 1

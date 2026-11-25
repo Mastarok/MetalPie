@@ -198,6 +198,9 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         var lastPublishTime: Double = 0
         var lastRenderConsumeTime: Double = 0
         var displayIntervalSeconds: Double = 1.0 / 60.0
+        var resizeGraceUntil: Double = 0
+        var lastSourceSize: PixelSize = .zero
+        var lastDrawableSize: PixelSize = .zero
         var sourceFPS: Double = 0
         var outputFPS: Double = 0
         var presentedFPS: Double = 0
@@ -253,8 +256,30 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         }
     }
 
-    func recordDroppedPresent(count: UInt64 = 1) {
+    func recordSourceSize(_ size: PixelSize, now: Double) {
+        guard size.isValid else { return }
         lock.withLock { s in
+            if s.lastSourceSize.isValid && s.lastSourceSize != size {
+                s.resizeGraceUntil = max(s.resizeGraceUntil, now + 0.35)
+            }
+            s.lastSourceSize = size
+        }
+    }
+
+    func recordDrawableSize(_ size: PixelSize, now: Double) {
+        guard size.isValid else { return }
+        lock.withLock { s in
+            if s.lastDrawableSize.isValid && s.lastDrawableSize != size {
+                s.resizeGraceUntil = max(s.resizeGraceUntil, now + 0.35)
+            }
+            s.lastDrawableSize = size
+        }
+    }
+
+    func recordDroppedPresent(now: Double = CACurrentMediaTime(), count: UInt64 = 1) {
+        lock.withLock { s in
+            // Do not falsely count transient swapchain/drawable transitions during live window resize as drops.
+            guard now >= s.resizeGraceUntil else { return }
             s.telemetry.droppedFrames &+= count
         }
     }
@@ -262,8 +287,9 @@ private final class TelemetryAccumulator: @unchecked Sendable {
     func recordSourceFrame(now: Double, mailboxSuperseded: Bool) {
         lock.withLock { s in
             // Distinguish true render-deadline-miss drops from harmless sub-vsync mailbox coalescing
-            // (e.g. slight clock phase beat between capture stream and 60/120Hz display vsync).
+            // and transient source/drawable dimension changes during live window resize / titlebar zoom.
             if mailboxSuperseded,
+               now >= s.resizeGraceUntil,
                s.lastRenderConsumeTime > 0,
                (now - s.lastRenderConsumeTime) > s.displayIntervalSeconds * 1.45
             {
@@ -632,10 +658,12 @@ private final class PresentPassRenderer {
         outputSize: PixelSize
     ) -> (any MTLTexture)? {
         guard outputSize.isValid else { return nil }
+        let safeSize = ScalingLayoutCalculator.clampAspectPreserving(outputSize)
+        guard safeSize.isValid else { return nil }
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm,
-            width: outputSize.width,
-            height: outputSize.height,
+            width: clampMetalTextureDimension(safeSize.width),
+            height: clampMetalTextureDimension(safeSize.height),
             mipmapped: false
         )
         desc.usage = [.shaderWrite, .shaderRead]
@@ -660,7 +688,7 @@ private final class PresentPassRenderer {
         let tgW = min(16, screenshotPipeline.threadExecutionWidth)
         let tgH = max(1, min(16, screenshotPipeline.maxTotalThreadsPerThreadgroup / tgW))
         encoder.dispatchThreads(
-            MTLSize(width: outputSize.width, height: outputSize.height, depth: 1),
+            MTLSize(width: staging.width, height: staging.height, depth: 1),
             threadsPerThreadgroup: MTLSize(width: tgW, height: tgH, depth: 1)
         )
         encoder.endEncoding()
@@ -1051,6 +1079,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             s.needsGraphicsRedraw = true
             s.configDirty = true
         }
+        telemetry.recordDrawableSize(configuration.overlayMetrics.drawablePixelSize, now: CACurrentMediaTime())
         telemetry.setDisplayRefreshRate(configuration.overlayMetrics.screenMaxFPS)
         telemetry.updateSessionMetadata(
             targetWindowName: configuration.targetWindowName,
@@ -1145,9 +1174,11 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         let (running, paused) = control.withLock { ($0.isRunning, $0.isPaused) }
         guard running, !paused else { return }
 
+        let now = CACurrentMediaTime()
+        telemetry.recordSourceSize(frame.pixelSize, now: now)
         let dropped = mailbox.deposit(frame)
         telemetry.recordSourceFrame(
-            now: CACurrentMediaTime(),
+            now: now,
             mailboxSuperseded: dropped
         )
 
@@ -1464,7 +1495,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         guard let drawable = acquireDrawable() else {
             if newFrame != nil || dueBeat != nil {
-                telemetry.recordDroppedPresent()
+                telemetry.recordDroppedPresent(now: now)
             }
             if let newFrame {
                 // Put frame back if drawable temporarily unavailable.
@@ -1504,6 +1535,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             width: drawable.texture.width,
             height: drawable.texture.height
         )
+        telemetry.recordDrawableSize(targetPixelSize, now: now)
         let targetCGRect = config.overlayMetrics.cgFrame.width > 0
             ? config.overlayMetrics.cgFrame
             : CGRect(
@@ -1625,21 +1657,49 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         // Run multi-pass EffectRendering graph when we have a real, interpolated, or reconfigured source frame.
         if let srcTex = sourceTextureForEffects {
-            let sourceSize = PixelSize(width: srcTex.width, height: srcTex.height)
-            let layout = ScalingLayoutCalculator.calculate(
-                sourcePixelSize: sourceSize,
+            let rawSourceSize = PixelSize(width: srcTex.width, height: srcTex.height)
+            let resolvedInput: (effectiveSize: PixelSize, videoPreDownscaleSize: PixelSize?)
+            if let preScaleConfigurable = effectRenderer as? any EffectPreScaleConfigurable {
+                let resolved = ScalingLayoutCalculator.resolveEffectiveSourceSize(
+                    rawSourceSize: rawSourceSize,
+                    targetPixelSize: targetPixelSize,
+                    presentationMode: config.profile.presentationMode,
+                    fullscreenVideoInput: config.profile.capture.fullscreenVideoInput,
+                    demagnifyActive: preScaleConfigurable.isDemagnifyActive
+                )
+                preScaleConfigurable.fullscreenVideoPreDownscaleSize = resolved.videoPreDownscaleSize
+                resolvedInput = resolved
+            } else {
+                resolvedInput = (rawSourceSize, nil)
+            }
+
+            let effectiveCrop = config.profile.crop.scaled(
+                from: rawSourceSize,
+                to: resolvedInput.effectiveSize
+            )
+
+            var layout = ScalingLayoutCalculator.calculate(
+                sourcePixelSize: resolvedInput.effectiveSize,
                 targetPixelSize: targetPixelSize,
                 targetCGRect: targetCGRect,
                 backingScaleFactor: config.overlayMetrics.backingScaleFactor,
-                crop: config.profile.crop,
+                crop: effectiveCrop,
                 effects: config.scalingMode.effects,
                 presentationMode: config.profile.presentationMode,
                 alignment: config.profile.outputAlignment
             )
+            // Defensive aspect-preserving guard: never allow finalOutputPixelSize to exceed Metal's 16,384px limit.
+            if layout.finalOutputPixelSize.width > ScalingLayoutCalculator.maxMetalTextureDimension
+                || layout.finalOutputPixelSize.height > ScalingLayoutCalculator.maxMetalTextureDimension
+            {
+                layout.finalOutputPixelSize = ScalingLayoutCalculator.clampAspectPreserving(layout.finalOutputPixelSize)
+            }
             activeLayout = layout
             notifyLayoutIfChanged(layout)
 
-            let upscaledFormat: MTLPixelFormat = sourceIsHDR ? .rgba16Float : drawable.texture.pixelFormat
+            let upscaledFormat = sanitizedComputeTextureFormat(
+                sourceIsHDR ? .rgba16Float : drawable.texture.pixelFormat
+            )
             if let dstTex = nextUpscaledOutputTexture(
                 size: layout.finalOutputPixelSize,
                 pixelFormat: upscaledFormat
@@ -1837,10 +1897,14 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         isHDR: Bool,
         commandBuffer: any MTLCommandBuffer
     ) {
-        let w = sourceTexture.width
-        let h = sourceTexture.height
-        let fmt = sourceTexture.pixelFormat
-        guard w > 0 && h > 0 else { return }
+        guard sourceTexture.width > 0 && sourceTexture.height > 0,
+              sourceTexture.pixelFormat != .invalid
+        else {
+            return
+        }
+        let w = clampMetalTextureDimension(sourceTexture.width)
+        let h = clampMetalTextureDimension(sourceTexture.height)
+        let fmt = sanitizedComputeTextureFormat(sourceTexture.pixelFormat)
 
         let needsRebuild = lastRawSourceTexture == nil
             || lastRawSourceTexture?.width != w
@@ -1864,12 +1928,14 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         else {
             return
         }
+        let copyW = min(sourceTexture.width, dst.width)
+        let copyH = min(sourceTexture.height, dst.height)
         blit.copy(
             from: sourceTexture,
             sourceSlice: 0,
             sourceLevel: 0,
             sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-            sourceSize: MTLSize(width: w, height: h, depth: 1),
+            sourceSize: MTLSize(width: copyW, height: copyH, depth: 1),
             to: dst,
             destinationSlice: 0,
             destinationLevel: 0,
@@ -1883,10 +1949,14 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         sourceTexture: any MTLTexture,
         commandBuffer: any MTLCommandBuffer
     ) {
-        let w = sourceTexture.width
-        let h = sourceTexture.height
-        let fmt = sourceTexture.pixelFormat
-        guard w > 0 && h > 0 else { return }
+        guard sourceTexture.width > 0 && sourceTexture.height > 0,
+              sourceTexture.pixelFormat != .invalid
+        else {
+            return
+        }
+        let w = clampMetalTextureDimension(sourceTexture.width)
+        let h = clampMetalTextureDimension(sourceTexture.height)
+        let fmt = sanitizedComputeTextureFormat(sourceTexture.pixelFormat)
 
         let needsRebuild = fgHistoryTextures.count != Self.fgHistoryRingCapacity
             || fgHistoryTextures[0].width != w
@@ -1925,13 +1995,16 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         }
 
         let targetIdx = fgHistoryCursor
+        let dst = fgHistoryTextures[targetIdx]
+        let copyW = min(sourceTexture.width, dst.width)
+        let copyH = min(sourceTexture.height, dst.height)
         blit.copy(
             from: sourceTexture,
             sourceSlice: 0,
             sourceLevel: 0,
             sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-            sourceSize: MTLSize(width: w, height: h, depth: 1),
-            to: fgHistoryTextures[targetIdx],
+            sourceSize: MTLSize(width: copyW, height: copyH, depth: 1),
+            to: dst,
             destinationSlice: 0,
             destinationLevel: 0,
             destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
@@ -2028,17 +2101,22 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     }
 
     private func ensureFGOutputTexture(matching template: any MTLTexture) -> (any MTLTexture)? {
+        guard template.width > 0 && template.height > 0 else { return nil }
+        let safeW = clampMetalTextureDimension(template.width)
+        let safeH = clampMetalTextureDimension(template.height)
+        let safeFormat = sanitizedComputeTextureFormat(template.pixelFormat)
+
         let needsRebuild = fgInterpolatedRing.count != 3
-            || fgInterpolatedRing[0].width != template.width
-            || fgInterpolatedRing[0].height != template.height
-            || fgInterpolatedRing[0].pixelFormat != template.pixelFormat
+            || fgInterpolatedRing[0].width != safeW
+            || fgInterpolatedRing[0].height != safeH
+            || fgInterpolatedRing[0].pixelFormat != safeFormat
 
         if needsRebuild {
             fgInterpolatedRing.removeAll(keepingCapacity: true)
             let desc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: template.pixelFormat,
-                width: template.width,
-                height: template.height,
+                pixelFormat: safeFormat,
+                width: safeW,
+                height: safeH,
                 mipmapped: false
             )
             desc.storageMode = .private
@@ -2081,18 +2159,23 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         pixelFormat: MTLPixelFormat
     ) -> (any MTLTexture)? {
         guard size.isValid else { return nil }
+        let safeSize = ScalingLayoutCalculator.clampAspectPreserving(size)
+        guard safeSize.isValid else { return nil }
+        let safeW = clampMetalTextureDimension(safeSize.width)
+        let safeH = clampMetalTextureDimension(safeSize.height)
+        let safeFormat = sanitizedComputeTextureFormat(pixelFormat)
 
         let needsRebuild = upscaledRing.count != 3
-            || upscaledRing[0].width != size.width
-            || upscaledRing[0].height != size.height
-            || upscaledRing[0].pixelFormat != pixelFormat
+            || upscaledRing[0].width != safeW
+            || upscaledRing[0].height != safeH
+            || upscaledRing[0].pixelFormat != safeFormat
 
         if needsRebuild {
             upscaledRing.removeAll(keepingCapacity: true)
             let desc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: pixelFormat,
-                width: size.width,
-                height: size.height,
+                pixelFormat: safeFormat,
+                width: safeW,
+                height: safeH,
                 mipmapped: false
             )
             desc.storageMode = .private

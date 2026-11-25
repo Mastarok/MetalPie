@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import MetalPieCapture
 import MetalPieCore
 import SwiftUI
 
@@ -27,7 +28,9 @@ final class NonActivatingChromePanel: NSPanel {
         isFloatingPanel = true
         hidesOnDeactivate = false
         becomesKeyOnlyIfNeeded = true
-        hasShadow = true
+        // Disable WindowServer's rectangular borderless shadow; SwiftUI draws rounded shadows
+        // inside a padded transparent canvas so no rectangular box appears around rounded corners.
+        hasShadow = false
         isOpaque = false
         backgroundColor = .clear
         self.ignoresMouseEvents = ignoresMouseEvents
@@ -85,13 +88,19 @@ public final class OverlayToolbarPanel {
     private var lastHoverLeaveTime: CFAbsoluteTime = 0
     private var currentLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)) + 1)
 
-    private static let toolbarSize = CGSize(width: 420, height: 42)
-    private static let topMargin: CGFloat = 10
+    public static let toolbarSize = OverlayChromeGeometry.defaultToolbarSize
+    /// Transparent outer padding reserved for SwiftUI drop shadow bleed (prevents rectangular clipping).
+    public static let shadowPadding: CGFloat = OverlayChromeGeometry.defaultShadowPadding
+    private static let topMargin: CGFloat = OverlayChromeGeometry.defaultTopMargin
+    private static let notchSafeTopMargin: CGFloat = OverlayChromeGeometry.notchSafeTopMargin
     private static let fittsTopStripHeight: CGFloat = 28
 
     /// Optional provider returning the active scaled cursor position in global Cocoa coordinates
     /// when `CGEventTap` confines the physical pointer inside the source window.
     public var scaledCursorCocoaProvider: (@MainActor () -> CGPoint?)?
+
+    /// Fired whenever the toolbar's visible interactive Cocoa frame appears, moves, or hides.
+    public var onInteractiveFrameChanged: (@MainActor () -> Void)?
 
     public init() {}
 
@@ -101,6 +110,39 @@ public final class OverlayToolbarPanel {
     }
 
     public var nsWindow: NSWindow? { panel }
+
+    /// Exact visible pill rect in global AppKit (Cocoa Y-up) coordinates excluding transparent
+    /// shadow bleed padding, or `nil` when hidden / auto-hidden.
+    public var visibleInteractiveCocoaFrame: CGRect? {
+        guard isShown, let panel else { return nil }
+        guard mode == .alwaysShow || isRevealedByHover else { return nil }
+        return Self.visibleFrame(fromPanelFrame: panel.frame)
+    }
+
+    /// Strips the transparent shadow bleed margin from a panel frame to recover the visible pill frame.
+    public static func visibleFrame(fromPanelFrame panelFrame: CGRect) -> CGRect {
+        OverlayChromeGeometry.visibleFrame(fromPanelFrame: panelFrame, shadowPadding: shadowPadding)
+    }
+
+    /// Expands a visible pill frame by `shadowPadding` on all sides so SwiftUI drop shadows never clip.
+    public static func panelFrame(fromVisibleFrame visibleFrame: CGRect) -> CGRect {
+        OverlayChromeGeometry.panelFrame(fromVisibleFrame: visibleFrame, shadowPadding: shadowPadding)
+    }
+
+    /// Computes the visible toolbar pill frame in global AppKit (Y-up) coordinates, clamping cleanly
+    /// below the macOS Menu Bar and MacBook Pro camera notch whenever `overlayFrame` extends into them.
+    public static func computeVisibleToolbarCocoaFrame(
+        for overlayFrame: CGRect,
+        hostScreenVisibleFrame: CGRect?
+    ) -> CGRect {
+        OverlayChromeGeometry.computeVisibleToolbarCocoaFrame(
+            for: overlayFrame,
+            hostScreenVisibleFrame: hostScreenVisibleFrame,
+            toolbarSize: toolbarSize,
+            topMargin: topMargin,
+            notchSafeTopMargin: notchSafeTopMargin
+        )
+    }
 
     public func configure(actions: OverlayToolbarActions) {
         self.actions = actions
@@ -134,12 +176,14 @@ public final class OverlayToolbarPanel {
             activePanel.ignoresMouseEvents = false
             activePanel.alphaValue = 1.0
             activePanel.orderFrontRegardless()
+            onInteractiveFrameChanged?()
         case .autoHide:
             isRevealedByHover = false
             activePanel.ignoresMouseEvents = true
             activePanel.alphaValue = 0.0
             activePanel.orderFrontRegardless()
             startHoverTimer()
+            onInteractiveFrameChanged?()
         }
     }
 
@@ -151,7 +195,10 @@ public final class OverlayToolbarPanel {
         }
         guard isShown, let panel, !overlayCocoaFrame.isEmpty else { return }
         let frame = computeToolbarFrame(for: overlayCocoaFrame)
-        panel.setFrame(frame, display: false, animate: false)
+        if panel.frame != frame {
+            panel.setFrame(frame, display: false, animate: false)
+            onInteractiveFrameChanged?()
+        }
     }
 
     public func updateState(
@@ -176,10 +223,14 @@ public final class OverlayToolbarPanel {
     }
 
     public func hide() {
+        let wasShown = isShown || isRevealedByHover
         isShown = false
         isRevealedByHover = false
         stopHoverTimer()
         panel?.orderOut(nil)
+        if wasShown {
+            onInteractiveFrameChanged?()
+        }
     }
 
     public func close() {
@@ -198,17 +249,32 @@ public final class OverlayToolbarPanel {
         let host = NSHostingView(rootView: content)
         host.frame = CGRect(origin: .zero, size: frame.size)
         host.autoresizingMask = [.width, .height]
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.clear.cgColor
+        host.layer?.isOpaque = false
         created.contentView = host
         self.panel = created
         return created
     }
 
+    private func hostScreenVisibleFrame(for overlayFrame: CGRect) -> CGRect? {
+        let bestScreen = NSScreen.screens.max { lhs, rhs in
+            let lArea = lhs.frame.intersection(overlayFrame).area
+            let rArea = rhs.frame.intersection(overlayFrame).area
+            return lArea < rArea
+        }
+        if let bestScreen, bestScreen.frame.intersects(overlayFrame) {
+            return bestScreen.visibleFrame
+        }
+        return NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame
+    }
+
     private func computeToolbarFrame(for overlayFrame: CGRect) -> CGRect {
-        let w = min(Self.toolbarSize.width, max(380, overlayFrame.width - 16))
-        let h = Self.toolbarSize.height
-        let x = (overlayFrame.midX - w * 0.5).rounded()
-        let y = (overlayFrame.maxY - h - Self.topMargin).rounded()
-        return CGRect(x: x, y: y, width: w, height: h)
+        let visiblePill = Self.computeVisibleToolbarCocoaFrame(
+            for: overlayFrame,
+            hostScreenVisibleFrame: hostScreenVisibleFrame(for: overlayFrame)
+        )
+        return Self.panelFrame(fromVisibleFrame: visiblePill)
     }
 
     private func startHoverTimer() {
@@ -230,13 +296,14 @@ public final class OverlayToolbarPanel {
     private func evaluateAutoHideHover() {
         guard isShown, mode == .autoHide, let panel else { return }
         let mouse = scaledCursorCocoaProvider?() ?? NSEvent.mouseLocation
+        let visibleRect = Self.visibleFrame(fromPanelFrame: panel.frame)
         let topStrip = CGRect(
             x: anchorOverlayFrame.midX - Self.toolbarSize.width * 0.65,
-            y: anchorOverlayFrame.maxY - Self.fittsTopStripHeight,
+            y: visibleRect.maxY - Self.fittsTopStripHeight,
             width: Self.toolbarSize.width * 1.3,
-            height: Self.fittsTopStripHeight + 8
+            height: Self.fittsTopStripHeight + Self.notchSafeTopMargin + 6
         )
-        let expandedToolbar = panel.frame.insetBy(dx: -16, dy: -12)
+        let expandedToolbar = visibleRect.insetBy(dx: -16, dy: -12)
         let hovering = topStrip.contains(mouse) || (isRevealedByHover && expandedToolbar.contains(mouse))
 
         if hovering {
@@ -248,6 +315,7 @@ public final class OverlayToolbarPanel {
                     ctx.duration = 0.16
                     panel.animator().alphaValue = 1.0
                 }
+                onInteractiveFrameChanged?()
             }
         } else if isRevealedByHover {
             let now = CFAbsoluteTimeGetCurrent()
@@ -261,8 +329,16 @@ public final class OverlayToolbarPanel {
                     ctx.duration = 0.22
                     panel.animator().alphaValue = 0.0
                 }
+                onInteractiveFrameChanged?()
             }
         }
+    }
+}
+
+private extension CGRect {
+    var area: CGFloat {
+        guard !isNull, !isEmpty else { return 0 }
+        return width * height
     }
 }
 
@@ -390,6 +466,7 @@ private struct OverlayToolbarSwiftUIView: View {
                 }
         }
         .shadow(color: .black.opacity(0.45), radius: 10, y: 4)
+        .padding(OverlayToolbarPanel.shadowPadding)
     }
 
     private func toolbarIconButton(

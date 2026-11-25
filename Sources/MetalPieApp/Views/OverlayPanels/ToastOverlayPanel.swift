@@ -31,6 +31,8 @@ public final class ToastOverlayPanel {
 
     private static let toastWidth: CGFloat = 376
     private static let toastHeight: CGFloat = 68
+    /// Transparent outer padding reserved for SwiftUI drop shadow bleed (prevents rectangular clipping).
+    public static let shadowPadding: CGFloat = 20
 
     public init() {}
 
@@ -108,19 +110,33 @@ public final class ToastOverlayPanel {
         let host = NSHostingView(rootView: ToastPillSwiftUIView(state: state))
         host.frame = CGRect(origin: .zero, size: frame.size)
         host.autoresizingMask = [.width, .height]
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.clear.cgColor
+        host.layer?.isOpaque = false
         created.contentView = host
         self.panel = created
         return created
     }
 
     private func computeToastFrame(anchorScreenFrame: CGRect?) -> CGRect {
-        let screenFrame = anchorScreenFrame
+        let baseFrame = anchorScreenFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSScreen.screens.first?.visibleFrame
             ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-        let x = (screenFrame.maxX - Self.toastWidth - 20).rounded()
-        let y = (screenFrame.maxY - Self.toastHeight - 20).rounded()
-        return CGRect(x: x, y: y, width: Self.toastWidth, height: Self.toastHeight)
+        // Clamp toast cleanly below Menu Bar / notch when anchored to a fullscreen overlay rect.
+        let matchingVisible = NSScreen.screens
+            .first(where: { $0.frame.intersects(baseFrame) })?
+            .visibleFrame
+        let safeMaxY: CGFloat
+        if let visible = matchingVisible, baseFrame.maxY > visible.maxY {
+            safeMaxY = visible.maxY
+        } else {
+            safeMaxY = baseFrame.maxY
+        }
+        let x = (baseFrame.maxX - Self.toastWidth - 20).rounded()
+        let y = (safeMaxY - Self.toastHeight - 16).rounded()
+        let visibleRect = CGRect(x: x, y: y, width: Self.toastWidth, height: Self.toastHeight)
+        return visibleRect.insetBy(dx: -Self.shadowPadding, dy: -Self.shadowPadding)
     }
 }
 
@@ -170,5 +186,6 @@ private struct ToastPillSwiftUIView: View {
                 }
         }
         .shadow(color: .black.opacity(0.45), radius: 12, y: 4)
+        .padding(ToastOverlayPanel.shadowPadding)
     }
 }

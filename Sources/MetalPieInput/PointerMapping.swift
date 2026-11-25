@@ -174,6 +174,12 @@ public struct PointerMapping: Hashable, Sendable {
     /// Inset from outer host-display edges for hidden physical cursor roaming in `adjustCursorSpeed`
     /// mode so sweeping across the full scaled window triggers zero mid-glide `CGWarpMouseCursorPosition` calls.
     public static let defaultPhysicalRoamingInset: CGFloat = 20.0
+    /// Default window border hit margin (in logical points) for detecting native resize drags.
+    public static let defaultBorderResizeMargin: CGFloat = 6.0
+    /// Default macOS titlebar height (in logical points) for detecting native window move drags.
+    public static let defaultTitlebarDragHeight: CGFloat = 32.0
+    /// Fallback macOS top Menu Bar height (in logical points) when `NSScreen.visibleFrame` matches `frame`.
+    public static let defaultMenuBarHeight: CGFloat = 28.0
     public static let identityTolerance: CGFloat = 0.5
 
     /// Active (cropped/visible) source window rect in global CG (Y-down) logical points.
@@ -201,6 +207,10 @@ public struct PointerMapping: Hashable, Sendable {
     /// Full host-display roaming bounds (inset 20pt from outer display bezel) for zero-warp glides
     /// while the physical hardware cursor is hidden in `adjustCursorSpeed` mode.
     public let physicalRoamingRect: CGRect
+    /// Host display bounds in global CG (Y-down) logical points for menu-bar bands and border-drag clamping.
+    public let hostDisplayBounds: CGRect
+    /// Host `CGDirectDisplayID` hosting the scaled overlay, if resolved from `displays`.
+    public let hostDisplayID: CGDirectDisplayID?
 
     public init(
         sourceRect: CGRect,
@@ -238,12 +248,20 @@ public struct PointerMapping: Hashable, Sendable {
         }
         let resolvedConfinement = Self.insetConfinementRect(baseConfinement, edgeInset: clampedInset)
         self.confinementRect = resolvedConfinement
-        self.physicalRoamingRect = Self.computePhysicalRoamingRect(
+        let resolvedHost = Self.resolveHostDisplay(
             sourceRect: normalizedSource,
             overlayRect: normalizedOverlay,
-            displays: displays,
-            fallback: resolvedConfinement
+            displays: displays
         )
+        self.hostDisplayID = resolvedHost?.id
+        let hostBounds = resolvedHost?.cgBounds.standardized ?? normalizedOverlay.union(normalizedSource).standardized
+        self.hostDisplayBounds = hostBounds
+        if !hostBounds.isEmpty {
+            let insetRoam = Self.insetConfinementRect(hostBounds, edgeInset: Self.defaultPhysicalRoamingInset)
+            self.physicalRoamingRect = insetRoam.isEmpty ? resolvedConfinement : insetRoam
+        } else {
+            self.physicalRoamingRect = resolvedConfinement
+        }
     }
 
     /// Initializes from `MetalPieCore`'s `CursorMappingConfiguration`.
@@ -527,6 +545,81 @@ public struct PointerMapping: Hashable, Sendable {
         )
         return cgPoint.x >= checkRect.minX && cgPoint.x <= checkRect.maxX &&
             cgPoint.y >= checkRect.minY && cgPoint.y <= checkRect.maxY
+    }
+
+    /// Returns `true` if `sourcePoint` lies within `borderMargin` of any edge of `sourceRect`
+    /// OR within the top `titlebarHeight` titlebar drag band of `sourceRect`.
+    public func isPointInWindowResizeOrTitlebarZone(
+        _ sourcePoint: CGPoint,
+        borderMargin: CGFloat = PointerMapping.defaultBorderResizeMargin,
+        titlebarHeight: CGFloat = PointerMapping.defaultTitlebarDragHeight
+    ) -> Bool {
+        guard isValid else { return false }
+        let margin = max(0, borderMargin)
+        let topBand = max(margin, max(0, titlebarHeight))
+        return sourcePoint.x <= sourceRect.minX + margin ||
+            sourcePoint.x >= sourceRect.maxX - margin ||
+            sourcePoint.y <= sourceRect.minY + topBand ||
+            sourcePoint.y >= sourceRect.maxY - margin
+    }
+
+    /// Clamps a global CG coordinate to the attached displays (or `hostDisplayBounds` if `displays` is empty)
+    /// without clamping to `sourceRect`, allowing outward window edge resize and titlebar move drags.
+    /// Zero heap allocations.
+    public func clampPointToDisplays(_ cgPoint: CGPoint, edgeInset: CGFloat = 0.0) -> CGPoint {
+        let safeInset = max(0, edgeInset)
+        if !displays.isEmpty {
+            // Fast path: already inside any attached display.
+            for display in displays {
+                let b = display.cgBounds.standardized
+                let maxX = max(b.minX, b.maxX - max(1.0, safeInset))
+                let maxY = max(b.minY, b.maxY - max(1.0, safeInset))
+                let minX = min(maxX, b.minX + safeInset)
+                let minY = min(maxY, b.minY + safeInset)
+                if cgPoint.x >= minX && cgPoint.x <= maxX && cgPoint.y >= minY && cgPoint.y <= maxY {
+                    return cgPoint
+                }
+            }
+            // Clamp to nearest attached display.
+            var bestPoint = cgPoint
+            var bestDistSq: CGFloat = .greatestFiniteMagnitude
+            for display in displays {
+                let b = display.cgBounds.standardized
+                let maxX = max(b.minX, b.maxX - max(1.0, safeInset))
+                let maxY = max(b.minY, b.maxY - max(1.0, safeInset))
+                let minX = min(maxX, b.minX + safeInset)
+                let minY = min(maxY, b.minY + safeInset)
+                let cx = min(max(cgPoint.x, minX), maxX)
+                let cy = min(max(cgPoint.y, minY), maxY)
+                let dx = cgPoint.x - cx
+                let dy = cgPoint.y - cy
+                let distSq = dx * dx + dy * dy
+                if distSq < bestDistSq {
+                    bestDistSq = distSq
+                    bestPoint = CGPoint(x: cx, y: cy)
+                }
+            }
+            return bestPoint
+        }
+
+        let b = hostDisplayBounds.standardized
+        guard !b.isEmpty else { return cgPoint }
+        let maxX = max(b.minX, b.maxX - max(1.0, safeInset))
+        let maxY = max(b.minY, b.maxY - max(1.0, safeInset))
+        let minX = min(maxX, b.minX + safeInset)
+        let minY = min(maxY, b.minY + safeInset)
+        return CGPoint(
+            x: min(max(cgPoint.x, minX), maxX),
+            y: min(max(cgPoint.y, minY), maxY)
+        )
+    }
+
+    /// Computes the host display's top macOS Menu Bar band in global CG (Y-down) logical coordinates.
+    public func menuBarRect(height: CGFloat = PointerMapping.defaultMenuBarHeight) -> CGRect {
+        let b = hostDisplayBounds.standardized
+        guard !b.isEmpty else { return .zero }
+        let safeHeight = min(max(1.0, height), b.height)
+        return CGRect(x: b.minX, y: b.minY, width: b.width, height: safeHeight)
     }
 
     /// Resolves a safe starting physical source point when starting/resuming confinement.
@@ -918,38 +1011,30 @@ public struct PointerMapping: Hashable, Sendable {
         return rects
     }
 
-    private static func computePhysicalRoamingRect(
+    private static func resolveHostDisplay(
         sourceRect: CGRect,
         overlayRect: CGRect,
-        displays: [DisplayDescriptor],
-        fallback: CGRect
-    ) -> CGRect {
-        let hostBounds: CGRect
-        if !displays.isEmpty {
-            let overlayCenter = CGPoint(x: overlayRect.midX, y: overlayRect.midY)
-            let sourceCenter = CGPoint(x: sourceRect.midX, y: sourceRect.midY)
-            if let d = displays.first(where: { $0.cgBounds.standardized.contains(overlayCenter) }) {
-                hostBounds = d.cgBounds.standardized
-            } else if let d = displays.first(where: { $0.cgBounds.standardized.contains(sourceCenter) }) {
-                hostBounds = d.cgBounds.standardized
-            } else if let d = displays.max(by: { a, b in
-                let ia = a.cgBounds.standardized.intersection(overlayRect)
-                let ib = b.cgBounds.standardized.intersection(overlayRect)
-                let areaA = (ia.isNull || ia.isEmpty) ? 0.0 : Double(ia.width * ia.height)
-                let areaB = (ib.isNull || ib.isEmpty) ? 0.0 : Double(ib.width * ib.height)
-                return areaA < areaB
-            }) {
-                hostBounds = d.cgBounds.standardized
-            } else {
-                hostBounds = displays[0].cgBounds.standardized
-            }
-        } else {
-            hostBounds = overlayRect.union(sourceRect).standardized
+        displays: [DisplayDescriptor]
+    ) -> DisplayDescriptor? {
+        guard !displays.isEmpty else { return nil }
+        let overlayCenter = CGPoint(x: overlayRect.midX, y: overlayRect.midY)
+        let sourceCenter = CGPoint(x: sourceRect.midX, y: sourceRect.midY)
+        if let d = displays.first(where: { $0.cgBounds.standardized.contains(overlayCenter) }) {
+            return d
         }
-
-        guard !hostBounds.isEmpty else { return fallback }
-        let inset = insetConfinementRect(hostBounds, edgeInset: defaultPhysicalRoamingInset)
-        return inset.isEmpty ? fallback : inset
+        if let d = displays.first(where: { $0.cgBounds.standardized.contains(sourceCenter) }) {
+            return d
+        }
+        if let d = displays.max(by: { a, b in
+            let ia = a.cgBounds.standardized.intersection(overlayRect)
+            let ib = b.cgBounds.standardized.intersection(overlayRect)
+            let areaA = (ia.isNull || ia.isEmpty) ? 0.0 : Double(ia.width * ia.height)
+            let areaB = (ib.isNull || ib.isEmpty) ? 0.0 : Double(ib.width * ib.height)
+            return areaA < areaB
+        }) {
+            return d
+        }
+        return displays[0]
     }
 
     private static func insetConfinementRect(_ rect: CGRect, edgeInset: CGFloat) -> CGRect {

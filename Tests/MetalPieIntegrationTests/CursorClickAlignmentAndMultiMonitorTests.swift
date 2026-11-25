@@ -1899,4 +1899,713 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         #expect(result != nil)
         #expect(taggedScroll.location == taggedLoc, "Reposted magic-tag event must pass straight through untouched")
     }
+
+    // MARK: 12. Regression (Bug #2A): Floating Toolbar & Profiler HUD Direct Chrome Interaction
+
+    @Test("Hovering, clicking, and dragging inside interactiveChromeRects (floating toolbar / Profiler HUD) bypasses source remapping at 1:1 native screen points and cleanly resumes scaled tracking on exit")
+    func interactiveChromeRectsToolbarAndProfilerHUDDirectInteraction() throws {
+        let sourceCG = CGRect(x: 120, y: 140, width: 680, height: 440)
+        let contentCG = CGRect(x: 0, y: 0, width: 1512, height: 981)
+        let toolbarCG = CGRect(x: 546, y: 42, width: 420, height: 42)
+        let profilerCG = CGRect(x: 16, y: 56, width: 296, height: 110)
+
+        let mapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: contentCG,
+            overlayRect: contentCG,
+            displays: [Self.primaryRetina],
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
+        )
+
+        var proc = CursorEventTapProcessor()
+        proc.interactiveChromeRects = [toolbarCG, profilerCG]
+        // Start slightly below toolbar in scaled mode (`scaledY ~= 100`, `scaledX ~= 756`).
+        let startScaled = CGPoint(x: 756, y: 100)
+        let startSrc = mapping.mapScaledToSource(startScaled, clampToSource: true)
+        var phys = CGPoint(x: 400, y: 500) // Hidden physical cursor drifted far away!
+        proc.reset(initialSourcePosition: startSrc, physicalLocation: phys)
+
+        // 1. Move up 35pt visually (`scaledY = 100 -> 65`) right onto MetalPie's floating toolbar button!
+        phys.y -= 35.0
+        let enterRaw = proc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: phys, deltaX: 0, deltaY: -35, timestamp: 1.0),
+            mapping: mapping
+        )
+        let enterDec = try #require(enterRaw)
+        #expect(enterDec.interactionMode == .directChrome)
+        #expect(enterDec.isDirectChromeInteraction)
+        #expect(!enterDec.isScaledSpriteVisible, "Scaled sprite must hide over toolbar so native OS cursor is never doubled!")
+        let entryPt = try #require(enterDec.warpTarget, "Entering toolbar must warp physical cursor onto visual toolbar coordinate")
+        #expect(toolbarCG.contains(entryPt))
+        #expect(abs(entryPt.x - 756.0) < 1.0)
+        #expect(abs(entryPt.y - 65.0) < 1.0)
+        #expect(enterDec.rewrittenEventLocation == entryPt)
+
+        // 2. Physical cursor lands at `entryPt` -> move 1:1 across toolbar buttons (zero `1/scale` distortion!).
+        phys = entryPt
+        let glideToolbarRaw = proc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: phys.x + 24, y: phys.y), deltaX: 24, deltaY: 0, timestamp: 1.02),
+            mapping: mapping
+        )
+        let glideToolbar = try #require(glideToolbarRaw)
+        #expect(glideToolbar.interactionMode == .directChrome)
+        #expect(glideToolbar.rewrittenEventLocation == nil, "Inside toolbar, events must pass 1:1 natively without source remapping!")
+        #expect(glideToolbar.warpTarget == nil)
+        #expect(abs(glideToolbar.scaledCGPosition.x - (entryPt.x + 24.0)) < 0.01)
+
+        // 3. Click toolbar button (`leftMouseDown` -> `leftMouseUp`): lands at exact screen button point, NOT sourceRect!
+        let buttonPt = CGPoint(x: entryPt.x + 24, y: entryPt.y)
+        let clickDownRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: buttonPt, deltaX: 0, deltaY: 0, timestamp: 1.04),
+            mapping: mapping
+        )
+        let clickDown = try #require(clickDownRaw)
+        #expect(clickDown.interactionMode == .directChrome)
+        #expect(clickDown.rewrittenEventLocation == nil)
+        #expect(clickDown.effectiveSourcePoint == buttonPt)
+
+        let clickUpRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: buttonPt, deltaX: 0, deltaY: 0, timestamp: 1.06),
+            mapping: mapping
+        )
+        let clickUp = try #require(clickUpRaw)
+        #expect(clickUp.interactionMode == .directChrome)
+        #expect(clickUp.rewrittenEventLocation == nil)
+
+        // 4. Move DOWN off the toolbar (`y = 110`, outside `toolbarCG.maxY = 84`): seamlessly resumes `.scaled`!
+        let exitPt = CGPoint(x: buttonPt.x, y: 110)
+        let exitDecRaw = proc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: exitPt, deltaX: 0, deltaY: 45, timestamp: 1.08),
+            mapping: mapping
+        )
+        let exitDec = try #require(exitDecRaw)
+        #expect(exitDec.interactionMode == .scaled)
+        #expect(exitDec.isScaledSpriteVisible)
+        let expectedReentrySrc = mapping.constrainSourcePoint(mapping.mapScaledToSource(exitPt, clampToSource: true)).point
+        #expect(abs(exitDec.effectiveSourcePoint.x - expectedReentrySrc.x) < 0.05)
+        #expect(abs(exitDec.effectiveSourcePoint.y - expectedReentrySrc.y) < 0.05)
+        #expect(abs(exitDec.scaledCGPosition.x - exitPt.x) < 0.5)
+        #expect(abs(exitDec.scaledCGPosition.y - exitPt.y) < 0.5)
+
+        // 5. Stationary click directly over newly revealed chrome (while hidden physical cursor is drifted far away!):
+        //    Click #1 MUST warp to exact visual chrome point AND flag `shouldRepostAfterWarp == true`!
+        let hudClickVisual = CGPoint(x: profilerCG.midX, y: profilerCG.midY)
+        let hudClickSrc = mapping.mapScaledToSource(hudClickVisual, clampToSource: true)
+        proc.reset(initialSourcePosition: hudClickSrc, physicalLocation: CGPoint(x: 900, y: 700))
+        let firstClickHUDRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: CGPoint(x: 900, y: 700), deltaX: 0, deltaY: 0, timestamp: 2.0),
+            mapping: mapping
+        )
+        let firstClickHUD = try #require(firstClickHUDRaw)
+        #expect(firstClickHUD.interactionMode == .directChrome)
+        #expect(firstClickHUD.shouldRepostAfterWarp, "Click #1 onto toolbar/HUD when physical cursor drifted must repost after warp!")
+        #expect(profilerCG.contains(try #require(firstClickHUD.warpTarget)))
+        #expect(profilerCG.contains(try #require(firstClickHUD.rewrittenEventLocation)))
+        #expect(proc.activeChromeDrag)
+
+        // 6. Dragging Profiler HUD across screen (starting from warped HUD click point and moving far outside
+        //    initial `profilerCG` rect!) MUST stay in `.directChrome` until `leftMouseUp`!
+        let dragStep1 = CGPoint(x: hudClickVisual.x + 100, y: hudClickVisual.y + 80)
+        _ = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDragged, location: dragStep1, deltaX: 100, deltaY: 80, timestamp: 2.02),
+            mapping: mapping
+        )
+        let dragMidPt = CGPoint(x: 620, y: 420) // Far outside initial `profilerCG`!
+        let dragHUDRaw = proc.process(
+            input: CursorTapEventInput(
+                type: .leftMouseDragged,
+                location: dragMidPt,
+                deltaX: Double(dragMidPt.x - dragStep1.x),
+                deltaY: Double(dragMidPt.y - dragStep1.y),
+                timestamp: 2.04
+            ),
+            mapping: mapping
+        )
+        let dragHUD = try #require(dragHUDRaw)
+        #expect(dragHUD.interactionMode == .directChrome, "Active Profiler HUD drag must stay in directChrome even ahead of panel frame update!")
+        #expect(!dragHUD.isScaledSpriteVisible)
+        #expect(dragHUD.rewrittenEventLocation == nil)
+
+        let dragUpRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: dragMidPt, deltaX: 0, deltaY: 0, timestamp: 2.08),
+            mapping: mapping
+        )
+        let dragUp = try #require(dragUpRaw)
+        #expect(dragUp.interactionMode == .directChrome)
+        #expect(!proc.activeChromeDrag)
+
+        // Next move outside chrome cleanly resumes `.scaled`!
+        let afterHudDragRaw = proc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 624, y: 424), deltaX: 4, deltaY: 4, timestamp: 2.10),
+            mapping: mapping
+        )
+        let afterHudDrag = try #require(afterHudDragRaw)
+        #expect(afterHudDrag.interactionMode == .scaled)
+        #expect(afterHudDrag.isScaledSpriteVisible)
+
+        // 7. Letterboxed Fit mode: toolbar sitting inside top black letterbox bar (`contentRect.minY = 66`, `toolbar.maxY = 52`)
+        //    is STILL reachable by pushing upward past top of content!
+        let letterboxMapping = PointerMapping(
+            sourceRect: CGRect(x: 100, y: 100, width: 640, height: 360),
+            contentRect: CGRect(x: 0, y: 66, width: 1512, height: 850),
+            overlayRect: CGRect(x: 0, y: 0, width: 1512, height: 981),
+            displays: [Self.primaryRetina],
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
+        )
+        let letterboxToolbar = CGRect(x: 546, y: 10, width: 420, height: 42)
+        var lbProc = CursorEventTapProcessor()
+        lbProc.interactiveChromeRects = [letterboxToolbar]
+        let lbTopSrc = CGPoint(x: 420, y: letterboxMapping.confinementRect.minY)
+        lbProc.reset(initialSourcePosition: lbTopSrc, physicalLocation: CGPoint(x: 756, y: 400))
+        // Push up 20pt past content top (`66 - 20 = 46` -> lands right inside `letterboxToolbar` `[10..52]`!)
+        let lbEnterRaw = lbProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 756, y: 380), deltaX: 0, deltaY: -20, timestamp: 3.0),
+            mapping: letterboxMapping
+        )
+        let lbEnter = try #require(lbEnterRaw)
+        #expect(lbEnter.interactionMode == .directChrome)
+        #expect(letterboxToolbar.contains(try #require(lbEnter.warpTarget)))
+    }
+
+    // MARK: 13. Regression (Bug #2B): Windowed Mode Outside-Overlay Escape & Fullscreen Top Menu Bar Passthrough
+
+    @Test("Windowed mode escapes smoothly outside overlayRect to macOS Menu Bar/Desktop and re-enters cleanly; Fullscreen mode enters Menu Bar passthrough on upward top-edge push while 3D Game Mode stays strictly confined")
+    func windowedOutsideOverlayAndFullscreenMenuBarPassthrough() throws {
+        let sourceCG = CGRect(x: 120, y: 140, width: 680, height: 440)
+        let windowedOverlayCG = CGRect(x: 246, y: 160, width: 1020, height: 660) // 1.5x windowed
+
+        // --- A. Windowed Mode (`setPresentationIsWindowed(true)`) ---
+        let winMapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: windowedOverlayCG,
+            overlayRect: windowedOverlayCG,
+            displays: Self.triMonitorDisplays,
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true),
+            threeDGameMode: false
+        )
+
+        var winProc = CursorEventTapProcessor()
+        winProc.isPresentationWindowed = true
+        let nearTopScaled = CGPoint(x: 600, y: 166) // 6pt below windowed overlay top edge (`y = 160`)
+        let nearTopSrc = winMapping.mapScaledToSource(nearTopScaled, clampToSource: true)
+        var winPhys = CGPoint(x: 500, y: 400)
+        winProc.reset(initialSourcePosition: nearTopSrc, physicalLocation: winPhys)
+
+        // Push UP 12pt past `overlayRect.minY = 160` -> escapes cleanly to `.outsideWindowedOverlay`!
+        winPhys.y -= 12.0
+        let escapeUpRaw = winProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: winPhys, deltaX: 0, deltaY: -12, timestamp: 1.0),
+            mapping: winMapping
+        )
+        let escapeUp = try #require(escapeUpRaw)
+        #expect(escapeUp.interactionMode == .outsideWindowedOverlay)
+        #expect(!escapeUp.isScaledSpriteVisible)
+        let exitPt = try #require(escapeUp.warpTarget)
+        #expect(!windowedOverlayCG.contains(exitPt), "Windowed escape warp must land outside overlayRect")
+        #expect(exitPt.y < windowedOverlayCG.minY)
+
+        // Move up to macOS Menu Bar `(600, 12)` and click -> 1:1 native passthrough!
+        let menuMoveRaw = winProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 600, y: 12), deltaX: 0, deltaY: -140, timestamp: 1.05),
+            mapping: winMapping
+        )
+        let menuMove = try #require(menuMoveRaw)
+        #expect(menuMove.interactionMode == .outsideWindowedOverlay)
+        #expect(menuMove.rewrittenEventLocation == nil)
+        #expect(menuMove.warpTarget == nil)
+
+        let menuClickRaw = winProc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: CGPoint(x: 600, y: 12), deltaX: 0, deltaY: 0, timestamp: 1.06),
+            mapping: winMapping
+        )
+        let menuClick = try #require(menuClickRaw)
+        #expect(menuClick.interactionMode == .outsideWindowedOverlay)
+        #expect(menuClick.rewrittenEventLocation == nil)
+
+        // While external mouse button is held (e.g. dragging another app window across overlayRect), MUST NOT hijack into `.scaled`!
+        let externalDragAcrossRaw = winProc.process(
+            input: CursorTapEventInput(type: .leftMouseDragged, location: CGPoint(x: 600, y: 300), deltaX: 0, deltaY: 288, timestamp: 1.08),
+            mapping: winMapping
+        )
+        let externalDragAcross = try #require(externalDragAcrossRaw)
+        #expect(externalDragAcross.interactionMode == .outsideWindowedOverlay, "Dragging an external window across windowed overlay must not hijack drag!")
+        _ = winProc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: CGPoint(x: 600, y: 120), deltaX: 0, deltaY: -180, timestamp: 1.10),
+            mapping: winMapping
+        )
+
+        // Move freely back into `overlayRect` at `(600, 220)` -> cleanly re-enters `.scaled` at exact `mapScaledToSource`!
+        let reentryPt = CGPoint(x: 600, y: 220)
+        let reenterRaw = winProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: reentryPt, deltaX: 0, deltaY: 100, timestamp: 1.12),
+            mapping: winMapping
+        )
+        let reenter = try #require(reenterRaw)
+        #expect(reenter.interactionMode == .scaled)
+        #expect(reenter.isScaledSpriteVisible)
+        let expectedSrc = winMapping.constrainSourcePoint(winMapping.mapScaledToSource(reentryPt, clampToSource: true)).point
+        #expect(abs(reenter.effectiveSourcePoint.x - expectedSrc.x) < 0.05)
+        #expect(abs(reenter.effectiveSourcePoint.y - expectedSrc.y) < 0.05)
+
+        // Verify `CursorOverlayController.setPresentationIsWindowed(true)` + `updateInteractiveChromeRects` via EventTapCallbackBox!
+        let controller = CursorOverlayController(presentationMode: .externalCompositor)
+        defer { controller.stop() }
+        controller.setPresentationIsWindowed(true)
+        controller.updateInteractiveChromeRects([CGRect(x: 546, y: 170, width: 420, height: 42)])
+        controller.activateForEventTapTesting(
+            configuration: CursorMappingConfiguration(
+                sourceCGRect: sourceCG,
+                destinationCGRect: windowedOverlayCG,
+                overlayCGRect: windowedOverlayCG,
+                backingScaleFactor: 2.0,
+                settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
+            ),
+            displays: Self.triMonitorDisplays,
+            initialPointer: nearTopSrc
+        )
+        let box = EventTapCallbackBox(controller: controller)
+        let dummyProxy = OpaquePointer(bitPattern: 0x1000)!
+        let evMoveOut = try #require(CGEvent(
+            mouseEventSource: nil,
+            mouseType: .mouseMoved,
+            mouseCursorPosition: CGPoint(x: nearTopSrc.x, y: nearTopSrc.y - 25),
+            mouseButton: .left
+        ))
+        _ = box.invoke(proxy: dummyProxy, type: .mouseMoved, event: evMoveOut)
+        #expect(!controller.currentState.isVisible, "Escaping windowed overlay via controller API must hide scaled sprite!")
+        #expect(controller.currentState.scaledCGPosition.y < windowedOverlayCG.minY)
+
+        // --- B. Fullscreen Mode Top Menu Bar Passthrough (Primary 37pt notch & External DELL Negative-CG-Y 25pt!) ---
+        let fsOverlayCG = CGRect(x: 0, y: 0, width: 1512, height: 981)
+        let fsMapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: fsOverlayCG,
+            overlayRect: fsOverlayCG,
+            displays: Self.triMonitorDisplays,
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true),
+            threeDGameMode: false
+        )
+        var fsProc = CursorEventTapProcessor()
+        fsProc.isPresentationWindowed = false
+        fsProc.displayMenuBarHeights = [Self.primaryRetina.id: 37.0, Self.externalDELLNegativeCGY.id: 25.0]
+        let topEdgeSrc = CGPoint(x: 400, y: fsMapping.confinementRect.minY)
+        fsProc.reset(initialSourcePosition: topEdgeSrc, physicalLocation: CGPoint(x: 500, y: 300))
+
+        // Hovering near top inside scaled app (moving horizontally) MUST stay in `.scaled` (app tabs remain clickable!).
+        let stayScaledRaw = fsProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 510, y: 300), deltaX: 10, deltaY: 0, timestamp: 10.0),
+            mapping: fsMapping
+        )
+        let stayScaled = try #require(stayScaledRaw)
+        #expect(stayScaled.interactionMode == .scaled)
+        #expect(stayScaled.isScaledSpriteVisible)
+
+        // Pushing upward >= 6pt at top edge enters `.menuBarPassthrough` at `(scaledX, minY + 12)`!
+        let pushMenuRaw = fsProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 510, y: 290), deltaX: 0, deltaY: -10, timestamp: 10.02),
+            mapping: fsMapping
+        )
+        let pushMenu = try #require(pushMenuRaw)
+        #expect(pushMenu.interactionMode == .menuBarPassthrough)
+        #expect(!pushMenu.isScaledSpriteVisible)
+        let menuEntry = try #require(pushMenu.warpTarget)
+        #expect(abs(menuEntry.y - 12.0) < 0.5, "Fullscreen menu-bar passthrough must warp to display.minY + 12")
+
+        // Click Apple/App menu item at `(menuEntry.x, 12)` -> opens dropdown (`menuBarDropdownActive == true`)!
+        let mbDownRaw = fsProc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: menuEntry, deltaX: 0, deltaY: 0, timestamp: 10.05),
+            mapping: fsMapping
+        )
+        let mbDown = try #require(mbDownRaw)
+        #expect(mbDown.interactionMode == .menuBarPassthrough)
+        #expect(mbDown.rewrittenEventLocation == nil)
+        let mbUpRaw = fsProc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: menuEntry, deltaX: 0, deltaY: 0, timestamp: 10.07),
+            mapping: fsMapping
+        )
+        let mbUp = try #require(mbUpRaw)
+        #expect(mbUp.interactionMode == .menuBarPassthrough)
+        #expect(fsProc.menuBarDropdownActive, "Clicking inside menu bar must keep passthrough active while dropdown is open!")
+
+        // Move DOWN to `y = 180` inside the open dropdown menu -> MUST STAY in `.menuBarPassthrough` 1:1 untouched!
+        let browseDropdownRaw = fsProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: menuEntry.x, y: 180), deltaX: 0, deltaY: 168, timestamp: 10.10),
+            mapping: fsMapping
+        )
+        let browseDropdown = try #require(browseDropdownRaw)
+        #expect(browseDropdown.interactionMode == .menuBarPassthrough)
+        #expect(browseDropdown.rewrittenEventLocation == nil)
+        #expect(!browseDropdown.isScaledSpriteVisible)
+
+        // Click dropdown item at `y = 180` -> releases dropdown on mouseUp, then next move below menu bar resumes `.scaled`!
+        _ = fsProc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: CGPoint(x: menuEntry.x, y: 180), deltaX: 0, deltaY: 0, timestamp: 10.12),
+            mapping: fsMapping
+        )
+        _ = fsProc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: CGPoint(x: menuEntry.x, y: 180), deltaX: 0, deltaY: 0, timestamp: 10.14),
+            mapping: fsMapping
+        )
+        #expect(!fsProc.menuBarDropdownActive)
+
+        let backToScaledRaw = fsProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: menuEntry.x, y: 185), deltaX: 0, deltaY: 5, timestamp: 10.16),
+            mapping: fsMapping
+        )
+        let backToScaled = try #require(backToScaledRaw)
+        #expect(backToScaled.interactionMode == .scaled)
+        #expect(backToScaled.isScaledSpriteVisible)
+
+        // External DELL negative-CG-Y (`minY = -720`, menu bar height = 25pt): enters menu bar at `y = -720 + 12 = -708`!
+        let dellSource = CGRect(x: 1620, y: -620, width: 680, height: 440)
+        let dellOverlay = CGRect(x: 1512, y: -720, width: 1280, height: 719)
+        let dellMapping = PointerMapping(
+            sourceRect: dellSource,
+            contentRect: dellOverlay,
+            overlayRect: dellOverlay,
+            displays: Self.triMonitorDisplays,
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true)
+        )
+        var dellProc = CursorEventTapProcessor()
+        dellProc.displayMenuBarHeights = [Self.externalDELLNegativeCGY.id: 25.0]
+        dellProc.reset(
+            initialSourcePosition: CGPoint(x: 1960, y: dellMapping.confinementRect.minY),
+            physicalLocation: CGPoint(x: 2000, y: -400)
+        )
+        let dellPushRaw = dellProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 2000, y: -410), deltaX: 0, deltaY: -10, timestamp: 20.0),
+            mapping: dellMapping
+        )
+        let dellPush = try #require(dellPushRaw)
+        #expect(dellPush.interactionMode == .menuBarPassthrough)
+        #expect(abs((try #require(dellPush.warpTarget)).y - (-708.0)) < 0.5)
+
+        // --- C. 3D Game Mode MUST stay strictly confined (no windowed escape, no menu-bar passthrough!) ---
+        let game3DMapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: fsOverlayCG,
+            overlayRect: fsOverlayCG,
+            displays: Self.triMonitorDisplays,
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true),
+            threeDGameMode: true
+        )
+        var gameProc = CursorEventTapProcessor()
+        gameProc.isPresentationWindowed = true // Even if windowed flag is set, 3D Game Mode locks strictly!
+        gameProc.reset(
+            initialSourcePosition: CGPoint(x: 400, y: game3DMapping.confinementRect.minY),
+            physicalLocation: CGPoint(x: 400, y: game3DMapping.confinementRect.minY)
+        )
+        let gamePushRaw = gameProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 400, y: game3DMapping.confinementRect.minY - 40), deltaX: 0, deltaY: -40, timestamp: 30.0),
+            mapping: game3DMapping
+        )
+        let gamePush = try #require(gamePushRaw)
+        #expect(gamePush.interactionMode == .scaled, "3D Game Mode must stay strictly confined and never escape to Menu Bar or desktop!")
+        #expect(sourceCG.contains(gamePush.effectiveSourcePoint))
+    }
+
+    // MARK: 14. Regression (Bug #5): Window Edge Resize Dragging (Inward & Outward) & Titlebar Drag
+
+    @Test("Window border-resize and titlebar drags move freely BOTH inward and outward past old sourceRect with live physical cursor sync and zero snap-back on mouseUp")
+    func windowBorderResizeInwardOutwardAndTitlebarDrag() throws {
+        let sourceCG = CGRect(x: 200, y: 160, width: 600, height: 400) // x: [200..800], y: [160..560]
+        let overlayCG = CGRect(x: 0, y: 0, width: 1512, height: 981)
+        let mapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: overlayCG,
+            overlayRect: overlayCG,
+            displays: [Self.primaryRetina],
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true),
+            threeDGameMode: false
+        )
+
+        // Verify border/titlebar zone helper accuracy.
+        #expect(mapping.isPointInWindowResizeOrTitlebarZone(CGPoint(x: 798, y: 360))) // Right border (2pt)
+        #expect(mapping.isPointInWindowResizeOrTitlebarZone(CGPoint(x: 203, y: 360))) // Left border (3pt)
+        #expect(mapping.isPointInWindowResizeOrTitlebarZone(CGPoint(x: 500, y: 557))) // Bottom border (3pt)
+        #expect(mapping.isPointInWindowResizeOrTitlebarZone(CGPoint(x: 500, y: 185))) // Titlebar band (25pt < 32pt)
+        #expect(!mapping.isPointInWindowResizeOrTitlebarZone(CGPoint(x: 500, y: 360))) // Interior content!
+
+        // --- A. Outward Right-Border Resize Drag (`adjustCursorSpeed == true`) ---
+        var proc = CursorEventTapProcessor()
+        let rightEdgeGrab = CGPoint(x: 798, y: 360) // 2pt inside right edge of `sourceCG`
+        proc.reset(initialSourcePosition: rightEdgeGrab, physicalLocation: rightEdgeGrab)
+
+        let downDecRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: rightEdgeGrab, deltaX: 0, deltaY: 0, timestamp: 1.0),
+            mapping: mapping
+        )
+        let downDec = try #require(downDecRaw)
+        #expect(proc.activeWindowBorderDrag, "Grabbing within 6pt of window edge must arm activeWindowBorderDrag")
+        #expect(downDec.effectiveSourcePoint == rightEdgeGrab)
+
+        var phys = rightEdgeGrab
+        var t = 1.02
+        var syncWarpsDuringOutward = 0
+        var lastOutward: CursorTapEventDecision?
+        // Drag 300pt right (outward past `sourceCG.maxX = 800`!).
+        for _ in 0..<15 {
+            phys.x += 20.0
+            let decRaw = proc.process(
+                input: CursorTapEventInput(type: .leftMouseDragged, location: phys, deltaX: 20, deltaY: 0, timestamp: t),
+                mapping: mapping
+            )
+            let dec = try #require(decRaw)
+            if let wt = dec.warpTarget {
+                syncWarpsDuringOutward += 1
+                phys = wt // Simulate OS cursor warping to synced resize target!
+            }
+            lastOutward = dec
+            t += 0.016
+        }
+        let finalOutward = try #require(lastOutward)
+        #expect(finalOutward.effectiveSourcePoint.x > sourceCG.maxX + 100.0,
+                "Outward border resize drag MUST NOT clamp to old sourceRect.maxX (\(sourceCG.maxX)); got \(finalOutward.effectiveSourcePoint.x)")
+        #expect(syncWarpsDuringOutward > 0,
+                "Outward border resize drag MUST sync physical OS cursor so macOS WindowServer resize loop tracks smoothly!")
+
+        // Release mouse button: `leftMouseUp` MUST preserve the outward coordinate (never snap back inside old sourceRect!).
+        let outwardUpRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: phys, deltaX: 0, deltaY: 0, timestamp: t + 0.02),
+            mapping: mapping
+        )
+        let outwardUp = try #require(outwardUpRaw)
+        #expect(outwardUp.effectiveSourcePoint.x > sourceCG.maxX + 100.0,
+                "leftMouseUp must commit the outward border coordinate rather than snapping back to old sourceRect!")
+        #expect(!proc.activeWindowBorderDrag, "activeWindowBorderDrag must clear on leftMouseUp")
+
+        // --- B. Inward Right-Border Resize Drag (`adjustCursorSpeed == true`) ---
+        proc.reset(initialSourcePosition: rightEdgeGrab, physicalLocation: rightEdgeGrab)
+        _ = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: rightEdgeGrab, deltaX: 0, deltaY: 0, timestamp: 5.0),
+            mapping: mapping
+        )
+        #expect(proc.activeWindowBorderDrag)
+        phys = rightEdgeGrab
+        t = 5.02
+        var syncWarpsDuringInward = 0
+        var lastInward: CursorTapEventDecision?
+        for _ in 0..<12 {
+            phys.x -= 20.0
+            let decRaw = proc.process(
+                input: CursorTapEventInput(type: .leftMouseDragged, location: phys, deltaX: -20, deltaY: 0, timestamp: t),
+                mapping: mapping
+            )
+            let dec = try #require(decRaw)
+            if let wt = dec.warpTarget {
+                syncWarpsDuringInward += 1
+                phys = wt
+            }
+            lastInward = dec
+            t += 0.016
+        }
+        let finalInward = try #require(lastInward)
+        #expect(finalInward.effectiveSourcePoint.x < rightEdgeGrab.x - 80.0,
+                "Inward border resize drag must move smoothly inward; got \(finalInward.effectiveSourcePoint.x)")
+        #expect(syncWarpsDuringInward > 0, "Inward border resize drag must keep physical OS cursor synced!")
+        _ = proc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: phys, deltaX: 0, deltaY: 0, timestamp: t + 0.02),
+            mapping: mapping
+        )
+        #expect(!proc.activeWindowBorderDrag)
+
+        // --- C. Outward Left-Border & Titlebar Move Drag (clamped only to display bounds, never old sourceRect!) ---
+        let titlebarGrab = CGPoint(x: 450, y: 175) // 15pt from top edge (titlebar band)
+        proc.reset(initialSourcePosition: titlebarGrab, physicalLocation: titlebarGrab)
+        _ = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: titlebarGrab, deltaX: 0, deltaY: 0, timestamp: 10.0),
+            mapping: mapping
+        )
+        #expect(proc.activeWindowBorderDrag, "Titlebar drag must also arm activeWindowBorderDrag")
+        // Drag far beyond left & top of old `sourceCG` (past x=200 and y=160), verifying display clamping only!
+        let dragFarOutRaw = proc.process(
+            input: CursorTapEventInput(type: .leftMouseDragged, location: CGPoint(x: 50, y: 20), deltaX: -400, deltaY: -155, timestamp: 10.02),
+            mapping: mapping
+        )
+        let dragFarOut = try #require(dragFarOutRaw)
+        #expect(dragFarOut.effectiveSourcePoint.y < sourceCG.minY, "Titlebar drag must move freely above old sourceRect.minY")
+        #expect(Self.primaryRetina.cgBounds.contains(dragFarOut.effectiveSourcePoint), "Border/titlebar drag must stay within host display bounds")
+
+        // --- D. Outward Border Resize Drag with `adjustCursorSpeed == false` also bypasses old sourceRect clamp! ---
+        let uncompMapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: overlayCG,
+            overlayRect: overlayCG,
+            displays: [Self.primaryRetina],
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: false),
+            threeDGameMode: false
+        )
+        var uncompProc = CursorEventTapProcessor()
+        uncompProc.reset(initialSourcePosition: rightEdgeGrab, physicalLocation: rightEdgeGrab)
+        _ = uncompProc.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: rightEdgeGrab, deltaX: 0, deltaY: 0, timestamp: 20.0),
+            mapping: uncompMapping
+        )
+        #expect(uncompProc.activeWindowBorderDrag)
+        let uncompOutRaw = uncompProc.process(
+            input: CursorTapEventInput(type: .leftMouseDragged, location: CGPoint(x: 960, y: 360), deltaX: 162, deltaY: 0, timestamp: 20.02),
+            mapping: uncompMapping
+        )
+        let uncompOut = try #require(uncompOutRaw)
+        #expect(uncompOut.effectiveSourcePoint.x == 960.0)
+        _ = uncompProc.process(
+            input: CursorTapEventInput(type: .leftMouseUp, location: CGPoint(x: 960, y: 360), deltaX: 0, deltaY: 0, timestamp: 20.04),
+            mapping: uncompMapping
+        )
+        #expect(!uncompProc.activeWindowBorderDrag)
+    }
+
+    // MARK: 15. Regression (Bug #1): WindowLifecycleWatcher Fullscreen Video Selection & Replacement Helper
+
+    @Test("WindowLifecycleWatcher.selectFrontmostWindow prefers display-covering fullscreen video window over higher z-order layer-0 helper bars, and findFullscreenReplacementWindow locates newly created HTML5/native fullscreen windows")
+    func windowLifecycleFullscreenVideoSelectionAndReplacementHelper() throws {
+        let displays = [Self.primaryRetina, Self.externalDELLNegativeCGY]
+        let safariPID: Int32 = 4242
+
+        // Scenario A: Safari HTML5 video fullscreen — tiny layer-0 media-control bar sits HIGHER in z-order
+        // than the display-covering fullscreen video window!
+        let safariHelperBar = RawWindowSnapshot(
+            windowID: 5001,
+            pid: safariPID,
+            ownerName: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            title: "Media Controls",
+            cgBounds: CGRect(x: 556, y: 890, width: 400, height: 72),
+            layer: 0
+        )
+        let safariFullscreenVideo = RawWindowSnapshot(
+            windowID: 5002,
+            pid: safariPID,
+            ownerName: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            title: "YouTube — Fullscreen",
+            cgBounds: Self.primaryRetina.cgBounds, // 1512x982 display-covering!
+            layer: 0
+        )
+        let safariDesktopTab = RawWindowSnapshot(
+            windowID: 5000,
+            pid: safariPID,
+            ownerName: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            title: "YouTube",
+            cgBounds: CGRect(x: 100, y: 100, width: 1100, height: 700),
+            layer: 0
+        )
+
+        let pickedFullscreen = WindowLifecycleWatcher.selectFrontmostWindow(
+            forPID: safariPID,
+            from: [safariHelperBar, safariFullscreenVideo, safariDesktopTab],
+            displays: displays
+        )
+        #expect(pickedFullscreen?.windowID == 5002,
+                "selectFrontmostWindow MUST prefer display-covering fullscreen video window (5002) over smaller layer-0 helper bar (5001)!")
+
+        // Scenario B: Raised-layer fullscreen player (e.g., IINA / VLC / Wine at layer > 0) behind a layer-0 helper bar!
+        let iinaPID: Int32 = 5151
+        let iinaOSCBar = RawWindowSnapshot(
+            windowID: 6001,
+            pid: iinaPID,
+            ownerName: "IINA",
+            bundleIdentifier: "com.colliderli.iina",
+            title: "OSC",
+            cgBounds: CGRect(x: 400, y: 860, width: 700, height: 90),
+            layer: 0
+        )
+        let iinaFullscreenRaised = RawWindowSnapshot(
+            windowID: 6002,
+            pid: iinaPID,
+            ownerName: "IINA",
+            bundleIdentifier: "com.colliderli.iina",
+            title: "Movie.mkv",
+            cgBounds: Self.primaryRetina.cgBounds,
+            layer: 24
+        )
+        let pickedIINA = WindowLifecycleWatcher.selectFrontmostWindow(
+            forPID: iinaPID,
+            from: [iinaOSCBar, iinaFullscreenRaised],
+            displays: displays
+        )
+        #expect(pickedIINA?.windowID == 6002,
+                "selectFrontmostWindow MUST prefer display-covering raised fullscreen window (6002) over layer-0 OSC bar (6001)!")
+
+        // Scenario C: Non-fullscreen desktop app with tiny layer-0 helper bar (120x80) ahead of substantial main window (900x600).
+        let appPID: Int32 = 6262
+        let tinyBar = RawWindowSnapshot(
+            windowID: 7001,
+            pid: appPID,
+            ownerName: "Chrome",
+            bundleIdentifier: "com.google.Chrome",
+            title: "Status Bubble",
+            cgBounds: CGRect(x: 100, y: 760, width: 160, height: 70),
+            layer: 0
+        )
+        let mainWin = RawWindowSnapshot(
+            windowID: 7002,
+            pid: appPID,
+            ownerName: "Chrome",
+            bundleIdentifier: "com.google.Chrome",
+            title: "Main Browser Window",
+            cgBounds: CGRect(x: 100, y: 100, width: 1000, height: 680),
+            layer: 0
+        )
+        let pickedSubstantial = WindowLifecycleWatcher.selectFrontmostWindow(
+            forPID: appPID,
+            from: [tinyBar, mainWin],
+            displays: displays
+        )
+        #expect(pickedSubstantial?.windowID == 7002,
+                "selectFrontmostWindow MUST prefer substantial (>=200x150) layer-0 window over tiny 64x64 helper bar!")
+
+        // Scenario D: `findFullscreenReplacementWindow(forPID:excluding:from:displays:)` locates the new HTML5
+        // fullscreen window (5002), excluding old desktop window (5000) and ignoring helper bars & other PIDs!
+        let otherAppFullscreen = RawWindowSnapshot(
+            windowID: 9999,
+            pid: 9999,
+            ownerName: "OtherApp",
+            cgBounds: Self.primaryRetina.cgBounds,
+            layer: 0
+        )
+        let replacement = WindowLifecycleWatcher.findFullscreenReplacementWindow(
+            forPID: safariPID,
+            excluding: 5000,
+            from: [otherAppFullscreen, safariHelperBar, safariDesktopTab, safariFullscreenVideo],
+            displays: displays
+        )
+        #expect(replacement?.windowID == 5002)
+
+        // Excluding `5002` itself must return nil when no other fullscreen window exists for `safariPID`.
+        let noReplacement = WindowLifecycleWatcher.findFullscreenReplacementWindow(
+            forPID: safariPID,
+            excluding: 5002,
+            from: [otherAppFullscreen, safariHelperBar, safariDesktopTab, safariFullscreenVideo],
+            displays: displays
+        )
+        #expect(noReplacement == nil)
+
+        // Notch-inset macOS native fullscreen window `(0, 37, 1512, 945)` is also detected cleanly by replacement helper!
+        let notchFullscreen = RawWindowSnapshot(
+            windowID: 5003,
+            pid: safariPID,
+            ownerName: "Safari",
+            bundleIdentifier: "com.apple.Safari",
+            title: "Fullscreen Video (Below Notch)",
+            cgBounds: CGRect(x: 0, y: 37, width: 1512, height: 945),
+            layer: 0
+        )
+        let notchReplacement = WindowLifecycleWatcher.findFullscreenReplacementWindow(
+            forPID: safariPID,
+            excluding: 5000,
+            from: [safariHelperBar, safariDesktopTab, notchFullscreen],
+            displays: displays
+        )
+        #expect(notchReplacement?.windowID == 5003)
+    }
 }

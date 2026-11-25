@@ -543,8 +543,11 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
         return results
     }
 
-    /// Selects the frontmost capturable window for `pid` (preserving z-order from `snapshots`),
-    /// preferring layer-0 windows `>= 64×64` and falling back to Wine raised display-filling windows.
+    /// Selects the frontmost capturable window for `pid` (preserving z-order from `snapshots`):
+    /// 1. Prefers any display-covering fullscreen window (`layer == 0` OR raised `layer > 0`; largest area if multiple)
+    ///    so tiny Safari/Chrome/IINA media-control/HUD helper bars never shadow the real fullscreen video window.
+    /// 2. Otherwise prefers the topmost substantial `layer == 0` window (`>= 200x150`) over tiny helper bars.
+    /// 3. Falls back to the topmost `layer == 0` window meeting `minimumDimension`.
     public static func selectFrontmostWindow(
         forPID pid: Int32,
         from snapshots: [RawWindowSnapshot],
@@ -561,7 +564,39 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
                 $0.cgBounds.height >= minimumDimension
         }
 
-        // 1. Prefer topmost normal layer-0 window.
+        // 1. Prefer any display-covering fullscreen window (layer == 0 OR raised layer > 0;
+        //    largest area wins if multiple, preserving frontmost z-order on area ties).
+        var bestFullscreen: RawWindowSnapshot?
+        var bestFullscreenArea: CGFloat = -1
+        for snap in pidSnapshots where snap.layer >= 0 && isDisplayFillingWindow(snap.cgBounds, displays: displays) {
+            let area = snap.cgBounds.width * snap.cgBounds.height
+            if area > bestFullscreenArea {
+                bestFullscreen = snap
+                bestFullscreenArea = area
+            }
+        }
+        if let fullscreen = bestFullscreen {
+            return makeDescriptor(
+                from: fullscreen,
+                displays: displays,
+                excludedBundleIDs: excludedBundleIDs,
+                ownPID: ownPID
+            )
+        }
+
+        // 2. Prefer topmost substantial normal layer-0 window (>= 200x150) over tiny 64x64 helper bars.
+        if let substantialNormal = pidSnapshots.first(where: {
+            $0.layer == 0 && $0.cgBounds.width >= 200.0 && $0.cgBounds.height >= 150.0
+        }) {
+            return makeDescriptor(
+                from: substantialNormal,
+                displays: displays,
+                excludedBundleIDs: excludedBundleIDs,
+                ownPID: ownPID
+            )
+        }
+
+        // 3. Fallback: topmost normal layer-0 window meeting `minimumDimension`.
         if let normal = pidSnapshots.first(where: { $0.layer == 0 }) {
             return makeDescriptor(
                 from: normal,
@@ -571,17 +606,95 @@ public final class WindowLifecycleWatcher: WindowTracking, @unchecked Sendable {
             )
         }
 
-        // 2. Fallback: topmost Wine/CrossOver raised borderless fullscreen window covering a display.
-        if let raised = pidSnapshots.first(where: { $0.layer > 0 && isDisplayFillingWindow($0.cgBounds, displays: displays) }) {
-            return makeDescriptor(
-                from: raised,
-                displays: displays,
-                excludedBundleIDs: excludedBundleIDs,
-                ownPID: ownPID
-            )
+        return nil
+    }
+
+    /// Finds a newly opened display-covering fullscreen window owned by `pid` (e.g. Safari/Chrome
+    /// HTML5 video fullscreen or IINA/VLC native fullscreen) to seamlessly follow when `previousWindowID`
+    /// hides or leaves the desktop Space.
+    public static func findFullscreenReplacementWindow(
+        forPID pid: Int32,
+        excluding previousWindowID: CGWindowID,
+        displays: [DisplayDescriptor]
+    ) -> WindowDescriptor? {
+        let snapshots = fetchOnScreenWindowSnapshots()
+        return findFullscreenReplacementWindow(
+            forPID: pid,
+            excluding: previousWindowID,
+            from: snapshots,
+            displays: displays
+        )
+    }
+
+    /// Pure, unit-testable helper locating a display-covering fullscreen replacement window owned by
+    /// `pid` (excluding `previousWindowID`) from a snapshot list.
+    public static func findFullscreenReplacementWindow(
+        forPID pid: Int32,
+        excluding previousWindowID: CGWindowID,
+        from snapshots: [RawWindowSnapshot],
+        displays: [DisplayDescriptor],
+        excludedBundleIDs: [String] = AppConfig.defaultAutoScaleExcludedBundleIDs,
+        ownPID: Int32 = ProcessInfo.processInfo.processIdentifier
+    ) -> WindowDescriptor? {
+        guard !displays.isEmpty else { return nil }
+
+        // Pass 1: Strict full-display covering window (layer == 0 or raised layer > 0).
+        var bestStrict: RawWindowSnapshot?
+        var bestStrictArea: CGFloat = -1
+        // Pass 2 fallback: macOS native fullscreen window sitting strictly below a notch camera housing
+        // (edge-to-edge horizontally, flush to bottom, top inset <= 44pt).
+        var bestNotchInset: RawWindowSnapshot?
+        var bestNotchInsetArea: CGFloat = -1
+
+        for snap in snapshots {
+            guard snap.pid == pid,
+                  snap.windowID != previousWindowID,
+                  snap.isOnScreen,
+                  snap.alpha > 0.01,
+                  snap.layer >= 0
+            else {
+                continue
+            }
+
+            let area = snap.cgBounds.width * snap.cgBounds.height
+            if isDisplayFillingWindow(snap.cgBounds, displays: displays) {
+                if area > bestStrictArea {
+                    bestStrict = snap
+                    bestStrictArea = area
+                }
+            } else if isNotchInsetFullscreenWindow(snap.cgBounds, displays: displays) {
+                if area > bestNotchInsetArea {
+                    bestNotchInset = snap
+                    bestNotchInsetArea = area
+                }
+            }
         }
 
-        return nil
+        guard let chosen = bestStrict ?? bestNotchInset else { return nil }
+        return makeDescriptor(
+            from: chosen,
+            displays: displays,
+            excludedBundleIDs: excludedBundleIDs,
+            ownPID: ownPID
+        )
+    }
+
+    private static func isNotchInsetFullscreenWindow(
+        _ bounds: CGRect,
+        displays: [DisplayDescriptor]
+    ) -> Bool {
+        let tolerance: CGFloat = 4.0
+        let maxNotchInset: CGFloat = 44.0
+        let normalized = bounds.standardized
+        guard !normalized.isEmpty else { return false }
+        return displays.contains { display in
+            let db = display.cgBounds.standardized
+            return normalized.minX <= db.minX + tolerance &&
+                normalized.maxX >= db.maxX - tolerance &&
+                normalized.maxY >= db.maxY - tolerance &&
+                normalized.minY >= db.minY &&
+                normalized.minY <= db.minY + maxNotchInset
+        }
     }
 
     /// Detects whether any non-popup foreign window above the tracked window overlaps `trackedBounds`

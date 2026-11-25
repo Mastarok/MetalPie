@@ -38,6 +38,16 @@ public enum DuplicateFrameMode: String, Codable, Sendable, CaseIterable, Identif
     public var id: String { rawValue }
 }
 
+/// Input resolution policy for fullscreen video / browser super-resolution pre-downscaling.
+public enum FullscreenVideoInputMode: String, Codable, Sendable, CaseIterable, Identifiable {
+    case auto
+    case p720
+    case p1080
+    case native
+
+    public var id: String { rawValue }
+}
+
 /// Per-profile capture pipeline configuration.
 public struct CaptureSettings: Hashable, Codable, Sendable {
     public var captureMode: CaptureMode
@@ -50,6 +60,8 @@ public struct CaptureSettings: Hashable, Codable, Sendable {
     public var duplicateFrameMode: DuplicateFrameMode
     /// Prefer immediate low-latency presentation over buffered display-link cadence when Frame Gen is off.
     public var lowLatencyPresent: Bool
+    /// Input resolution policy for fullscreen video / browser super-resolution pre-downscaling.
+    public var fullscreenVideoInput: FullscreenVideoInputMode
 
     public init(
         captureMode: CaptureMode = .window,
@@ -59,7 +71,8 @@ public struct CaptureSettings: Hashable, Codable, Sendable {
         dynamicRange: DynamicRangeMode = .sdr,
         frameRateLimit: Int? = nil,
         duplicateFrameMode: DuplicateFrameMode = .dynamic,
-        lowLatencyPresent: Bool = true
+        lowLatencyPresent: Bool = true,
+        fullscreenVideoInput: FullscreenVideoInputMode = .auto
     ) {
         self.captureMode = captureMode
         self.captureTitleBar = captureTitleBar
@@ -73,6 +86,37 @@ public struct CaptureSettings: Hashable, Codable, Sendable {
         }
         self.duplicateFrameMode = duplicateFrameMode
         self.lowLatencyPresent = lowLatencyPresent
+        self.fullscreenVideoInput = fullscreenVideoInput
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case captureMode
+        case captureTitleBar
+        case ignoreShadows
+        case preferredPixelFormat
+        case dynamicRange
+        case frameRateLimit
+        case duplicateFrameMode
+        case lowLatencyPresent
+        case fullscreenVideoInput
+    }
+
+    /// Backwards-compatible Codable decoding so saved configs lacking `fullscreenVideoInput` load cleanly as `.auto`.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.captureMode = try c.decodeIfPresent(CaptureMode.self, forKey: .captureMode) ?? .window
+        self.captureTitleBar = try c.decodeIfPresent(Bool.self, forKey: .captureTitleBar) ?? false
+        self.ignoreShadows = try c.decodeIfPresent(Bool.self, forKey: .ignoreShadows) ?? true
+        self.preferredPixelFormat = try c.decodeIfPresent(CapturePixelFormat.self, forKey: .preferredPixelFormat) ?? .bgra8
+        self.dynamicRange = try c.decodeIfPresent(DynamicRangeMode.self, forKey: .dynamicRange) ?? .sdr
+        if let limit = try c.decodeIfPresent(Int.self, forKey: .frameRateLimit) {
+            self.frameRateLimit = min(max(limit, 10), 1000)
+        } else {
+            self.frameRateLimit = nil
+        }
+        self.duplicateFrameMode = try c.decodeIfPresent(DuplicateFrameMode.self, forKey: .duplicateFrameMode) ?? .dynamic
+        self.lowLatencyPresent = try c.decodeIfPresent(Bool.self, forKey: .lowLatencyPresent) ?? true
+        self.fullscreenVideoInput = try c.decodeIfPresent(FullscreenVideoInputMode.self, forKey: .fullscreenVideoInput) ?? .auto
     }
 }
 

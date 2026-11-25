@@ -79,9 +79,12 @@ public final class MetalFXEffect: @unchecked Sendable {
         outputWidth: Int,
         outputHeight: Int
     ) -> Bool {
+        let maxDim = ScalingLayoutCalculator.maxMetalTextureDimension
         guard isSupported,
               inputWidth >= 16, inputHeight >= 16,
-              outputWidth >= inputWidth, outputHeight >= inputHeight
+              inputWidth <= maxDim, inputHeight <= maxDim,
+              outputWidth >= inputWidth, outputHeight >= inputHeight,
+              outputWidth <= maxDim, outputHeight <= maxDim
         else {
             return false
         }
@@ -293,14 +296,27 @@ public final class MetalFXEffect: @unchecked Sendable {
                 detail: "MTLFXSpatialScaler is not supported on \(device.name)."
             )
         }
+        let maxDim = ScalingLayoutCalculator.maxMetalTextureDimension
+        guard inputWidth >= 16, inputHeight >= 16,
+              outputWidth >= inputWidth, outputHeight >= inputHeight,
+              inputWidth <= maxDim, inputHeight <= maxDim,
+              outputWidth <= maxDim, outputHeight <= maxDim
+        else {
+            throw EngineError.shaderCompilationFailed(
+                effectID: .metalFXSpatial,
+                detail: "MTLFXSpatialScaler dimensions out of supported range (\(inputWidth)x\(inputHeight) -> \(outputWidth)x\(outputHeight))."
+            )
+        }
+        let safeColorFormat = normalizedMetalFXFormat(colorFormat, mode: colorProcessingMode)
+        let safeOutputFormat = normalizedMetalFXFormat(outputFormat, mode: colorProcessingMode)
 
         let key = ScalerKey(
             inputWidth: inputWidth,
             inputHeight: inputHeight,
             outputWidth: outputWidth,
             outputHeight: outputHeight,
-            colorFormatRaw: colorFormat.rawValue,
-            outputFormatRaw: outputFormat.rawValue,
+            colorFormatRaw: safeColorFormat.rawValue,
+            outputFormatRaw: safeOutputFormat.rawValue,
             colorProcessingModeRaw: colorProcessingMode.rawValue
         )
 
@@ -319,14 +335,14 @@ public final class MetalFXEffect: @unchecked Sendable {
         desc.inputHeight = inputHeight
         desc.outputWidth = outputWidth
         desc.outputHeight = outputHeight
-        desc.colorTextureFormat = colorFormat
-        desc.outputTextureFormat = outputFormat
+        desc.colorTextureFormat = safeColorFormat
+        desc.outputTextureFormat = safeOutputFormat
         desc.colorProcessingMode = colorProcessingMode
 
         guard let created = desc.makeSpatialScaler(device: device) else {
             throw EngineError.shaderCompilationFailed(
                 effectID: .metalFXSpatial,
-                detail: "Failed to create MTLFXSpatialScaler (\(inputWidth)x\(inputHeight) -> \(outputWidth)x\(outputHeight), fmt=\(colorFormat.rawValue))."
+                detail: "Failed to create MTLFXSpatialScaler (\(inputWidth)x\(inputHeight) -> \(outputWidth)x\(outputHeight), fmt=\(safeColorFormat.rawValue))."
             )
         }
 

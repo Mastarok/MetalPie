@@ -40,6 +40,12 @@ public final class ProfilerHUDPanel {
 
     private static let hudWidth: CGFloat = 296
     private static let edgeMargin: CGFloat = 16
+    private static let notchSafeTopMargin: CGFloat = 6
+    /// Transparent outer padding reserved for SwiftUI drop shadow bleed (prevents rectangular clipping).
+    public static let shadowPadding: CGFloat = 20
+
+    /// Fired whenever the HUD's visible interactive Cocoa frame appears, moves, resizes, or hides.
+    public var onInteractiveFrameChanged: (@MainActor () -> Void)?
 
     public init() {}
 
@@ -51,6 +57,55 @@ public final class ProfilerHUDPanel {
     public var nsWindow: NSWindow? { panel }
 
     public var isVisible: Bool { isShown }
+
+    /// Exact visible HUD card rect in global AppKit (Cocoa Y-up) coordinates excluding transparent
+    /// shadow bleed padding, or `nil` when hidden.
+    public var visibleInteractiveCocoaFrame: CGRect? {
+        guard isShown, let panel else { return nil }
+        return Self.visibleFrame(fromPanelFrame: panel.frame)
+    }
+
+    public static func visibleFrame(fromPanelFrame panelFrame: CGRect) -> CGRect {
+        panelFrame.insetBy(dx: shadowPadding, dy: shadowPadding)
+    }
+
+    public static func panelFrame(fromVisibleFrame visibleFrame: CGRect) -> CGRect {
+        visibleFrame.insetBy(dx: -shadowPadding, dy: -shadowPadding)
+    }
+
+    public static func computeVisibleHUDCocoaFrame(
+        for overlayFrame: CGRect,
+        cardHeight: CGFloat,
+        corner: HUDCornerAnchor,
+        hostScreenVisibleFrame: CGRect?
+    ) -> CGRect {
+        let w = hudWidth
+        let h = cardHeight
+        let m = edgeMargin
+        let safeTopMaxY: CGFloat
+        if let visible = hostScreenVisibleFrame, overlayFrame.maxY > visible.maxY {
+            safeTopMaxY = visible.maxY - notchSafeTopMargin
+        } else {
+            safeTopMaxY = overlayFrame.maxY
+        }
+        let x: CGFloat
+        let y: CGFloat
+        switch corner {
+        case .topLeft:
+            x = overlayFrame.minX + m
+            y = max(overlayFrame.minY + m, safeTopMaxY - h - m - 42)
+        case .topRight:
+            x = overlayFrame.maxX - w - m
+            y = max(overlayFrame.minY + m, safeTopMaxY - h - m - 42)
+        case .bottomLeft:
+            x = overlayFrame.minX + m
+            y = overlayFrame.minY + m
+        case .bottomRight:
+            x = overlayFrame.maxX - w - m
+            y = overlayFrame.minY + m
+        }
+        return CGRect(x: x.rounded(), y: y.rounded(), width: w, height: h)
+    }
 
     public func show(
         overlayCocoaFrame: CGRect,
@@ -70,6 +125,7 @@ public final class ProfilerHUDPanel {
         activePanel.setFrame(targetFrame, display: true, animate: false)
         activePanel.orderFrontRegardless()
         isShown = true
+        onInteractiveFrameChanged?()
     }
 
     public func update(
@@ -90,16 +146,22 @@ public final class ProfilerHUDPanel {
             panel?.level = level
         }
         guard isShown, let panel, !anchorOverlayFrame.isEmpty else { return }
-        let targetHeight = estimatedHUDHeight()
-        if anchorChanged || abs(panel.frame.height - targetHeight) > 4 {
-            let resized = computeHUDFrame(for: anchorOverlayFrame, height: targetHeight)
+        let targetCardHeight = estimatedHUDHeight()
+        let currentCardHeight = Self.visibleFrame(fromPanelFrame: panel.frame).height
+        if anchorChanged || abs(currentCardHeight - targetCardHeight) > 4 {
+            let resized = computeHUDFrame(for: anchorOverlayFrame, height: targetCardHeight)
             panel.setFrame(resized, display: false, animate: false)
+            onInteractiveFrameChanged?()
         }
     }
 
     public func hide() {
+        let wasShown = isShown
         isShown = false
         panel?.orderOut(nil)
+        if wasShown {
+            onInteractiveFrameChanged?()
+        }
     }
 
     public func close() {
@@ -151,6 +213,9 @@ public final class ProfilerHUDPanel {
         let host = NSHostingView(rootView: dragWrapper)
         host.frame = CGRect(origin: .zero, size: frame.size)
         host.autoresizingMask = [.width, .height]
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.clear.cgColor
+        host.layer?.isOpaque = false
         created.contentView = host
         self.panel = created
         return created
@@ -161,45 +226,62 @@ public final class ProfilerHUDPanel {
         return CGFloat(132 + (passRows > 0 ? (24 + passRows * 18) : 0))
     }
 
-    private func computeHUDFrame(for overlayFrame: CGRect, height: CGFloat) -> CGRect {
-        let w = Self.hudWidth
-        let h = height
-        let m = Self.edgeMargin
-        let x: CGFloat
-        let y: CGFloat
-        switch corner {
-        case .topLeft:
-            x = overlayFrame.minX + m
-            y = overlayFrame.maxY - h - m - 42
-        case .topRight:
-            x = overlayFrame.maxX - w - m
-            y = overlayFrame.maxY - h - m - 42
-        case .bottomLeft:
-            x = overlayFrame.minX + m
-            y = overlayFrame.minY + m
-        case .bottomRight:
-            x = overlayFrame.maxX - w - m
-            y = overlayFrame.minY + m
+    private func hostScreenVisibleFrame(for overlayFrame: CGRect) -> CGRect? {
+        let bestScreen = NSScreen.screens.max { lhs, rhs in
+            let lInter = lhs.frame.intersection(overlayFrame)
+            let rInter = rhs.frame.intersection(overlayFrame)
+            let lArea = (lInter.isNull || lInter.isEmpty) ? 0 : (lInter.width * lInter.height)
+            let rArea = (rInter.isNull || rInter.isEmpty) ? 0 : (rInter.width * rInter.height)
+            return lArea < rArea
         }
-        return CGRect(x: x.rounded(), y: y.rounded(), width: w, height: h)
+        if let bestScreen, bestScreen.frame.intersects(overlayFrame) {
+            return bestScreen.visibleFrame
+        }
+        return NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame
+    }
+
+    private func computeHUDFrame(for overlayFrame: CGRect, height: CGFloat) -> CGRect {
+        let visibleCard = Self.computeVisibleHUDCocoaFrame(
+            for: overlayFrame,
+            cardHeight: height,
+            corner: corner,
+            hostScreenVisibleFrame: hostScreenVisibleFrame(for: overlayFrame)
+        )
+        return Self.panelFrame(fromVisibleFrame: visibleCard)
     }
 
     private func moveBy(dx: CGFloat, dy: CGFloat) {
         guard let panel else { return }
-        var frame = panel.frame
-        frame.origin.x += dx
-        frame.origin.y += dy
+        var visibleCard = Self.visibleFrame(fromPanelFrame: panel.frame)
+        visibleCard.origin.x += dx
+        visibleCard.origin.y += dy
         if !anchorOverlayFrame.isEmpty {
-            frame.origin.x = min(max(frame.origin.x, anchorOverlayFrame.minX + 6), anchorOverlayFrame.maxX - frame.width - 6)
-            frame.origin.y = min(max(frame.origin.y, anchorOverlayFrame.minY + 6), anchorOverlayFrame.maxY - frame.height - 6)
+            let safeTop: CGFloat
+            if let screenVisible = hostScreenVisibleFrame(for: anchorOverlayFrame),
+               anchorOverlayFrame.maxY > screenVisible.maxY
+            {
+                safeTop = screenVisible.maxY - Self.notchSafeTopMargin
+            } else {
+                safeTop = anchorOverlayFrame.maxY - 6
+            }
+            visibleCard.origin.x = min(
+                max(visibleCard.origin.x, anchorOverlayFrame.minX + 6),
+                anchorOverlayFrame.maxX - visibleCard.width - 6
+            )
+            visibleCard.origin.y = min(
+                max(visibleCard.origin.y, anchorOverlayFrame.minY + 6),
+                max(anchorOverlayFrame.minY + 6, safeTop - visibleCard.height)
+            )
         }
-        panel.setFrame(frame, display: false, animate: false)
+        panel.setFrame(Self.panelFrame(fromVisibleFrame: visibleCard), display: false, animate: false)
+        onInteractiveFrameChanged?()
     }
 
     private func snapToNearestCorner() {
         guard let panel, !anchorOverlayFrame.isEmpty else { return }
-        let midX = panel.frame.midX
-        let midY = panel.frame.midY
+        let visibleCard = Self.visibleFrame(fromPanelFrame: panel.frame)
+        let midX = visibleCard.midX
+        let midY = visibleCard.midY
         let isRight = midX >= anchorOverlayFrame.midX
         let isTop = midY >= anchorOverlayFrame.midY
         switch (isTop, isRight) {
@@ -208,8 +290,9 @@ public final class ProfilerHUDPanel {
         case (false, false): corner = .bottomLeft
         case (false, true): corner = .bottomRight
         }
-        let snapped = computeHUDFrame(for: anchorOverlayFrame, height: panel.frame.height)
+        let snapped = computeHUDFrame(for: anchorOverlayFrame, height: visibleCard.height)
         panel.setFrame(snapped, display: true, animate: true)
+        onInteractiveFrameChanged?()
     }
 }
 
@@ -226,6 +309,7 @@ private struct DraggableHUDContainerView: View {
             language: state.language,
             isInteractiveDragHint: true
         )
+        .padding(ProfilerHUDPanel.shadowPadding)
         .gesture(
             DragGesture(minimumDistance: 2)
                 .onChanged { value in

@@ -103,7 +103,7 @@ public struct ShaderBenchmarkResult: Identifiable, Hashable, Codable, Sendable {
 ///   black letterbox, HDR/EDR, optional VRR cursor & HUD compositing)
 /// - Live Metal Preview (`renderPreview`), GPU Shader Benchmark (`runBenchmark`),
 ///   and Cursor-Free PNG Screenshot Export (`captureLastOutputImage` / `captureLastOutputPNGData`).
-public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
+public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigurable, @unchecked Sendable {
     public let device: any MTLDevice
     public let shaderManager: ShaderLibraryManager
     public let texturePool: TexturePool
@@ -134,6 +134,7 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
 
     private struct RendererState {
         var demagnifyMode: DemagnifyMode = .none
+        var fullscreenVideoPreDownscaleSize: PixelSize? = nil
         var presentOverlayOptions: PresentOverlayOptions?
         var enableCursorFreeScreenshotCache: Bool = true
         var duplicate = DuplicateDetectorState()
@@ -206,6 +207,18 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
     public var demagnifyMode: DemagnifyMode {
         get { state.withLockUnchecked { $0.demagnifyMode } }
         set { state.withLockUnchecked { $0.demagnifyMode = newValue } }
+    }
+
+    /// True when 1x Non-Retina demagnification is active (`EffectPreScaleConfigurable`).
+    public var isDemagnifyActive: Bool {
+        state.withLockUnchecked { $0.demagnifyMode != .none }
+    }
+
+    /// Optional GPU pre-downscale target size for fullscreen video super-resolution (`nil` disables pre-downscale).
+    /// Coalesced with `demagnifyMode` inside `encode(...)` so frames are NEVER double-halved.
+    public var fullscreenVideoPreDownscaleSize: PixelSize? {
+        get { state.withLockUnchecked { $0.fullscreenVideoPreDownscaleSize } }
+        set { state.withLockUnchecked { $0.fullscreenVideoPreDownscaleSize = newValue } }
     }
 
     /// Optional in-pass VRR cursor & HUD compositing configuration applied during the Present pass.
@@ -287,8 +300,16 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         // - ScreenCaptureKit already drops `.idle` frames via `SCFrameStatus != .complete`, so `.dynamic`
         //   never performs blocking GPU readbacks or redundant per-frame source blits.
         // - Explicit `.always` additionally schedules a non-blocking GPU `duplicateFrameCheck` inside `cb`.
-        let activeDemag: DemagnifyMode = allowLiveStateMutation ? state.withLockUnchecked { $0.demagnifyMode } : .none
-        let modeSignature = makeModeSignature(scalingMode: scalingMode, layout: layout, isHDR: context.isHDR, demagnify: activeDemag)
+        let (activeDemag, activePreDownscale): (DemagnifyMode, PixelSize?) = allowLiveStateMutation
+            ? state.withLockUnchecked { ($0.demagnifyMode, $0.fullscreenVideoPreDownscaleSize) }
+            : (.none, nil)
+        let modeSignature = makeModeSignature(
+            scalingMode: scalingMode,
+            layout: layout,
+            isHDR: context.isHDR,
+            demagnify: activeDemag,
+            preDownscale: activePreDownscale
+        )
         if allowLiveStateMutation,
            context.duplicateFrameMode != .never,
            let cachedOutput = checkDuplicateFrameZeroStall(
@@ -333,36 +354,98 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             }
         }
 
-        // 1. Optional 1x Non-Retina Demagnification
+        // 1. Optional Coalesced Pre-Downscale / 1x Non-Retina Demagnification (NEVER double-halves!)
         var currentTex: any MTLTexture = context.sourceTexture
-        if activeDemag != .none, currentTex.width >= 64, currentTex.height >= 64 {
-            let demagW = max(1, currentTex.width / 2)
-            let demagH = max(1, currentTex.height / 2)
-            let demagLease = try texturePool.acquire(
-                width: demagW,
-                height: demagH,
+        let preScaleStep: (
+            size: PixelSize,
+            id: String,
+            name: String,
+            mode: DemagnifyMode?
+        )? = {
+            guard currentTex.width >= 64, currentTex.height >= 64 else { return nil }
+            if let videoSize = activePreDownscale,
+               videoSize.isValid,
+               (videoSize.width < currentTex.width || videoSize.height < currentTex.height)
+            {
+                let clamped = ScalingLayoutCalculator.clampAspectPreserving(videoSize)
+                let isExactHalf = clamped.width == max(1, currentTex.width / 2)
+                    && clamped.height == max(1, currentTex.height / 2)
+                if isExactHalf && activeDemag == .nearest {
+                    return (
+                        size: clamped,
+                        id: "video_prescale",
+                        name: "Video Pre-Scale (\(clamped.width)x\(clamped.height))",
+                        mode: .nearest
+                    )
+                } else if isExactHalf && !context.isHDR {
+                    // Exact 2x inverse bilinear demagnify recovers sharp edges from player/WindowServer 2x stretch.
+                    return (
+                        size: clamped,
+                        id: "video_prescale",
+                        name: "Video Pre-Scale (\(clamped.width)x\(clamped.height))",
+                        mode: .bilinear
+                    )
+                } else {
+                    return (
+                        size: clamped,
+                        id: "video_prescale",
+                        name: "Video Pre-Scale (\(clamped.width)x\(clamped.height))",
+                        mode: nil
+                    )
+                }
+            }
+            if activeDemag != .none {
+                let demagSize = PixelSize(
+                    width: max(1, currentTex.width / 2),
+                    height: max(1, currentTex.height / 2)
+                )
+                let demagMode: DemagnifyMode? = (activeDemag == .bilinear && context.isHDR) ? nil : activeDemag
+                return (
+                    size: demagSize,
+                    id: "demagnify",
+                    name: activeDemag == .nearest ? "1x Demagnify (Nearest)" : "1x Demagnify (Bilinear)",
+                    mode: demagMode
+                )
+            }
+            return nil
+        }()
+
+        if let step = preScaleStep {
+            let preLease = try texturePool.acquire(
+                width: step.size.width,
+                height: step.size.height,
                 pixelFormat: workingFormat,
                 usage: [.shaderRead, .shaderWrite],
                 storageMode: .private,
-                label: "MetalPie_Demagnify"
+                label: "MetalPie_PreScale_\(step.size.width)x\(step.size.height)"
             )
-            frameLeases.append(demagLease)
-            try encodeDemagnifyPass(
-                source: currentTex,
-                destination: demagLease.texture,
-                mode: activeDemag,
-                commandBuffer: cb
-            )
-            currentTex = demagLease.texture
+            frameLeases.append(preLease)
+            if let demagMode = step.mode {
+                try encodeDemagnifyPass(
+                    source: currentTex,
+                    destination: preLease.texture,
+                    mode: demagMode,
+                    commandBuffer: cb
+                )
+            } else {
+                try encodeBicubic(
+                    source: currentTex,
+                    destination: preLease.texture,
+                    b: 0.0,
+                    c: 0.5,
+                    commandBuffer: cb
+                )
+            }
+            currentTex = preLease.texture
             passRecords.append((
-                id: "demagnify",
-                name: activeDemag == .nearest ? "1x Demagnify (Nearest)" : "1x Demagnify (Bilinear)",
+                id: step.id,
+                name: step.name,
                 colorHex: "#FFD60A",
-                weight: Double(demagW * demagH) * 0.4
+                weight: Double(step.size.width * step.size.height) * 0.4
             ))
         }
 
-        // 2. Optional Crop Pass (scales layout.croppedSourceRect when demagnify halved currentTex)
+        // 2. Optional Crop Pass (scales layout.croppedSourceRect if caller passed un-adjusted raw layout)
         let rawCropRect = layout.croppedSourceRect
         let effCropX: Int
         let effCropY: Int
@@ -421,6 +504,34 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             ))
         }
 
+        // 3. Reconcile effect passes if caller didn't pre-adjust `context.layout` for demagnify / pre-downscale
+        // so same-size & fixed-2x shaders (Anime4K, CuNNy, FSRCNNX) NEVER shrink into a 1/4 top-left corner!
+        let activeSourceSize = PixelSize(width: currentTex.width, height: currentTex.height)
+        let activeLayout: ScalingLayoutResult
+        if let firstPass = layout.effectPasses.first, firstPass.inputSize != activeSourceSize {
+            let inferredTarget = layout.targetPixelSize.isValid
+                ? layout.targetPixelSize
+                : PixelSize(width: context.destinationTexture.width, height: context.destinationTexture.height)
+            var reconciled = ScalingLayoutCalculator.calculate(
+                sourcePixelSize: activeSourceSize,
+                targetPixelSize: inferredTarget,
+                targetCGRect: layout.targetCGRect,
+                backingScaleFactor: layout.backingScaleFactor,
+                crop: .zero,
+                effects: scalingMode.effects,
+                presentationMode: .fullscreen,
+                alignment: Self.inferredAlignment(from: layout)
+            )
+            if reconciled.finalOutputPixelSize == layout.finalOutputPixelSize {
+                reconciled.destinationPixelRect = layout.destinationPixelRect
+                reconciled.visibleContentPixelRect = layout.visibleContentPixelRect
+                reconciled.visibleTextureUVRect = layout.visibleTextureUVRect
+            }
+            activeLayout = reconciled
+        } else {
+            activeLayout = layout
+        }
+
         // Map EffectInstance by UUID (and ordered enabled fallback) for fast parameter lookup.
         let enabledEffects = scalingMode.effects.filter(\.enabled)
         var instanceLookup: [UUID: EffectInstance] = [:]
@@ -429,11 +540,12 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             instanceLookup[inst.id] = inst
         }
 
-        // 4. Execute Ordered Effect Chain (`layout.effectPasses`, including any auto-Bicubic fallback).
+        // 4. Execute Ordered Effect Chain (`activeLayout.effectPasses`, including any auto-Bicubic fallback).
         let rwUsage: MTLTextureUsage = [.shaderRead, .shaderWrite, .renderTarget]
-        for (passIdx, passLayout) in layout.effectPasses.enumerated() {
-            let outW = max(1, passLayout.outputSize.width)
-            let outH = max(1, passLayout.outputSize.height)
+        for (passIdx, passLayout) in activeLayout.effectPasses.enumerated() {
+            let safePassOut = ScalingLayoutCalculator.clampAspectPreserving(passLayout.outputSize)
+            let outW = clampMetalTextureDimension(safePassOut.width)
+            let outH = clampMetalTextureDimension(safePassOut.height)
             let targetLease = try texturePool.acquire(
                 width: outW,
                 height: outH,
@@ -501,7 +613,7 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         try encodeOutputOrPresent(
             contentTexture: currentTex,
             destinationTexture: context.destinationTexture,
-            layout: layout,
+            layout: activeLayout,
             isHDR: context.isHDR,
             allowOverlays: allowLiveStateMutation,
             commandBuffer: cb
@@ -538,6 +650,7 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         videoToolboxML.reset()
         texturePool.reset()
         state.withLockUnchecked { s in
+            s.fullscreenVideoPreDownscaleSize = nil
             s.duplicate = DuplicateDetectorState()
             s.lastCursorFreeOutput = nil
             s.passGPUEmaMs.removeAll()
@@ -558,7 +671,9 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
     ) throws -> CGImage {
         let srcTex = try uploadCGImageToTexture(sourceImage)
         let srcSize = PixelSize(width: srcTex.width, height: srcTex.height)
-        let safeOut = PixelSize(width: max(1, outputSize.width), height: max(1, outputSize.height))
+        let safeOut = ScalingLayoutCalculator.clampAspectPreserving(
+            PixelSize(width: max(1, outputSize.width), height: max(1, outputSize.height))
+        )
 
         let layout = ScalingLayoutCalculator.calculate(
             sourcePixelSize: srcSize,
@@ -570,11 +685,11 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             alignment: alignment
         )
 
-        let dstFormat: MTLPixelFormat = isHDR ? .rgba16Float : .bgra8Unorm
+        let dstFormat: MTLPixelFormat = sanitizedComputeTextureFormat(isHDR ? .rgba16Float : .bgra8Unorm)
         let dstDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: dstFormat,
-            width: safeOut.width,
-            height: safeOut.height,
+            width: clampMetalTextureDimension(safeOut.width),
+            height: clampMetalTextureDimension(safeOut.height),
             mipmapped: false
         )
         dstDesc.usage = [.shaderRead, .shaderWrite, .renderTarget]
@@ -670,10 +785,11 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 scalingType = .fit
             }
 
+            let safeBenchOut = ScalingLayoutCalculator.clampAspectPreserving(targetOutSize)
             let dstDesc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .bgra8Unorm,
-                width: targetOutSize.width,
-                height: targetOutSize.height,
+                width: clampMetalTextureDimension(safeBenchOut.width),
+                height: clampMetalTextureDimension(safeBenchOut.height),
                 mipmapped: false
             )
             dstDesc.usage = [.shaderRead, .shaderWrite, .renderTarget]
@@ -817,9 +933,9 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
     /// Reads back any Metal 2D texture (`.bgra8Unorm`, `.rgba8Unorm`, `.bgr10a2Unorm`, `.rgba16Float`)
     /// into an sRGB `CGImage`.
     public func exportTextureToCGImage(_ texture: any MTLTexture) throws -> CGImage {
-        let w = texture.width
-        let h = texture.height
-        guard w > 0, h > 0 else {
+        let w = clampMetalTextureDimension(texture.width)
+        let h = clampMetalTextureDimension(texture.height)
+        guard texture.width > 0, texture.height > 0 else {
             throw EngineError.screenshotExportFailed("Cannot export empty texture.")
         }
 
@@ -1048,11 +1164,17 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             let variant = parameters.choice("variant", default: "M")
             let strength = parameters.float32("strength", default: 1.0)
             let clampHighlights = parameters.bool("clampHighlights", default: true)
+            let restoreSrc = try alignedInputForSameSizeEffect(
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
             try encodeAnime4KRestore(
                 variant: variant,
                 strength: strength,
                 clampHighlights: clampHighlights,
-                source: source,
+                source: restoreSrc,
                 destination: destination,
                 commandBuffer: commandBuffer,
                 frameLeases: &frameLeases
@@ -1062,11 +1184,17 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             let variant = parameters.choice("variant", default: "L")
             let strength = parameters.float32("strength", default: 1.0)
             let clampHighlights = parameters.bool("clampHighlights", default: true)
+            let alignedSrc = try alignedInputForFixed2xEffect(
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
             try encodeAnime4KUpscale(
                 variant: variant,
                 strength: strength,
                 clampHighlights: clampHighlights,
-                source: source,
+                source: alignedSrc,
                 destination: destination,
                 commandBuffer: commandBuffer,
                 frameLeases: &frameLeases
@@ -1078,7 +1206,15 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             let lineSharpness = parameters.float32("lineSharpness", default: 1.0)
             let clampHighlights = parameters.bool("clampHighlights", default: true)
             let legacyThinning = parameters.float32("lineThinning", default: 0.0)
-            var cnnInput: any MTLTexture = source
+            let alignedSrc = try alignedInputForFixed2xEffect(
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
+            let cnnW = alignedSrc.width
+            let cnnH = alignedSrc.height
+            var cnnInput: any MTLTexture = alignedSrc
 
             // Smooth bilateral mode pre-denoise scaled by denoiseStrength (0 = off, 1 = subtle, 2 = strong)
             if denoiseStrength > 0.01 {
@@ -1091,7 +1227,7 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 let effectiveBilateral = min(max(denoiseStrength * 0.35, 0.0), 1.0)
                 var du = Anime4KDenoiseUniforms(denoiseStrength: effectiveBilateral)
                 let pDenoise = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_bilateral_mode", effectHint: .anime4kUpscaleDenoise)
-                let denoised = try texturePool.acquire(width: inW, height: inH, pixelFormat: source.pixelFormat, usage: rwUsage, storageMode: .private)
+                let denoised = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: sanitizedComputeTextureFormat(alignedSrc.pixelFormat), usage: rwUsage, storageMode: .private)
                 frameLeases.append(denoised)
                 if let enc = commandBuffer.makeComputeCommandEncoder() {
                     enc.label = "Anime4K_BilateralMode"
@@ -1099,7 +1235,7 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                     enc.setTexture(cnnInput, index: 0)
                     enc.setTexture(denoised.texture, index: 1)
                     enc.setBytes(&du, length: MemoryLayout<Anime4KDenoiseUniforms>.stride, index: 0)
-                    dispatch2D(encoder: enc, pipeline: pDenoise, width: inW, height: inH)
+                    dispatch2D(encoder: enc, pipeline: pDenoise, width: cnnW, height: cnnH)
                     enc.endEncoding()
                 }
                 cnnInput = denoised.texture
@@ -1116,22 +1252,22 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 var tu = Anime4KThinUniforms(strength: legacyThinning, iterations: 1)
                 let pSobel = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_sobel", effectHint: .anime4kUpscaleDenoise)
                 let pWarp = try shaderManager.computePipeline(library: "Anime4K", function: "anime4k_thin_warp", effectHint: .anime4kUpscaleDenoise)
-                let gradTex = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rg16Float, usage: rwUsage, storageMode: .private)
-                let thinned = try texturePool.acquire(width: inW, height: inH, pixelFormat: source.pixelFormat, usage: rwUsage, storageMode: .private)
+                let gradTex = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: .rg16Float, usage: rwUsage, storageMode: .private)
+                let thinned = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: sanitizedComputeTextureFormat(alignedSrc.pixelFormat), usage: rwUsage, storageMode: .private)
                 frameLeases.append(contentsOf: [gradTex, thinned])
                 if let enc = commandBuffer.makeComputeCommandEncoder() {
                     enc.label = "Anime4K_LineThinningLegacy"
                     enc.setComputePipelineState(pSobel)
                     enc.setTexture(cnnInput, index: 0)
                     enc.setTexture(gradTex.texture, index: 1)
-                    dispatch2D(encoder: enc, pipeline: pSobel, width: inW, height: inH)
+                    dispatch2D(encoder: enc, pipeline: pSobel, width: cnnW, height: cnnH)
 
                     enc.setComputePipelineState(pWarp)
                     enc.setTexture(cnnInput, index: 0)
                     enc.setTexture(gradTex.texture, index: 1)
                     enc.setTexture(thinned.texture, index: 2)
                     enc.setBytes(&tu, length: MemoryLayout<Anime4KThinUniforms>.stride, index: 0)
-                    dispatch2D(encoder: enc, pipeline: pWarp, width: inW, height: inH)
+                    dispatch2D(encoder: enc, pipeline: pWarp, width: cnnW, height: cnnH)
                     enc.endEncoding()
                 }
                 cnnInput = thinned.texture
@@ -1326,10 +1462,16 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         case .cunny:
             let variant = parameters.choice("variant", default: "balanced")
             let sharpness = parameters.float32("sharpness", default: 1.0)
+            let alignedSrc = try alignedInputForFixed2xEffect(
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
             try encodeCuNNy(
                 variant: variant,
                 sharpness: sharpness,
-                source: source,
+                source: alignedSrc,
                 destination: destination,
                 commandBuffer: commandBuffer,
                 frameLeases: &frameLeases
@@ -1404,6 +1546,14 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 antiRinging: parameters.float32("antiRinging", default: 0.35),
                 enhancedDetail: isEnhanced ? 1 : 0
             )
+            let alignedSrc = try alignedInputForFixed2xEffect(
+                source: source,
+                destination: destination,
+                commandBuffer: commandBuffer,
+                frameLeases: &frameLeases
+            )
+            let cnnW = alignedSrc.width
+            let cnnH = alignedSrc.height
 
             let p1 = try shaderManager.computePipeline(library: "FSRCNNX", function: "\(prefix)_pass1", effectHint: .fsrcnnx)
             let p2 = try shaderManager.computePipeline(library: "FSRCNNX", function: "\(prefix)_pass2", effectHint: .fsrcnnx)
@@ -1412,42 +1562,42 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             let p5 = try shaderManager.computePipeline(library: "FSRCNNX", function: "\(prefix)_pass5", effectHint: .fsrcnnx)
             let p6 = try shaderManager.computePipeline(library: "FSRCNNX", function: "\(prefix)_pass6", effectHint: .fsrcnnx)
 
-            let f1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            let f2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            let t1 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            let t2 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            let t3 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
-            let t4 = try texturePool.acquire(width: inW, height: inH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let f1 = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let f2 = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t1 = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t2 = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t3 = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
+            let t4 = try texturePool.acquire(width: cnnW, height: cnnH, pixelFormat: .rgba16Float, usage: rwUsage, storageMode: .private)
             frameLeases.append(contentsOf: [f1, f2, t1, t2, t3, t4])
 
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.label = "FSRCNNX_2x"
                 enc.setComputePipelineState(p1)
-                enc.setTexture(source, index: 0)
+                enc.setTexture(alignedSrc, index: 0)
                 enc.setTexture(f1.texture, index: 1)
                 enc.setTexture(f2.texture, index: 2)
-                dispatch2D(encoder: enc, pipeline: p1, width: inW, height: inH)
+                dispatch2D(encoder: enc, pipeline: p1, width: cnnW, height: cnnH)
 
                 enc.setComputePipelineState(p2)
                 enc.setTexture(f1.texture, index: 0)
                 enc.setTexture(f2.texture, index: 1)
                 enc.setTexture(t1.texture, index: 2)
                 enc.setTexture(t2.texture, index: 3)
-                dispatch2D(encoder: enc, pipeline: p2, width: inW, height: inH)
+                dispatch2D(encoder: enc, pipeline: p2, width: cnnW, height: cnnH)
 
                 enc.setComputePipelineState(p3)
                 enc.setTexture(t1.texture, index: 0)
                 enc.setTexture(t2.texture, index: 1)
                 enc.setTexture(t3.texture, index: 2)
                 enc.setTexture(t4.texture, index: 3)
-                dispatch2D(encoder: enc, pipeline: p3, width: inW, height: inH)
+                dispatch2D(encoder: enc, pipeline: p3, width: cnnW, height: cnnH)
 
                 enc.setComputePipelineState(p4)
                 enc.setTexture(t3.texture, index: 0)
                 enc.setTexture(t4.texture, index: 1)
                 enc.setTexture(t1.texture, index: 2)
                 enc.setTexture(t2.texture, index: 3)
-                dispatch2D(encoder: enc, pipeline: p4, width: inW, height: inH)
+                dispatch2D(encoder: enc, pipeline: p4, width: cnnW, height: cnnH)
 
                 enc.setComputePipelineState(p5)
                 enc.setTexture(t1.texture, index: 0)
@@ -1456,15 +1606,15 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
                 enc.setTexture(f2.texture, index: 3)
                 enc.setTexture(t3.texture, index: 4)
                 enc.setTexture(t4.texture, index: 5)
-                dispatch2D(encoder: enc, pipeline: p5, width: inW, height: inH)
+                dispatch2D(encoder: enc, pipeline: p5, width: cnnW, height: cnnH)
 
                 enc.setComputePipelineState(p6)
                 enc.setTexture(t3.texture, index: 0)
                 enc.setTexture(t4.texture, index: 1)
-                enc.setTexture(source, index: 2)
+                enc.setTexture(alignedSrc, index: 2)
                 enc.setTexture(destination, index: 3)
                 enc.setBytes(&outUniforms, length: MemoryLayout<FSRCNNXOutputUniforms>.stride, index: 0)
-                dispatch2D(encoder: enc, pipeline: p6, width: inW, height: inH)
+                dispatch2D(encoder: enc, pipeline: p6, width: cnnW, height: cnnH)
                 enc.endEncoding()
             }
 
@@ -2642,7 +2792,99 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         }
     }
 
-    // MARK: - Helper Encoders (Crop, Bicubic, Present)
+    // MARK: - Helper Encoders (Alignment, Crop, Bicubic, Present)
+
+    /// Ensures a same-size neural shader (e.g. Anime4K Restore) receives an input matching `destination`
+    /// so every thread writes full-frame output even if a caller passed mismatched sizes.
+    private func alignedInputForSameSizeEffect(
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        commandBuffer: any MTLCommandBuffer,
+        frameLeases: inout [PooledTexture]
+    ) throws -> any MTLTexture {
+        if source.width == destination.width && source.height == destination.height {
+            return source
+        }
+        let alignedLease = try texturePool.acquire(
+            width: destination.width,
+            height: destination.height,
+            pixelFormat: sanitizedComputeTextureFormat(source.pixelFormat),
+            usage: [.shaderRead, .shaderWrite],
+            storageMode: .private,
+            label: "MetalPie_SameSizeAlign"
+        )
+        frameLeases.append(alignedLease)
+        try encodeBicubic(
+            source: source,
+            destination: alignedLease.texture,
+            b: 0.0,
+            c: 0.5,
+            commandBuffer: commandBuffer
+        )
+        return alignedLease.texture
+    }
+
+    /// Ensures a fixed-2x sub-pixel-shuffle shader (`Anime4K Upscale`, `CuNNy`, `FSRCNNX`) receives an input
+    /// whose 2x footprint covers 100% of `destination` with zero clipping or 1/4 shrinking (e.g. after cap clamping).
+    private func alignedInputForFixed2xEffect(
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        commandBuffer: any MTLCommandBuffer,
+        frameLeases: inout [PooledTexture]
+    ) throws -> any MTLTexture {
+        let expectedInW = max(1, (destination.width + 1) / 2)
+        let expectedInH = max(1, (destination.height + 1) / 2)
+        if source.width == expectedInW && source.height == expectedInH {
+            return source
+        }
+        let alignedLease = try texturePool.acquire(
+            width: expectedInW,
+            height: expectedInH,
+            pixelFormat: sanitizedComputeTextureFormat(source.pixelFormat),
+            usage: [.shaderRead, .shaderWrite],
+            storageMode: .private,
+            label: "MetalPie_Fixed2xAlign"
+        )
+        frameLeases.append(alignedLease)
+        try encodeBicubic(
+            source: source,
+            destination: alignedLease.texture,
+            b: 0.0,
+            c: 0.5,
+            commandBuffer: commandBuffer
+        )
+        return alignedLease.texture
+    }
+
+    private static func inferredAlignment(from layout: ScalingLayoutResult) -> OutputAlignment {
+        let slackX = layout.targetPixelSize.width - layout.destinationPixelRect.width
+        let slackY = layout.targetPixelSize.height - layout.destinationPixelRect.height
+        let hx: Int = {
+            guard slackX != 0 else { return 1 }
+            let frac = Double(layout.destinationPixelRect.x) / Double(slackX)
+            if frac < 0.25 { return 0 }
+            if frac > 0.75 { return 2 }
+            return 1
+        }()
+        let vy: Int = {
+            guard slackY != 0 else { return 1 }
+            let frac = Double(layout.destinationPixelRect.y) / Double(slackY)
+            if frac < 0.25 { return 0 }
+            if frac > 0.75 { return 2 }
+            return 1
+        }()
+        switch (vy, hx) {
+        case (0, 0): return .topLeft
+        case (0, 1): return .top
+        case (0, 2): return .topRight
+        case (1, 0): return .left
+        case (1, 1): return .center
+        case (1, 2): return .right
+        case (2, 0): return .bottomLeft
+        case (2, 1): return .bottom
+        default:     return .bottomRight
+        }
+    }
 
     private func encodeCropPass(
         source: any MTLTexture,
@@ -2992,18 +3234,21 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
     }
 
     private func updatePreviousSourceCache(from source: any MTLTexture, commandBuffer: any MTLCommandBuffer) {
+        guard source.pixelFormat != .invalid, source.width > 0, source.height > 0 else { return }
+        let safeW = clampMetalTextureDimension(source.width)
+        let safeH = clampMetalTextureDimension(source.height)
         let dest: (any MTLTexture)? = state.withLockUnchecked { s in
             if let existing = s.duplicate.prevCroppedTexture,
-               existing.width == source.width,
-               existing.height == source.height,
+               existing.width == safeW,
+               existing.height == safeH,
                existing.pixelFormat == source.pixelFormat
             {
                 return existing
             }
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: source.pixelFormat,
-                width: source.width,
-                height: source.height,
+                width: safeW,
+                height: safeH,
                 mipmapped: false
             )
             desc.usage = [.shaderRead]
@@ -3015,13 +3260,15 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         }
 
         guard let dest, let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+        let copyW = min(source.width, dest.width)
+        let copyH = min(source.height, dest.height)
         blit.label = "CachePrevSource"
         blit.copy(
             from: source,
             sourceSlice: 0,
             sourceLevel: 0,
             sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-            sourceSize: MTLSize(width: source.width, height: source.height, depth: 1),
+            sourceSize: MTLSize(width: copyW, height: copyH, depth: 1),
             to: dest,
             destinationSlice: 0,
             destinationLevel: 0,
@@ -3036,10 +3283,13 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         signature: String,
         commandBuffer: any MTLCommandBuffer
     ) {
+        guard finalTex.pixelFormat != .invalid, finalTex.width > 0, finalTex.height > 0 else { return }
+        let safeW = clampMetalTextureDimension(finalTex.width)
+        let safeH = clampMetalTextureDimension(finalTex.height)
         let dest: (any MTLTexture)? = state.withLockUnchecked { s in
             if let existing = s.duplicate.cachedFinalOutputTexture,
-               existing.width == finalTex.width,
-               existing.height == finalTex.height,
+               existing.width == safeW,
+               existing.height == safeH,
                existing.pixelFormat == finalTex.pixelFormat
             {
                 s.duplicate.cachedOutputSize = size
@@ -3049,8 +3299,8 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             }
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: finalTex.pixelFormat,
-                width: finalTex.width,
-                height: finalTex.height,
+                width: safeW,
+                height: safeH,
                 mipmapped: false
             )
             desc.usage = [.shaderRead]
@@ -3065,13 +3315,15 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         }
 
         guard let dest, let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+        let copyW = min(finalTex.width, dest.width)
+        let copyH = min(finalTex.height, dest.height)
         blit.label = "CacheCursorFreeOutput"
         blit.copy(
             from: finalTex,
             sourceSlice: 0,
             sourceLevel: 0,
             sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-            sourceSize: MTLSize(width: finalTex.width, height: finalTex.height, depth: 1),
+            sourceSize: MTLSize(width: copyW, height: copyH, depth: 1),
             to: dest,
             destinationSlice: 0,
             destinationLevel: 0,
@@ -3262,7 +3514,8 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         scalingMode: ScalingMode,
         layout: ScalingLayoutResult,
         isHDR: Bool,
-        demagnify: DemagnifyMode
+        demagnify: DemagnifyMode,
+        preDownscale: PixelSize?
     ) -> String {
         var hasher = Hasher()
         hasher.combine(scalingMode)
@@ -3270,6 +3523,7 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         hasher.combine(layout.croppedSourceRect)
         hasher.combine(isHDR)
         hasher.combine(demagnify)
+        hasher.combine(preDownscale)
         return String(hasher.finalize())
     }
 
@@ -3310,8 +3564,8 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
     }
 
     private func uploadCGImageToTexture(_ image: CGImage) throws -> any MTLTexture {
-        let w = max(1, image.width)
-        let h = max(1, image.height)
+        let w = clampMetalTextureDimension(image.width)
+        let h = clampMetalTextureDimension(image.height)
         let bytesPerRow = w * 4
         var pixels = [UInt8](repeating: 0, count: bytesPerRow * h)
 
@@ -3358,6 +3612,8 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
     }
 
     private func makeSyntheticTestTexture(width: Int, height: Int) throws -> any MTLTexture {
+        let width = clampMetalTextureDimension(width)
+        let height = clampMetalTextureDimension(height)
         let bytesPerRow = width * 4
         var bytes = [UInt8](repeating: 255, count: bytesPerRow * height)
         for y in 0..<height {
