@@ -23,6 +23,14 @@ _metalpie_setup_swiftpm_env() {
   local active_dev_dir
   active_dev_dir="$(xcode-select -p 2>/dev/null || true)"
 
+  # Only apply CLT workarounds when CommandLineTools is the active developer directory
+  # (full Xcode.app environments such as GitHub Actions macOS runners already ship matching
+  # SwiftPM PackageDescription modules and SwiftUIMacros plugins).
+  case "${active_dev_dir}" in
+    *CommandLineTools*) ;;
+    *) return 0 ;;
+  esac
+
   local clt_pm_dir="/Library/Developer/CommandLineTools/usr/lib/swift/pm"
   local pm_src_dir="${active_dev_dir}/usr/lib/swift/pm"
   if [ ! -d "${pm_src_dir}/ManifestAPI" ] && [ -d "${clt_pm_dir}/ManifestAPI" ]; then

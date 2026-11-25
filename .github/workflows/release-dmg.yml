@@ -1,0 +1,142 @@
+name: Build & Release DMG
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g. 1.0.0; leave empty to use tag or dev build)'
+        required: false
+        default: ''
+      create_release:
+        description: 'Publish a GitHub Release with the built DMG'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-dmg:
+    name: Build macOS ARM64 DMG
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect build environment
+        run: |
+          sw_vers
+          uname -m
+          xcode-select -p
+          swift --version
+
+      - name: Resolve version metadata
+        id: version
+        shell: bash
+        run: |
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          BUILD_NUM="${GITHUB_RUN_NUMBER:-1}"
+          SHOULD_RELEASE="false"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            APP_VER="${TAG_NAME#v}"
+            DMG_VER="${APP_VER}"
+            SHOULD_RELEASE="true"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            RAW_IN="${{ inputs.version }}"
+            APP_VER="${RAW_IN#v}"
+            TAG_NAME="v${APP_VER}"
+            DMG_VER="${APP_VER}"
+            if [[ "${{ inputs.create_release }}" == "true" ]]; then
+              SHOULD_RELEASE="true"
+            fi
+          else
+            APP_VER="1.0.0"
+            TAG_NAME=""
+            DMG_VER="1.0.0-${SHORT_SHA}"
+          fi
+
+          # Ensure Info.plist CFBundleShortVersionString stays numeric X.Y.Z
+          PLIST_VER="$(echo "${APP_VER}" | sed -E 's/^([0-9]+(\.[0-9]+){0,2}).*/\1/')"
+          if [[ -z "${PLIST_VER}" ]]; then
+            PLIST_VER="1.0.0"
+          fi
+
+          echo "app_version=${PLIST_VER}" >> "${GITHUB_OUTPUT}"
+          echo "dmg_version=${DMG_VER}" >> "${GITHUB_OUTPUT}"
+          echo "build_number=${BUILD_NUM}" >> "${GITHUB_OUTPUT}"
+          echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "should_release=${SHOULD_RELEASE}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved: app_version=${PLIST_VER}, dmg_version=${DMG_VER}, build=${BUILD_NUM}, tag=${TAG_NAME}, release=${SHOULD_RELEASE}"
+
+      - name: Run core unit tests
+        run: swift test --filter MetalPieCoreTests
+
+      - name: Build MetalPie.app and DMG
+        env:
+          METALPIE_VERSION: ${{ steps.version.outputs.app_version }}
+          METALPIE_DMG_VERSION: ${{ steps.version.outputs.dmg_version }}
+          METALPIE_BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+        run: |
+          chmod +x scripts/build-app.sh scripts/build-dmg.sh scripts/test.sh
+          ./scripts/build-dmg.sh
+
+      - name: Upload DMG workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MetalPie-${{ steps.version.outputs.dmg_version }}-arm64-dmg
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.version.outputs.tag_name }}
+          DMG_VER: ${{ steps.version.outputs.dmg_version }}
+        run: |
+          DMG_FILE="dist/MetalPie-${DMG_VER}-arm64.dmg"
+          SHA_FILE="${DMG_FILE}.sha256"
+          CHECKSUM="$(awk '{print $1}' "${SHA_FILE}")"
+
+          NOTES=$(cat <<EOF
+          ## MetalPie ${TAG_NAME} (macOS Apple Silicon)
+
+          ### Installation / 安装说明
+          1. Download \`MetalPie-${DMG_VER}-arm64.dmg\` and drag **MetalPie.app** into **Applications**.
+          2. First launch: because the build is ad-hoc signed, if macOS Gatekeeper warns on open, run:
+             \`\`\`bash
+             xattr -dr com.apple.quarantine /Applications/MetalPie.app
+             \`\`\`
+          3. Grant **Screen Recording** (required) and **Accessibility** (for scaled cursor alignment) in *System Settings → Privacy & Security*.
+
+          **SHA-256:** \`${CHECKSUM}\`
+          EOF
+          )
+
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" "${DMG_FILE}" "${SHA_FILE}" --clobber
+          else
+            gh release create "${TAG_NAME}" "${DMG_FILE}" "${SHA_FILE}" \
+              --title "MetalPie ${TAG_NAME}" \
+              --notes "${NOTES}" \
+              --generate-notes
+          fi

@@ -99,10 +99,13 @@ Requires **macOS 14.0+** (Apple Silicon recommended; macOS 15+ unlocks SCK HDR, 
 # 2. Build, generate AppIcon.icns, assemble, and code-sign dist/MetalPie.app
 ./scripts/build-app.sh
 
-# 3. Optional: Sign with your local certificate so macOS permissions persist across rebuilds
-CODESIGN_IDENTITY="Apple Development: Your Name" ./scripts/build-app.sh
+# 3. Package compressed macOS DMG + SHA-256 checksum (dist/MetalPie-1.0.0-arm64.dmg)
+./scripts/build-dmg.sh
 
-# 4. Launch the packaged app
+# 4. Optional: Sign with your local certificate so macOS permissions persist across rebuilds
+CODESIGN_IDENTITY="Apple Development: Your Name" ./scripts/build-dmg.sh
+
+# 5. Launch the packaged app
 open dist/MetalPie.app
 ```
 
@@ -146,6 +149,9 @@ open dist/MetalPie.app
 
 # 编译 Release 版本、生成应用图标并打包签名 dist/MetalPie.app
 ./scripts/build-app.sh
+
+# 打包为可拖拽安装的 DMG 镜像与 SHA-256 校验文件（dist/MetalPie-1.0.0-arm64.dmg）
+./scripts/build-dmg.sh
 
 # 启动应用
 open dist/MetalPie.app
