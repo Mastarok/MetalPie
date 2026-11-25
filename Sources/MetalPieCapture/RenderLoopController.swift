@@ -384,26 +384,35 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         }
     }
 
-    func recordSourceFrame(now: Double, mailboxSuperseded: Bool) {
+    func recordSourceFrame(
+        now: Double,
+        mailboxSuperseded: Bool,
+        inFlightCommandBuffers: Int = 0
+    ) {
         lock.withLock { s in
             // Detect static-screen -> active-motion wakeup (no capture frames arrived for >= 100 ms):
-            // ProMotion steps DisplayLink down to 10-60 Hz while static and takes ~100-150 ms to ramp
-            // back to 120 Hz on the first motion burst. Never misclassify those 1-2 ramp-up frames as drops!
+            // ProMotion steps DisplayLink down while static and takes ~100-150 ms to ramp back to 120 Hz.
             if s.lastSourceArrivalTime > 0 && (now - s.lastSourceArrivalTime) >= 0.10 {
                 s.idleWakeupGraceUntil = max(s.idleWakeupGraceUntil, now + 0.15)
             }
             s.lastSourceArrivalTime = now
 
-            // Distinguish true render-deadline-miss drops from harmless sub-vsync mailbox coalescing,
-            // ProMotion static-to-motion wakeup ramp, startup warm-up, and live resize/reconfig transitions.
+            // Distinguish genuine MetalPie GPU/render drops from macOS ProMotion's normal periodic
+            // single-refresh (8.33ms -> 16.67ms) WindowServer VSync phase step while GPU is idle (`inFlight == 0`):
+            // count a superseded capture frame as dropped ONLY when EITHER:
+            //   1. GPU is genuinely backed up (`inFlight >= 2`) and missed active cadence (> 1.45x), OR
+            //   2. Render thread genuinely stalled for > 3 refreshes / 40 ms.
             let lastActiveRender = max(s.lastRenderConsumeTime, s.lastDisplayTickTime)
             let activeCadence = max(s.displayIntervalSeconds, s.liveDisplayIntervalSeconds)
+            let renderAge = now - lastActiveRender
+            let isGenuineGPUBacklog = (inFlightCommandBuffers >= 2) && (renderAge > activeCadence * 1.45)
+            let isGenuineRenderStall = renderAge > max(activeCadence * 3.0, 0.040)
             if mailboxSuperseded,
                now >= s.startupGraceUntil,
                now >= s.resizeGraceUntil,
                now >= s.idleWakeupGraceUntil,
                lastActiveRender > 0,
-               (now - lastActiveRender) > activeCadence * 1.45
+               (isGenuineGPUBacklog || isGenuineRenderStall)
             {
                 s.telemetry.droppedFrames &+= 1
             }
@@ -1293,7 +1302,9 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
     /// Deposits a captured GPU frame into the single-slot mailbox without blocking `SCStream`.
     public func ingest(frame: CapturedFrame) {
-        let (running, paused, needsWakeup) = control.withLock { ($0.isRunning, $0.isPaused, $0.usesWakeupDriver) }
+        let (running, paused, needsWakeup, inFlight) = control.withLock {
+            ($0.isRunning, $0.isPaused, $0.usesWakeupDriver, $0.inFlightCommandBuffers)
+        }
         guard running, !paused else { return }
 
         let now = CACurrentMediaTime()
@@ -1301,7 +1312,8 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         let dropped = mailbox.deposit(frame)
         telemetry.recordSourceFrame(
             now: now,
-            mailboxSuperseded: dropped
+            mailboxSuperseded: dropped,
+            inFlightCommandBuffers: inFlight
         )
 
         // Wake the render thread immediately ONLY in direct-present or VRR mode (skip 120Hz CFRunLoop

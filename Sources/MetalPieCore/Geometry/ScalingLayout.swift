@@ -457,6 +457,10 @@ public enum ScalingLayoutCalculator: Sendable {
     /// Stable UUID used for auto-inserted Bicubic Catmull-Rom fallback passes.
     public static let autoBicubicPassID = UUID(uuidString: "A10B1C0B-1C00-4000-8000-000000000001")!
 
+    /// Stable UUID used for automatic second-stage 2× neural upscaling on low-resolution sources
+    /// (e.g. 480p -> 960p -> 1920p, matching official Anime4K `OUTPUT/INPUT > 2.4` chaining).
+    public static let secondStageNeuralPassID = UUID(uuidString: "A10B1C0B-1C00-4000-8000-000000000002")!
+
     /// Clamps `size` into `1...maxDimension` while preserving aspect ratio whenever either axis exceeds `maxDimension`.
     public static func clampAspectPreserving(
         _ size: PixelSize,
@@ -569,8 +573,11 @@ public enum ScalingLayoutCalculator: Sendable {
             return nil
         }
 
-        let coversTarget = Double(rawSourceSize.width) >= Double(targetPixelSize.width) * 0.85
-            && Double(rawSourceSize.height) >= Double(targetPixelSize.height) * 0.85
+        // Recognize full-screen / maximized video windows across 16:9, 16:10, 4:3 (e.g. classic anime
+        // filling 100% height at ~83.7% width), and 21:9 ultrawide (filling 100% width at ~75% height).
+        let widthFrac = Double(rawSourceSize.width) / Double(max(1, targetPixelSize.width))
+        let heightFrac = Double(rawSourceSize.height) / Double(max(1, targetPixelSize.height))
+        let coversTarget = (widthFrac >= 0.85 && heightFrac >= 0.50) || (heightFrac >= 0.85 && widthFrac >= 0.50)
         guard presentationMode.isFullscreen && coversTarget else {
             return nil
         }
@@ -592,6 +599,13 @@ public enum ScalingLayoutCalculator: Sendable {
             let outH = min(srcH, max(360, srcH / 2))
             guard outW < srcW || outH < srcH else { return nil }
             return clampAspectPreserving(PixelSize(width: outW, height: outH))
+
+        case .p480:
+            guard srcH > 520 else { return nil }
+            let scale = 480.0 / Double(srcH)
+            let outW = max(1, Int((Double(srcW) * scale).rounded()))
+            let candidate = clampAspectPreserving(PixelSize(width: outW, height: 480))
+            return (candidate.width < srcW || candidate.height < srcH) ? candidate : nil
 
         case .p720:
             guard srcH > 760 else { return nil }
@@ -718,6 +732,7 @@ public enum ScalingLayoutCalculator: Sendable {
         var explicitFillOverflowAllowed = false
         var ranRestoreAtCurrentSize = false
         var bypassedUpscalerAfterRestore = false
+        var lastFittedNeural2xEffectID: EffectID? = nil
 
         for instance in enabledEffects {
             let descriptor = EffectCatalog.descriptor(for: instance.effectID)
@@ -784,6 +799,14 @@ public enum ScalingLayoutCalculator: Sendable {
                         absoluteHeight: instance.absoluteHeight
                     ))
                     explicitFillOverflowAllowed = (instance.scalingType == .fill)
+                    if abs(factor - 2.0) < 0.01,
+                       instance.effectID == .anime4kUpscale
+                        || instance.effectID == .anime4kUpscaleDenoise
+                        || instance.effectID == .cunny
+                        || instance.effectID == .fsrcnnx
+                    {
+                        lastFittedNeural2xEffectID = instance.effectID
+                    }
                 }
             case .discreteScales(let factors):
                 // Pick the discrete factor closest to the desired scale ratio.
@@ -849,6 +872,39 @@ public enum ScalingLayoutCalculator: Sendable {
                 bypassedUpscalerAfterRestore = false
             }
             currentSize = actualOutput
+        }
+
+        // Official Anime4K / neural 2x+2x chaining for low-resolution sources (e.g. 480p -> 960p -> 1920p -> 3K):
+        // when a target-fitting fixed-2x neural upscaler still leaves >1.35x upscaling to reach desiredFinalSize
+        // (such as 640x480 -> 1280x960 targeting 2531x1898), append a second fast 2x neural pass instead of
+        // letting Auto Bicubic blur the remaining ~2x stretch, while staying strictly within display pixel budget!
+        if let secondStageEffect = lastFittedNeural2xEffectID,
+           let desired = desiredFinalSize,
+           desired.isValid,
+           currentSize.isValid
+        {
+            let remainingScale = max(
+                Double(desired.width) / Double(max(1, currentSize.width)),
+                Double(desired.height) / Double(max(1, currentSize.height))
+            )
+            let secondRaw = PixelSize(
+                width: max(1, currentSize.width * 2),
+                height: max(1, currentSize.height * 2)
+            )
+            let secondPixels = Double(secondRaw.width) * Double(secondRaw.height)
+            let targetPixels = Double(safeTargetSize.width) * Double(safeTargetSize.height)
+            let maxSecondStagePixels = max(targetPixels * 1.25, 6_000_000.0)
+            if remainingScale > 1.35 && secondPixels <= maxSecondStagePixels {
+                let secondOut = clampAspectPreserving(secondRaw, maxDimension: intermediateFixedCap)
+                passes.append(EffectPassLayout(
+                    effectInstanceID: secondStageNeuralPassID,
+                    effectID: secondStageEffect,
+                    inputSize: currentSize,
+                    outputSize: secondOut,
+                    isAutoInsertedFallback: false
+                ))
+                currentSize = secondOut
+            }
         }
 
         // Determine if an automatic Bicubic Catmull-Rom (B=0, C=0.5) fallback pass is required.

@@ -647,6 +647,18 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
             let params: EffectParameters
             if passLayout.isAutoInsertedFallback {
                 params = ["b": .float(0.0), "c": .float(0.5)]
+            } else if passLayout.effectInstanceID == ScalingLayoutCalculator.secondStageNeuralPassID {
+                switch passLayout.effectID {
+                case .anime4kUpscale, .anime4kUpscaleDenoise:
+                    // Official Anime4K v4.0.1 second-stage 2x pass uses fast M model for crisp 4x without slowness.
+                    params = ["variant": .choice("M"), "clampHighlights": .bool(true)]
+                case .cunny:
+                    params = ["variant": .choice("fast"), "sharpness": .float(1.0)]
+                case .fsrcnnx:
+                    params = ["variant": .choice("standard"), "sharpness": .float(1.0), "antiRinging": .float(0.35)]
+                default:
+                    params = EffectCatalog.descriptor(for: passLayout.effectID).defaultParameters
+                }
             } else if let byID = instanceLookup[passLayout.effectInstanceID] {
                 params = byID.parameters
             } else if passIdx < enabledEffects.count, enabledEffects[passIdx].effectID == passLayout.effectID {
@@ -1229,14 +1241,64 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
             }
 
         case .vtSuperResolution:
+            let layoutScale = max(Float(outW) / Float(max(1, inW)), Float(outH) / Float(max(1, inH)))
             let scaleStr = parameters.choice("scaleFactor", default: "2.0")
-            let requestedScale = Float(scaleStr) ?? 2.0
-            let ranVT = try videoToolboxML.superResolution.encode(
-                commandBuffer: commandBuffer,
-                source: source,
-                destination: destination,
-                requestedScaleFactor: requestedScale
-            )
+            let paramScale = Float(scaleStr) ?? 2.0
+            let requestedScale = (layoutScale >= 1.25) ? layoutScale : paramScale
+            let supportedScales = VideoToolboxSuperResolution.supportedScaleFactors(width: inW, height: inH)
+            let chosenVTScale = supportedScales.min { abs($0 - requestedScale) < abs($1 - requestedScale) }
+            let needsPostMetalFX: Bool = {
+                guard let s = chosenVTScale else { return false }
+                let vtW = Int((Float(inW) * s).rounded())
+                let vtH = Int((Float(inH) * s).rounded())
+                return vtW < outW - 4 || vtH < outH - 4
+            }()
+
+            let ranVT: Bool
+            if needsPostMetalFX, let s = chosenVTScale {
+                // Chain ANE 2x (e.g. 640x480 -> 1280x960) + MetalFX Spatial (1280x960 -> 2560x1920)
+                // instead of stretching the NV12 output linearly across the remaining 2x gap!
+                let vtW = max(2, Int((Float(inW) * s).rounded()))
+                let vtH = max(2, Int((Float(inH) * s).rounded()))
+                let midLease = try texturePool.acquire(
+                    width: vtW,
+                    height: vtH,
+                    pixelFormat: sanitizedComputeTextureFormat(destination.pixelFormat),
+                    usage: [.shaderRead, .shaderWrite, .renderTarget],
+                    storageMode: .private,
+                    label: "VT_SR_Mid_\(vtW)x\(vtH)"
+                )
+                frameLeases.append(midLease)
+                let okVT = try videoToolboxML.superResolution.encode(
+                    commandBuffer: commandBuffer,
+                    source: source,
+                    destination: midLease.texture,
+                    requestedScaleFactor: s
+                )
+                if okVT {
+                    let colorMode: MTLFXSpatialScalerColorProcessingMode = isHDR ? .hdr : .perceptual
+                    let okFX = try metalFX.encode(
+                        commandBuffer: commandBuffer,
+                        source: midLease.texture,
+                        destination: destination,
+                        colorProcessingMode: colorMode,
+                        texturePool: texturePool
+                    )
+                    if !okFX {
+                        try encodeBicubic(source: midLease.texture, destination: destination, b: 0.0, c: 0.5, commandBuffer: commandBuffer)
+                    }
+                    ranVT = true
+                } else {
+                    ranVT = false
+                }
+            } else {
+                ranVT = try videoToolboxML.superResolution.encode(
+                    commandBuffer: commandBuffer,
+                    source: source,
+                    destination: destination,
+                    requestedScaleFactor: requestedScale
+                )
+            }
             if !ranVT {
                 // Seamless hardware fallback: MetalFX Spatial -> Bicubic Catmull-Rom
                 let colorMode: MTLFXSpatialScalerColorProcessingMode = isHDR ? .hdr : .perceptual

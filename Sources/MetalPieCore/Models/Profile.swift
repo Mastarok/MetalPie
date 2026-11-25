@@ -41,6 +41,7 @@ public enum DuplicateFrameMode: String, Codable, Sendable, CaseIterable, Identif
 /// Input resolution policy for fullscreen video / browser super-resolution pre-downscaling.
 public enum FullscreenVideoInputMode: String, Codable, Sendable, CaseIterable, Identifiable {
     case auto
+    case p480
     case p720
     case p1080
     case native

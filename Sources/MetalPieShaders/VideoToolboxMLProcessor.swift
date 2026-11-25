@@ -287,6 +287,9 @@ public final class VideoToolboxSuperResolution: @unchecked Sendable {
         processor.process(with: commandBuffer, parameters: params)
 
         // 3. Convert output 420v NV12 -> BGRA/RGBA destination texture on GPU.
+        // If ANE only supported a lower discrete factor than `destination` (e.g. 640x480 -> 2x = 1280x960
+        // inside a 4x = 2560x1920 layout slot), write exact 1:1 into `intermediateOutput` when supplied
+        // or smoothly into `destination`, letting caller chain MetalFX for the remaining upscale!
         let fromNV12 = try shaderManager.computePipeline(library: "Common", function: "nv12ToBGRA", effectHint: .vtSuperResolution)
         if let enc = commandBuffer.makeComputeCommandEncoder() {
             enc.label = "VT_SR_NV12toBGRA"

@@ -223,7 +223,7 @@ kernel void bgraToNV12Resampled(
 }
 
 kernel void nv12ToBGRA(
-    texture2d<half, access::read> luma [[texture(0)]],
+    texture2d<half, access::sample> luma [[texture(0)]],
     texture2d<half, access::sample> chroma [[texture(1)]],
     texture2d<half, access::write> output [[texture(2)]],
     uint2 gid [[thread_position_in_grid]]
@@ -235,12 +235,10 @@ kernel void nv12ToBGRA(
     }
 
     constexpr sampler linearSampler(filter::linear, address::clamp_to_edge, coord::normalized);
-    const int2 lumaSize = int2(luma.get_width(), luma.get_height());
     const float2 uv = (float2(gid) + 0.5f) / float2(outW, outH);
 
-    // Sample Y at matching coordinate (supports both exact 1:1 and resampled readback).
-    uint2 yCoord = clampCoord(int2(uv * float2(lumaSize)), lumaSize);
-    half yRaw = luma.read(yCoord).r;
+    // Exact texel center at 1:1 and smooth linear filtering if destination differs from NV12 size.
+    half yRaw = luma.sample(linearSampler, uv).r;
     half2 cbcrRaw = chroma.sample(linearSampler, uv).rg;
 
     // Invert BT.709 video range: Y in [16/255, 235/255], Cb/Cr in [16/255, 240/255].

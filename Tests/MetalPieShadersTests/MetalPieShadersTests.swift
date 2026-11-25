@@ -1853,5 +1853,25 @@ struct MetalPieShadersGPUValidationTests {
             #expect(dcStats.pixelsRGBA[idx + 1] > 0.70, "Demagnify+Crop (\(px),\(py)) should be green")
             #expect(dcStats.pixelsRGBA[idx + 0] < 0.20, "Demagnify+Crop (\(px),\(py)) leaked red border (R=\(dcStats.pixelsRGBA[idx + 0]))")
         }
+        let metalFXSupported = renderer.metalFX.canScaleDirectly(
+            inputWidth: 640,
+            inputHeight: 480,
+            outputWidth: 2531,
+            outputHeight: 1898
+        )
+        #expect(metalFXSupported, "MetalFX Spatial must support 480p -> 3K (3.95x) instead of falling back to Bicubic")
+
+        // Verify all 480p -> 3K (640x480 -> 2531x1898) high-ratio paths run cleanly on GPU (MetalFX 2-stage,
+        // Apple ML SR + MetalFX hybrid, Anime4K Mode C 4x neural chain, CuNNy 4x neural chain).
+        let src480 = TestPatterns.makeCGImage(width: 640, height: 480)
+        for presetID in [ScalingMode.metalFXSpatialID, ScalingMode.appleMLSuperResID, ScalingMode.anime4kModeCID, ScalingMode.cunnyAnimeID] {
+            let preset = try #require(ScalingMode.builtInPresets.first { $0.id == presetID })
+            let outImg = try renderer.renderPreview(
+                sourceImage: src480,
+                scalingMode: preset,
+                outputSize: PixelSize(width: 2531, height: 1898)
+            )
+            #expect(outImg.width == 2531 && outImg.height == 1898)
+        }
     }
 }

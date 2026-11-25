@@ -603,13 +603,14 @@ struct SettingsView: View {
                                 .font(.system(size: 12.5))
                             Picker("", selection: binding(profileID, \.capture.fullscreenVideoInput)) {
                                 Text(l10n.tr("Auto", "自动")).tag(FullscreenVideoInputMode.auto)
+                                Text("480p").tag(FullscreenVideoInputMode.p480)
                                 Text("720p").tag(FullscreenVideoInputMode.p720)
                                 Text("1080p").tag(FullscreenVideoInputMode.p1080)
                                 Text(l10n.tr("Native", "原生")).tag(FullscreenVideoInputMode.native)
                             }
                             .labelsHidden()
                             .pickerStyle(.segmented)
-                            .frame(maxWidth: 240)
+                            .frame(maxWidth: 280)
                         }
 
                         GridRow {

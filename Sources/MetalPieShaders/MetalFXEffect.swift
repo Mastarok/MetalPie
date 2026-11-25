@@ -72,7 +72,8 @@ public final class MetalFXEffect: @unchecked Sendable {
     }
 
     /// Checks whether `MTLFXSpatialScaler` supports scaling directly from `(inputWidth, inputHeight)`
-    /// to `(outputWidth, outputHeight)` (MetalFX Spatial is an upscaler: `out >= in`, up to 3x per axis).
+    /// to `(outputWidth, outputHeight)` (Apple Silicon MetalFX Spatial natively supports up to ~8x per axis;
+    /// higher ratios automatically chain two hardware MetalFX passes).
     public func canScaleDirectly(
         inputWidth: Int,
         inputHeight: Int,
@@ -88,10 +89,9 @@ public final class MetalFXEffect: @unchecked Sendable {
         else {
             return false
         }
-        // MetalFX Spatial supports up to ~3x per axis; larger factors need chaining or fallback.
         let scaleX = Double(outputWidth) / Double(inputWidth)
         let scaleY = Double(outputHeight) / Double(inputHeight)
-        return scaleX <= 3.001 && scaleY <= 3.001
+        return scaleX <= 8.001 && scaleY <= 8.001
     }
 
     /// Prewarms and caches a `MTLFXSpatialScaler` for the specified dimensions, format, and color mode.
@@ -122,6 +122,73 @@ public final class MetalFXEffect: @unchecked Sendable {
     /// Returns `true` if encoded via MetalFX Spatial, or `false` if dimensions require fallback (e.g. downscale).
     @discardableResult
     public func encode(
+        commandBuffer: any MTLCommandBuffer,
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        colorProcessingMode: MTLFXSpatialScalerColorProcessingMode,
+        texturePool: TexturePool
+    ) throws -> Bool {
+        let inW = source.width
+        let inH = source.height
+        let outW = destination.width
+        let outH = destination.height
+
+        // For extreme upscale ratios (> 3.0x per axis, e.g. 480p -> 3K = 3.95x), chain two crisp ~2x
+        // hardware MetalFX Spatial passes (in -> mid -> out) for noticeably cleaner edges than a single
+        // 4x+ spatial jump (falling back cleanly to single pass if intermediate allocation fails).
+        let scaleX = Double(outW) / Double(max(1, inW))
+        let scaleY = Double(outH) / Double(max(1, inH))
+        if isSupported,
+           inW >= 16, inH >= 16,
+           outW > inW, outH > inH,
+           (scaleX > 3.001 || scaleY > 3.001)
+        {
+            let midW = max(inW + 1, min(outW - 1, Int((sqrt(Double(inW) * Double(outW))).rounded())))
+            let midH = max(inH + 1, min(outH - 1, Int((sqrt(Double(inH) * Double(outH))).rounded())))
+            if canScaleDirectly(inputWidth: inW, inputHeight: inH, outputWidth: midW, outputHeight: midH)
+                && canScaleDirectly(inputWidth: midW, inputHeight: midH, outputWidth: outW, outputHeight: outH)
+            {
+                let midFmt = normalizedMetalFXFormat(destination.pixelFormat, mode: colorProcessingMode)
+                if let midLease = try? texturePool.acquire(
+                    width: midW,
+                    height: midH,
+                    pixelFormat: midFmt,
+                    usage: [.shaderRead, .shaderWrite, .renderTarget],
+                    storageMode: .private,
+                    label: "MetalFX_MidStage_\(midW)x\(midH)"
+                ) {
+                    texturePool.recycleOnCompletion([midLease], of: commandBuffer)
+                    let ok1 = try encodeSinglePass(
+                        commandBuffer: commandBuffer,
+                        source: source,
+                        destination: midLease.texture,
+                        colorProcessingMode: colorProcessingMode,
+                        texturePool: texturePool
+                    )
+                    if ok1 {
+                        let ok2 = try encodeSinglePass(
+                            commandBuffer: commandBuffer,
+                            source: midLease.texture,
+                            destination: destination,
+                            colorProcessingMode: colorProcessingMode,
+                            texturePool: texturePool
+                        )
+                        if ok2 { return true }
+                    }
+                }
+            }
+        }
+
+        return try encodeSinglePass(
+            commandBuffer: commandBuffer,
+            source: source,
+            destination: destination,
+            colorProcessingMode: colorProcessingMode,
+            texturePool: texturePool
+        )
+    }
+
+    private func encodeSinglePass(
         commandBuffer: any MTLCommandBuffer,
         source: any MTLTexture,
         destination: any MTLTexture,

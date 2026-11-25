@@ -324,7 +324,7 @@ struct ScalingLayoutTests {
         #expect(webpageAuto.effectiveSize == retinaWebpage)
 
         // 2. Windowed mode covering >=85% of target -> NEVER pre-downscales (fixes `||` -> `&&` bug!)
-        for mode in [FullscreenVideoInputMode.auto, .p720, .p1080, .native] {
+        for mode in FullscreenVideoInputMode.allCases {
             let windowed = ScalingLayoutCalculator.computeFullscreenVideoPreDownscaleSize(
                 rawSourceSize: retinaDisplay,
                 targetPixelSize: retinaDisplay,
@@ -379,6 +379,18 @@ struct ScalingLayoutTests {
             demagnifyActive: false
         )
         #expect(explicit1080 == PixelSize(width: 1663, height: 1080))
+
+        // 6. 4:3 maximized video (2531x1898 on 3024x1898 = 83.7% width, 100% height) + .p480/.p720 pre-downscale
+        let maximized4x3 = PixelSize(width: 2531, height: 1898)
+        let explicit480On4x3 = ScalingLayoutCalculator.computeFullscreenVideoPreDownscaleSize(
+            rawSourceSize: maximized4x3,
+            targetPixelSize: retinaDisplay,
+            presentationMode: .fullscreen,
+            mode: .p480,
+            isNativeFullscreenSource: false,
+            demagnifyActive: false
+        )
+        #expect(explicit480On4x3 == PixelSize(width: 640, height: 480))
     }
 
     @Test("DirectPresentPacer caps 150-240Hz bursts strictly to display refresh rate while passing jittered native frames immediately")
@@ -545,6 +557,22 @@ struct ScalingLayoutTests {
                     )
                 }
             }
+        }
+
+        // 7. Low-resolution 480p -> 3K (640x480 -> 3024x1898 = 3.95x) chains a second 2x neural pass
+        //    (640x480 -> 1280x960 -> 2560x1920 -> 2531x1898) instead of letting Auto Bicubic blur the final 2x!
+        for presetID in [ScalingMode.anime4kModeCID, ScalingMode.anime4kModeAID, ScalingMode.cunnyAnimeID, ScalingMode.fsrcnnxID] {
+            let preset = try #require(ScalingMode.builtInPresets.first { $0.id == presetID })
+            let layout4x = ScalingLayoutCalculator.calculate(
+                sourcePixelSize: PixelSize(width: 640, height: 480),
+                targetPixelSize: PixelSize(width: 3024, height: 1898),
+                effects: preset.effects
+            )
+            #expect(
+                layout4x.effectPasses.contains { $0.effectInstanceID == ScalingLayoutCalculator.secondStageNeuralPassID && $0.outputSize == PixelSize(width: 2560, height: 1920) },
+                "Preset '\(preset.name)' should chain a second 2x neural pass for 480p -> 3K (3.95x)"
+            )
+            #expect(layout4x.finalOutputPixelSize == PixelSize(width: 2531, height: 1898))
         }
     }
 }
