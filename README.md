@@ -97,5 +97,11 @@ CODESIGN_IDENTITY="Apple Development: Your Name" ./scripts/build-dmg.sh
 MetalPie draws architectural inspiration and shader algorithms from the following projects:
 
 - [Magpie](https://github.com/Blinue/Magpie) — Window scaling architecture, cursor confinement model, and shader ecosystem.
-- [Anime4K](https://github.com/bloc97/Anime4K), [AMD FidelityFX FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [CuNNy](https://github.com/funnyplanter/CuNNy), [FSRCNNX](https://github.com/igv/FSRCNN-TensorFlow) — Upscaling algorithms and shaders.
+- [Anime4K](https://github.com/bloc97/Anime4K), [AMD FidelityFX FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR) / [CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS), [Qualcomm SGSR](https://github.com/SnapdragonGameStudios/snapdragon-gsr), [CuNNy](https://github.com/funnyplanter/CuNNy), [FSRCNNX](https://github.com/igv/FSRCNN-TensorFlow), and [libretro/slang-shaders](https://github.com/libretro/slang-shaders) — Upscaling algorithms, CRT/pixel-art filters, and neural shader weights.
 - [MetalDuck](https://github.com/Nycolazs/MetalDuck) & [MetalGoose](https://github.com/Stallion77RepoOfficial/MetalGoose) — Early macOS Metal window-scaling references.
+
+See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the complete per-shader provenance table and upstream license notices.
+
+## License
+
+MetalPie is released under the [GNU General Public License v3.0](LICENSE).

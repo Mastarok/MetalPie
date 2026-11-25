@@ -94,8 +94,14 @@ CODESIGN_IDENTITY="Apple Development: Your Name" ./scripts/build-dmg.sh
 
 ## 致谢
 
-MetalPie 的架构设计与部分着色器算法参考或受益于以下开源项目：
+MetalPie 的架构设计与着色器算法参考或移植自以下开源项目：
 
 - [Magpie](https://github.com/Blinue/Magpie) — 窗口缩放架构、光标限位模型与着色器生态。
-- [Anime4K](https://github.com/bloc97/Anime4K)、[AMD FidelityFX FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR)、[CuNNy](https://github.com/funnyplanter/CuNNy)、[FSRCNNX](https://github.com/igv/FSRCNN-TensorFlow) — 超分算法与着色器实现。
+- [Anime4K](https://github.com/bloc97/Anime4K)、[AMD FidelityFX FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR) / [CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS)、[Qualcomm SGSR](https://github.com/SnapdragonGameStudios/snapdragon-gsr)、[CuNNy](https://github.com/funnyplanter/CuNNy)、[FSRCNNX](https://github.com/igv/FSRCNN-TensorFlow) 与 [libretro/slang-shaders](https://github.com/libretro/slang-shaders) — 超分算法、CRT/像素滤波与神经网络着色器权重。
 - [MetalDuck](https://github.com/Nycolazs/MetalDuck) 与 [MetalGoose](https://github.com/Stallion77RepoOfficial/MetalGoose) — macOS Metal 窗口缩放的早期参考实现。
+
+全部 14 个 `.metal` 着色器文件的详细上游来源、移植方式与原始版权声明见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
+
+## 开源协议
+
+MetalPie 基于 [GNU General Public License v3.0 (GPL-3.0)](LICENSE) 协议开源。
