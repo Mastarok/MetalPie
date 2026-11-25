@@ -519,5 +519,32 @@ struct ScalingLayoutTests {
         #expect(hd1080To1440.effectPasses[0].outputSize == PixelSize(width: 3840, height: 2160))
         #expect(hd1080To1440.effectPasses[1].isAutoInsertedFallback)
         #expect(hd1080To1440.effectPasses[1].outputSize == PixelSize(width: 2560, height: 1440))
+
+        // 6. Exhaustive audit across ALL 21 built-in presets on native 3K (3024x1898 -> 3024x1896)
+        //    and near-native 1440p -> 3K (2560x1440 -> 3024x1898): ZERO presets may ever blow up
+        //    any intermediate pass above max(source, target) (no 5K/6K overscaling anywhere).
+        let nearNativeCases: [(PixelSize, PixelSize)] = [
+            (PixelSize(width: 3024, height: 1898), PixelSize(width: 3024, height: 1896)),
+            (PixelSize(width: 3024, height: 1898), PixelSize(width: 3024, height: 1898)),
+            (PixelSize(width: 2560, height: 1440), PixelSize(width: 3024, height: 1898)),
+            (PixelSize(width: 3840, height: 2160), PixelSize(width: 3840, height: 2160))
+        ]
+        for preset in ScalingMode.builtInPresets {
+            for (src, dst) in nearNativeCases {
+                let maxAllowedW = max(src.width, dst.width)
+                let maxAllowedH = max(src.height, dst.height)
+                let layout = ScalingLayoutCalculator.calculate(
+                    sourcePixelSize: src,
+                    targetPixelSize: dst,
+                    effects: preset.effects
+                )
+                for pass in layout.effectPasses {
+                    #expect(
+                        pass.outputSize.width <= maxAllowedW && pass.outputSize.height <= maxAllowedH,
+                        "Preset '\(preset.name)' overscaled \(src.width)x\(src.height) -> \(dst.width)x\(dst.height) into \(pass.outputSize.width)x\(pass.outputSize.height) at pass \(pass.effectID.rawValue)"
+                    )
+                }
+            }
+        }
     }
 }
