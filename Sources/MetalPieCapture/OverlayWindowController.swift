@@ -1716,19 +1716,26 @@ public final class OverlayWindowController {
     ) -> CGRect {
         switch presentationMode {
         case .fullscreen:
+            let fullDisplayRect = ScreenGeometry.targetCocoaFrame(
+                forCGRect: sourceCGRect,
+                mode: multiMonitorMode,
+                in: displays
+            )
             var rect = (respectNotchSafeArea
                 ? ScreenGeometry.targetFullscreenSafeCocoaFrame(
                     forCGRect: sourceCGRect,
                     mode: multiMonitorMode,
                     in: displays
                 )
-                : ScreenGeometry.targetCocoaFrame(
-                    forCGRect: sourceCGRect,
-                    mode: multiMonitorMode,
-                    in: displays
-                )) ?? NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1280, height: 720)
+                : fullDisplayRect) ?? NSScreen.main?.frame ?? CGRect(x: 0, y: 0, width: 1280, height: 720)
 
-            if applyAntiOcclusion {
+            // On notched MacBooks where `respectNotchSafeArea` already leaves the top notch band
+            // uncovered (plus `panel.alphaValue = 0.999` prevents per-window occlusion), skip the
+            // extra 1pt bottom shrink so maximized 3024x1898 windows match the overlay 1:1 without
+            // triggering a wasteful 2px fractional Auto-Bicubic resample pass every frame!
+            let alreadyExcludedNotchBand = respectNotchSafeArea
+                && fullDisplayRect.map({ rect.height < $0.height - 0.5 }) == true
+            if applyAntiOcclusion && !alreadyExcludedNotchBand {
                 rect = ScreenGeometry.antiOcclusionInset(cocoaRect: rect, insetPoints: 1.0)
             }
             return rect

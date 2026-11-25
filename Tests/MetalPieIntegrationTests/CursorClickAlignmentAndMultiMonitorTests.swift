@@ -801,7 +801,8 @@ struct CursorClickAlignmentAndMultiMonitorTests {
             )
             #expect(metrics.displayID == display.id, "Overlay jumped away from display '\(display.name)' (\(display.id)) to \(metrics.displayID)!")
             #expect(abs(metrics.cocoaFrame.minX - display.notchSafeCocoaFrame.minX) < 0.5)
-            #expect(abs(metrics.cocoaFrame.minY - (display.notchSafeCocoaFrame.minY + 1.0)) < 0.5)
+            let expectedBottomInset: CGFloat = display.hasNotch ? 0.0 : 1.0
+            #expect(abs(metrics.cocoaFrame.minY - (display.notchSafeCocoaFrame.minY + expectedBottomInset)) < 0.5)
             #expect(abs(metrics.cocoaFrame.maxY - display.notchSafeCocoaFrame.maxY) < 0.5)
             #expect(abs(metrics.cgFrame.minX - display.notchSafeCGBounds.minX) < 0.5)
             #expect(abs(metrics.cgFrame.minY - display.notchSafeCGBounds.minY) < 0.5)

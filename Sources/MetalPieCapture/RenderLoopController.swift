@@ -267,6 +267,7 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         var presentCounter = RollingFPSCounter(windowSeconds: 0.6)
         var lastPublishTime: Double = 0
         var lastRenderConsumeTime: Double = 0
+        var lastDisplayTickTime: Double = 0
         var displayIntervalSeconds: Double = 1.0 / 60.0
         var resizeGraceUntil: Double = 0
         var lastSourceSize: PixelSize = .zero
@@ -353,14 +354,21 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         }
     }
 
+    func recordDisplayLinkTick(now: Double) {
+        lock.withLock { s in
+            s.lastDisplayTickTime = now
+        }
+    }
+
     func recordSourceFrame(now: Double, mailboxSuperseded: Bool) {
         lock.withLock { s in
-            // Distinguish true render-deadline-miss drops from harmless sub-vsync mailbox coalescing
-            // and transient source/drawable dimension changes during live window resize / titlebar zoom.
+            // Distinguish true render-deadline-miss drops from harmless sub-vsync mailbox coalescing,
+            // irregular-FPS source bursts waking from idle, and transient live window resize transitions.
+            let lastActiveRender = max(s.lastRenderConsumeTime, s.lastDisplayTickTime)
             if mailboxSuperseded,
                now >= s.resizeGraceUntil,
-               s.lastRenderConsumeTime > 0,
-               (now - s.lastRenderConsumeTime) > s.displayIntervalSeconds * 1.45
+               lastActiveRender > 0,
+               (now - lastActiveRender) > s.displayIntervalSeconds * 1.45
             {
                 s.telemetry.droppedFrames &+= 1
             }
@@ -934,6 +942,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private struct SharedControlState: Sendable {
         var isRunning: Bool = false
         var isPaused: Bool = false
+        var usesWakeupDriver: Bool = false
         var sessionGeneration: UInt64 = 0
         var inFlightCommandBuffers: Int = 0
         var configuration: RenderSessionConfiguration?
@@ -982,6 +991,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private var lastRawSourceTexture: (any MTLTexture)?
     private var lastRawContentPixelRect: PixelRect = .zero
     private var lastRawSourceIsHDR: Bool = false
+    private var lastRawSourceStagedTime: Double = 0
     private var frameIndex: UInt64 = 0
 
     // Frame Generation history ring (4-slot private GPU ring so in-flight frames NEVER alias or stall!).
@@ -1194,6 +1204,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         let pendingShots: [@Sendable (Result<CGImage, Error>) -> Void] = control.withLock { s in
             s.isRunning = false
             s.isPaused = false
+            s.usesWakeupDriver = false
             s.sessionGeneration &+= 1
             s.configuration = nil
             s.latestLayout = nil
@@ -1232,6 +1243,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             controller.lastRawSourceTexture = nil
             controller.lastRawContentPixelRect = .zero
             controller.lastRawSourceIsHDR = false
+            controller.lastRawSourceStagedTime = 0
             controller.resetFrameGenStateOnRenderThread()
             controller.effectRenderer.reset()
         }
@@ -1241,7 +1253,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
     /// Deposits a captured GPU frame into the single-slot mailbox without blocking `SCStream`.
     public func ingest(frame: CapturedFrame) {
-        let (running, paused) = control.withLock { ($0.isRunning, $0.isPaused) }
+        let (running, paused, needsWakeup) = control.withLock { ($0.isRunning, $0.isPaused, $0.usesWakeupDriver) }
         guard running, !paused else { return }
 
         let now = CACurrentMediaTime()
@@ -1252,11 +1264,14 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             mailboxSuperseded: dropped
         )
 
-        // Wake the render thread immediately if running in low-latency direct-present or VRR mode.
-        renderThread.perform { [weak self] in
-            guard let self else { return }
-            if self.driverMode == .directPresent || self.driverMode == .vrrDirectScanout {
-                self.scheduleDirectOrVRRWakeupIfNeeded()
+        // Wake the render thread immediately ONLY in direct-present or VRR mode (skip 120Hz CFRunLoop
+        // wakeups & closure allocations when CAMetalDisplayLink is already driving the render thread).
+        if needsWakeup {
+            renderThread.perform { [weak self] in
+                guard let self else { return }
+                if self.driverMode == .directPresent || self.driverMode == .vrrDirectScanout {
+                    self.scheduleDirectOrVRRWakeupIfNeeded()
+                }
             }
         }
     }
@@ -1358,6 +1373,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             detachDisplayLinkOnRenderThread()
             cancelVRRBeatTimerOnRenderThread()
             driverMode = .stopped
+            control.withLock { $0.usesWakeupDriver = false }
             return
         }
 
@@ -1383,32 +1399,44 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                 displayLink = link
             }
             if let link = displayLink {
-                // Lock to full display refresh rate (never throttle link to 30Hz, avoiding 2x latency).
+                // Prefer full display refresh rate (e.g. 120Hz ProMotion) while allowing smooth
+                // stepping down to 60Hz when heavy shaders exceed 8.33ms (avoiding both 30Hz lag
+                // and hard 120Hz deadline judder).
                 link.preferredFrameRateRange = CAFrameRateRange(
-                    minimum: maxFPS,
+                    minimum: min(60.0, maxFPS),
                     maximum: maxFPS,
                     preferred: maxFPS
                 )
-                link.preferredFrameLatency = isFrameGenAllowedByConfig(config) ? 2.0 : 1.0
+                // Use triple-buffered latency = 2.0 on 90-120Hz+ ProMotion and standard sessions so
+                // GPU + WindowServer compositing have full 2-refresh pipelining headroom (zero 8.33ms
+                // deadline-miss judder). Keep 1.0 only for 60Hz ultra-low-latency 3D Game Mode without FG.
+                let useTightOneFrameLatency = config.profile.threeDGameMode
+                    && !isFrameGenAllowedByConfig(config)
+                    && maxFPS <= 65.0
+                link.preferredFrameLatency = useTightOneFrameLatency ? 1.0 : 2.0
                 link.isPaused = control.withLock(\.isPaused)
             }
             driverMode = .displayLink
+            control.withLock { $0.usesWakeupDriver = false }
 
         case .directPresent:
             detachDisplayLinkOnRenderThread()
             cancelVRRBeatTimerOnRenderThread()
             driverMode = .directPresent
+            control.withLock { $0.usesWakeupDriver = true }
 
         case .vrrDirectScanout:
             detachDisplayLinkOnRenderThread()
             cancelDirectPaceTimerOnRenderThread()
             driverMode = .vrrDirectScanout
+            control.withLock { $0.usesWakeupDriver = true }
 
         case .stopped:
             detachDisplayLinkOnRenderThread()
             cancelDirectPaceTimerOnRenderThread()
             cancelVRRBeatTimerOnRenderThread()
             driverMode = .stopped
+            control.withLock { $0.usesWakeupDriver = false }
         }
     }
 
@@ -1716,11 +1744,21 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
             // Retain a private GPU copy of the latest clean raw source frame (zero IOSurface hoarding) so
             // mid-session `updateConfiguration` changes can immediately re-run effects on static windows.
-            stageLastRawSourceTexture(
-                sourceTexture: activeFrameTexture,
-                isHDR: frame.isHDR,
-                commandBuffer: commandBuffer
-            )
+            // Throttle staging to ~4 Hz when dimensions/HDR are unchanged to avoid 5.5 GB/s of redundant
+            // 3K blits during active 120Hz playback.
+            let rawNeedsStage = lastRawSourceTexture == nil
+                || lastRawSourceTexture?.width != activeFrameTexture.width
+                || lastRawSourceTexture?.height != activeFrameTexture.height
+                || lastRawSourceIsHDR != frame.isHDR
+                || (now - lastRawSourceStagedTime) >= 0.25
+            if rawNeedsStage {
+                stageLastRawSourceTexture(
+                    sourceTexture: activeFrameTexture,
+                    isHDR: frame.isHDR,
+                    commandBuffer: commandBuffer
+                )
+                lastRawSourceStagedTime = now
+            }
 
             // Re-evaluate FG plan after recording the latest cadence sample so 60fps on 60Hz bypasses immediately.
             let postPlan = evaluateFrameGenPlan(config: config)
@@ -2561,6 +2599,7 @@ extension RenderLoopController: CAMetalDisplayLinkDelegate {
         needsUpdate update: CAMetalDisplayLink.Update
     ) {
         let now = CACurrentMediaTime()
+        telemetry.recordDisplayLinkTick(now: now)
         let maxFPS = control.withLock { $0.configuration?.overlayMetrics.screenMaxFPS ?? 60.0 }
         let vsyncPeriod = 1.0 / max(30.0, maxFPS)
         executeRenderStepOnRenderThread(

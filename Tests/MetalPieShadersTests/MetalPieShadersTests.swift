@@ -1554,6 +1554,72 @@ struct MetalPieShadersGPUValidationTests {
             #expect(res.averageGPUMilliseconds > 0.0, "Benchmark GPU ms must be > 0 for \(res.effectID.rawValue)")
         }
         print("==========================================================================")
+
+        // 9c. Native 3K Retina (3024x1898 -> 3024x1898) real GPU timings across key presets
+        let (_, queue3k) = try Self.requireDeviceAndQueue()
+        let src3k = TestPatterns.diagonalEdges(device: device, width: 3024, height: 1898)
+        let dst3k = TestPatterns.makeOutputTexture(device: device, width: 3024, height: 1898)
+        renderer.usesExternalOutputCache = true
+        let keyPresetIDs = [
+            ScalingMode.metalFXSpatialID,
+            ScalingMode.fsr1ID,
+            ScalingMode.sgsrID,
+            ScalingMode.lanczos6ID,
+            ScalingMode.anime4kModeAID,
+            ScalingMode.anime4kModeBID,
+            ScalingMode.anime4kModeCID,
+            ScalingMode.anime4kModeBBID
+        ]
+        print("=== Native 3K (3024x1898 -> 3024x1898) Real GPU Timings (\(device.name)) ===")
+        for pid in keyPresetIDs {
+            guard let mode = ScalingMode.builtInPresets.first(where: { $0.id == pid }) else { continue }
+            let layout3k = ScalingLayoutCalculator.calculate(
+                sourcePixelSize: PixelSize(width: 3024, height: 1898),
+                targetPixelSize: PixelSize(width: 3024, height: 1898),
+                effects: mode.effects
+            )
+            // Warm up 1 frame
+            if let warmCB = queue3k.makeCommandBuffer() {
+                _ = try renderer.encode(
+                    scalingMode: mode,
+                    context: EffectRenderContext(
+                        device: device,
+                        commandBuffer: warmCB,
+                        sourceTexture: src3k,
+                        destinationTexture: dst3k,
+                        layout: layout3k,
+                        isHDR: false,
+                        frameIndex: 1,
+                        duplicateFrameMode: .never
+                    )
+                )
+                warmCB.commit()
+                warmCB.waitUntilCompleted()
+            }
+            var sumMs = 0.0
+            for iter in 0..<4 {
+                guard let cb = queue3k.makeCommandBuffer() else { continue }
+                _ = try renderer.encode(
+                    scalingMode: mode,
+                    context: EffectRenderContext(
+                        device: device,
+                        commandBuffer: cb,
+                        sourceTexture: src3k,
+                        destinationTexture: dst3k,
+                        layout: layout3k,
+                        isHDR: false,
+                        frameIndex: UInt64(10 + iter),
+                        duplicateFrameMode: .never
+                    )
+                )
+                cb.commit()
+                cb.waitUntilCompleted()
+                sumMs += max(0.0, (cb.gpuEndTime - cb.gpuStartTime) * 1000.0)
+            }
+            let avgMs = sumMs / 4.0
+            print(String(format: "  %-24s | avg %6.2f ms (%6.1f FPS)", (mode.name as NSString).utf8String!, avgMs, avgMs > 0 ? 1000.0 / avgMs : 0))
+        }
+        print("==========================================================================")
     }
 
     // 10. Verifier Audit Regressions (Intermediate Output 1:1, Same-Queue SceneDiff, Cache Isolation, Demagnify+Crop)

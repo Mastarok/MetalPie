@@ -633,20 +633,17 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
 
         // 4. Execute Ordered Effect Chain (`activeLayout.effectPasses`, including any auto-Bicubic fallback).
         let rwUsage: MTLTextureUsage = [.shaderRead, .shaderWrite, .renderTarget]
-        for (passIdx, passLayout) in activeLayout.effectPasses.enumerated() {
-            let safePassOut = ScalingLayoutCalculator.clampAspectPreserving(passLayout.outputSize)
-            let outW = clampMetalTextureDimension(safePassOut.width)
-            let outH = clampMetalTextureDimension(safePassOut.height)
-            let targetLease = try texturePool.acquire(
-                width: outW,
-                height: outH,
-                pixelFormat: workingFormat,
-                usage: rwUsage,
-                storageMode: .private,
-                label: "MetalPie_Pass\(passIdx)_\(passLayout.effectID.rawValue)"
-            )
-            frameLeases.append(targetLease)
+        let dstCanBeDirectLastPassTarget = externalOutputCache
+            && context.destinationTexture.usage.contains(.shaderWrite)
+            && context.destinationTexture.usage.contains(.renderTarget)
+            && context.destinationTexture.pixelFormat == workingFormat
 
+        // Pre-filter any redundant standalone `anime4kClampHighlights` pass that immediately follows an
+        // Anime4K CNN pass at the exact same resolution which already executed highlight clamping inline.
+        var executablePasses: [(passLayout: EffectPassLayout, params: EffectParameters)] = []
+        executablePasses.reserveCapacity(activeLayout.effectPasses.count)
+        var prevClampedHighlightsSize: PixelSize? = nil
+        for (passIdx, passLayout) in activeLayout.effectPasses.enumerated() {
             let params: EffectParameters
             if passLayout.isAutoInsertedFallback {
                 params = ["b": .float(0.0), "c": .float(0.5)]
@@ -658,23 +655,73 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
                 params = EffectCatalog.descriptor(for: passLayout.effectID).defaultParameters
             }
 
+            if passLayout.effectID == .anime4kClampHighlights,
+               !passLayout.isAutoInsertedFallback,
+               let prevSize = prevClampedHighlightsSize,
+               prevSize == passLayout.inputSize,
+               prevSize == passLayout.outputSize
+            {
+                continue
+            }
+
+            executablePasses.append((passLayout, params))
+            switch passLayout.effectID {
+            case .anime4kRestore, .anime4kUpscale, .anime4kUpscaleDenoise:
+                prevClampedHighlightsSize = params.bool("clampHighlights", default: true) ? passLayout.outputSize : nil
+            default:
+                prevClampedHighlightsSize = nil
+            }
+        }
+
+        var wroteDirectlyToDestination = false
+        for (execIdx, entry) in executablePasses.enumerated() {
+            let passLayout = entry.passLayout
+            let params = entry.params
+            let safePassOut = ScalingLayoutCalculator.clampAspectPreserving(passLayout.outputSize)
+            let outW = clampMetalTextureDimension(safePassOut.width)
+            let outH = clampMetalTextureDimension(safePassOut.height)
+
+            let isFinalPass = (execIdx == executablePasses.count - 1)
+            let useDirectDest = isFinalPass
+                && dstCanBeDirectLastPassTarget
+                && outW == context.destinationTexture.width
+                && outH == context.destinationTexture.height
+                && (currentTex as AnyObject) !== (context.destinationTexture as AnyObject)
+
+            let passDestTexture: any MTLTexture
+            if useDirectDest {
+                passDestTexture = context.destinationTexture
+                wroteDirectlyToDestination = true
+            } else {
+                let targetLease = try texturePool.acquire(
+                    width: outW,
+                    height: outH,
+                    pixelFormat: workingFormat,
+                    usage: rwUsage,
+                    storageMode: .private,
+                    label: "MetalPie_Pass\(execIdx)_\(passLayout.effectID.rawValue)"
+                )
+                frameLeases.append(targetLease)
+                passDestTexture = targetLease.texture
+            }
+
             try encodeSingleEffect(
                 effectID: passLayout.effectID,
                 parameters: params,
                 source: currentTex,
-                destination: targetLease.texture,
+                destination: passDestTexture,
                 isHDR: context.isHDR,
                 frameIndex: context.frameIndex,
                 commandBuffer: cb,
                 frameLeases: &frameLeases
             )
 
-            currentTex = targetLease.texture
+            currentTex = passDestTexture
             let desc = EffectCatalog.descriptor(for: passLayout.effectID)
             let passName = passLayout.isAutoInsertedFallback
                 ? "Auto Bicubic (\(outW)x\(outH))"
                 : "\(desc.nameEN) (\(outW)x\(outH))"
-            let passID = "\(passIdx)_\(passLayout.effectID.rawValue)"
+            let passID = "\(execIdx)_\(passLayout.effectID.rawValue)"
             let colorHex = passLayout.isAutoInsertedFallback ? "#8E8E93" : Self.colorHex(for: desc.category)
             passRecords.append((
                 id: passID,
@@ -707,14 +754,17 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
         }
 
         // 6. Output Copy (1:1 when destination is an intermediate upscaled buffer) or Single-Pass TBDR Present.
-        try encodeOutputOrPresent(
-            contentTexture: currentTex,
-            destinationTexture: context.destinationTexture,
-            layout: activeLayout,
-            isHDR: context.isHDR,
-            allowOverlays: allowLiveStateMutation,
-            commandBuffer: cb
-        )
+        // Skipped when the final effect pass already rendered directly into `context.destinationTexture`!
+        if !wroteDirectlyToDestination {
+            try encodeOutputOrPresent(
+                contentTexture: currentTex,
+                destinationTexture: context.destinationTexture,
+                layout: activeLayout,
+                isHDR: context.isHDR,
+                allowOverlays: allowLiveStateMutation,
+                commandBuffer: cb
+            )
+        }
         passRecords.append((
             id: "present",
             name: "Present (\(context.destinationTexture.width)x\(context.destinationTexture.height))",

@@ -1817,7 +1817,8 @@ struct WindowOcclusionAndCoverageTests {
         #expect(nativeFSFrame == CGRect(x: 0, y: 0, width: 1512, height: 949))
         #expect(nativeFSFrame.maxY <= 949.0)
 
-        // 3. Desktop window scaled to fullscreen on notched MacBook -> (0, 1, 1512, 948), maxY == 949 (ZERO notch overflow!)
+        // 3. Desktop window scaled to fullscreen on notched MacBook -> exact (0, 0, 1512, 949) = 3024x1898
+        //    (notch band + alphaValue=0.999 already prevent occlusion without 1pt bottom shrink causing 2px Auto-Bicubic!)
         let desktopFSFrame = OverlayWindowController.computeOverlayCocoaFrame(
             sourceCGRect: CGRect(x: 120, y: 120, width: 960, height: 600),
             presentationMode: .fullscreen,
@@ -1827,7 +1828,7 @@ struct WindowOcclusionAndCoverageTests {
             applyAntiOcclusion: true,
             respectNotchSafeArea: true
         )
-        #expect(desktopFSFrame == CGRect(x: 0, y: 1, width: 1512, height: 948))
+        #expect(desktopFSFrame == CGRect(x: 0, y: 0, width: 1512, height: 949))
         #expect(desktopFSFrame.maxY <= 949.0)
 
         // 4. External non-notched DELL -> fills full (1512, 982, 1280, 720) edge-to-edge!
