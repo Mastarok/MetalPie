@@ -429,13 +429,13 @@ public enum PreviewSampleGenerator {
             .font: NSFont.systemFont(ofSize: 22, weight: .bold),
             .foregroundColor: NSColor.white
         ]
-        NSString(string: "MetalPie 4K Ultra").draw(at: CGPoint(x: 20, y: 20), withAttributes: titleAttrs)
+        NSString(string: "MetalPie").draw(at: CGPoint(x: 20, y: 20), withAttributes: titleAttrs)
 
         let subAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
             .foregroundColor: NSColor(calibratedRed: 0.42, green: 0.86, blue: 1.0, alpha: 1)
         ]
-        NSString(string: "金属派 Apple Silicon 超分与帧生成").draw(at: CGPoint(x: 20, y: 52), withAttributes: subAttrs)
+        NSString(string: "Apple Silicon 超分与帧生成").draw(at: CGPoint(x: 20, y: 52), withAttributes: subAttrs)
 
         let bodyAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
