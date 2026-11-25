@@ -17,11 +17,11 @@ public enum PreviewSampleScene: String, CaseIterable, Identifiable, Sendable {
     public func title(_ l10n: L10n) -> String {
         switch self {
         case .pixelArtAnime:
-            return l10n.tr("Pixel Art & Anime Lines", "像素画与动漫线条")
+            return l10n.tr("Pixel / Anime", "像素 / 动漫")
         case .textAndEdges:
-            return l10n.tr("Sharp Text & Diagonals", "清晰文字与斜线边缘")
+            return l10n.tr("Text / Lines", "文字 / 线条")
         case .gradientDeband:
-            return l10n.tr("Dark Gradients & Deband", "暗部渐变与去色带")
+            return l10n.tr("Gradient", "渐变")
         }
     }
 }

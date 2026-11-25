@@ -31,11 +31,11 @@ public enum AppTab: String, CaseIterable, Identifiable, Sendable {
 
     public func title(_ l10n: L10n) -> String {
         switch self {
-        case .home: return l10n.tr("Scale", "开始缩放")
+        case .home: return l10n.tr("Home", "主页")
         case .effects: return l10n.tr("Scaling Modes", "缩放模式")
         case .profiles: return l10n.tr("Profiles", "配置文件")
         case .settings: return l10n.tr("Settings", "设置")
-        case .diagnostics: return l10n.tr("Benchmark", "显卡测速")
+        case .diagnostics: return l10n.tr("Benchmark", "性能测试")
         }
     }
 }
@@ -343,16 +343,10 @@ public final class AppCoordinator {
                     await self.reconfigureActiveSession()
                     self.showToast(
                         icon: "checkmark.circle.fill",
-                        title: self.l10n.tr(
-                            "Accessibility Enabled — Clicks Aligned",
-                            "辅助功能已开启，缩放鼠标已自动对齐"
-                        ),
-                        subtitle: self.l10n.tr(
-                            "Scaled clicks are now aligned without restarting scaling.",
-                            "无需重启缩放，现在放大画面中的点击已精准对齐。"
-                        ),
+                        title: self.l10n.tr("Accessibility Enabled", "辅助功能已授权"),
+                        subtitle: self.l10n.tr("Cursor aligned.", "光标已对齐"),
                         style: .success,
-                        durationSeconds: 3.2
+                        durationSeconds: 2.6
                     )
                 }
             }
@@ -684,8 +678,8 @@ public final class AppCoordinator {
     public func createNewScalingMode() -> ScalingMode {
         let newMode = ScalingMode(
             id: UUID(),
-            name: l10n.tr("Custom Scaling Mode", "自定义缩放模式"),
-            localizedDescription: l10n.tr("Custom multi-pass GPU effect chain.", "自由组合滤镜与超分效果的自定义模式。"),
+            name: l10n.tr("Custom Mode", "自定义模式"),
+            localizedDescription: "",
             effects: [
                 EffectInstance(effectID: .fsr1EASU, scalingType: .fit),
                 EffectInstance(effectID: .cas, scalingType: .normal, parameters: ["sharpness": .float(0.35)])
@@ -761,7 +755,7 @@ public final class AppCoordinator {
         persistConfig(reconfigureHotkeys: true, reconfigureSession: true)
         showToast(
             icon: "arrow.counterclockwise.circle.fill",
-            title: l10n.tr("Configuration Reset", "配置已恢复默认"),
+            title: l10n.tr("Defaults Restored", "已恢复默认"),
             style: .info
         )
     }
@@ -828,8 +822,8 @@ public final class AppCoordinator {
         telemetry.state = .countingDown
 
         let modeLabel = mode.isFullscreen
-            ? l10n.tr("Fullscreen", "全屏放大")
-            : l10n.tr("Windowed", "窗口放大")
+            ? l10n.tr("Fullscreen", "全屏")
+            : l10n.tr("Windowed", "窗口")
         let targetAnchor = specificWindow.flatMap {
             ScreenGeometry.bestDisplay(forCGRect: $0.cgBounds, in: self.displays)?.cocoaFrame
         }
@@ -842,11 +836,10 @@ public final class AppCoordinator {
                 self.toastPanel.show(
                     icon: "timer",
                     title: self.l10n.tr(
-                        "Scaling (\(modeLabel)) in \(remaining)s…",
-                        "\(remaining) 秒后\(modeLabel)…"
+                        "Scaling (\(modeLabel)) in \(remaining)s",
+                        "\(remaining)s 后\(modeLabel)缩放"
                     ),
-                    subtitle: specificWindow?.displayName
-                        ?? self.l10n.tr("Switch to your game/app window now", "现在请切换到你想放大的游戏或视频窗口"),
+                    subtitle: specificWindow?.displayName,
                     style: .countdown,
                     durationSeconds: nil,
                     anchorScreenFrame: targetAnchor
@@ -906,8 +899,7 @@ public final class AppCoordinator {
         guard let target = candidate else {
             showToast(
                 icon: "exclamationmark.triangle.fill",
-                title: l10n.tr("No Target Window Found", "未找到可缩放的目标窗口"),
-                subtitle: l10n.tr("Focus an application window or pick one in MetalPie", "请先聚焦目标应用窗口或在列表中选择"),
+                title: l10n.tr("No Target Window", "未找到目标窗口"),
                 style: .warning
             )
             return
@@ -1115,7 +1107,7 @@ public final class AppCoordinator {
         if showToast {
             self.showToast(
                 icon: "stop.circle.fill",
-                title: toastOverride ?? l10n.tr("Scaling Stopped", "已退出缩放"),
+                title: toastOverride ?? l10n.tr("Scaling Stopped", "缩放已停止"),
                 style: .info,
                 anchorScreenFrame: lastAnchor
             )
@@ -1135,7 +1127,7 @@ public final class AppCoordinator {
         if profile.threeDGameMode && activePresentationMode.isFullscreen {
             showToast(
                 icon: "lock.shield.fill",
-                title: l10n.tr("Windowed Mode Disabled in 3D Game Mode", "3D 游戏模式下已禁用窗口缩放"),
+                title: l10n.tr("3D Game Mode: Fullscreen Only", "3D 游戏模式仅支持全屏"),
                 style: .warning
             )
             return
@@ -1164,8 +1156,8 @@ public final class AppCoordinator {
         showToast(
             icon: nextMode.isFullscreen ? "arrow.up.left.and.arrow.down.right" : "macwindow",
             title: nextMode.isFullscreen
-                ? l10n.tr("Switched to Fullscreen Scaling", "已切换为全屏放大")
-                : l10n.tr("Switched to Windowed Scaling", "已切换为窗口放大"),
+                ? l10n.tr("Fullscreen", "全屏缩放")
+                : l10n.tr("Windowed", "窗口缩放"),
             style: .info
         )
     }
@@ -1184,8 +1176,8 @@ public final class AppCoordinator {
         showToast(
             icon: isWindowedClickThrough ? "lock.fill" : "hand.draw.fill",
             title: isWindowedClickThrough
-                ? l10n.tr("Window Locked (Click-Through)", "窗口已锁定（鼠标可正常点选）")
-                : l10n.tr("Window Unlocked (Drag Edges to Resize)", "窗口已解锁（拖动边缘可调整大小）"),
+                ? l10n.tr("Window Locked", "窗口已锁定")
+                : l10n.tr("Window Unlocked", "窗口已解锁"),
             style: .info
         )
     }
@@ -1309,7 +1301,7 @@ public final class AppCoordinator {
         guard isScalingSessionOpen, let renderLoop = renderLoopController else {
             showToast(
                 icon: "camera.badge.ellipsis",
-                title: l10n.tr("Start Scaling to Take a Screenshot", "请先启动缩放后再截图"),
+                title: l10n.tr("No Active Session", "当前未在缩放"),
                 style: .warning
             )
             return nil
@@ -1342,7 +1334,7 @@ public final class AppCoordinator {
             PipelineLog.shared.info(.app, "Saved cursor-free PNG screenshot to \(fileURL.path).")
             showToast(
                 icon: "camera.fill",
-                title: l10n.tr("Screenshot Saved", "高清无光标截图已保存"),
+                title: l10n.tr("Screenshot Saved", "截图已保存"),
                 subtitle: fileURL.lastPathComponent,
                 style: .success
             )
@@ -1351,7 +1343,7 @@ public final class AppCoordinator {
             PipelineLog.shared.error(.app, "Screenshot failed: \(error.localizedDescription)")
             showToast(
                 icon: "exclamationmark.triangle.fill",
-                title: l10n.tr("Screenshot Failed", "截图保存失败"),
+                title: l10n.tr("Screenshot Failed", "截图失败"),
                 subtitle: error.localizedDescription,
                 style: .warning
             )
@@ -1439,7 +1431,7 @@ public final class AppCoordinator {
             refreshLogs()
             showToast(
                 icon: "checkmark.seal.fill",
-                title: l10n.tr("Shader Cache Rebuilt", "着色器二进制缓存已重建"),
+                title: l10n.tr("Cache Rebuilt", "缓存已重建"),
                 style: .success
             )
         } catch {
@@ -1491,16 +1483,13 @@ public final class AppCoordinator {
         didWarnAccessibilityForCurrentSession = true
         showToast(
             icon: "hand.point.up.left.and.text.fill",
-            title: l10n.tr(
-                "Accessibility Required for Scaled Clicks",
-                "需要开启辅助功能，缩放后点击才能对齐"
-            ),
+            title: l10n.tr("Accessibility Required", "需要辅助功能权限"),
             subtitle: l10n.tr(
-                "Enable Accessibility in System Settings so clicks align with buttons and don't exit scaling.",
-                "未开启时点击按钮会错位或误点桌面退出；开启后会自动对齐，无需重启缩放。"
+                "Scaled clicks will be offset until enabled.",
+                "未开启辅助功能，缩放后光标点击将偏移"
             ),
             style: .warning,
-            durationSeconds: 5.0,
+            durationSeconds: 4.5,
             anchorScreenFrame: anchorScreenFrame
         )
     }
@@ -1514,7 +1503,7 @@ public final class AppCoordinator {
             await stopScaling(
                 isManual: true,
                 showToast: true,
-                toastOverride: l10n.tr("Force Exited Scaling (⌃⌥⌘⎋)", "已强制退出缩放 (⌃⌥⌘⎋)")
+                toastOverride: l10n.tr("Force Exited", "已强制退出")
             )
         case .toggleFullscreen:
             if countdownRemaining != nil {
@@ -1658,7 +1647,7 @@ public final class AppCoordinator {
                 await stopScaling(
                     isManual: false,
                     showToast: true,
-                    toastOverride: reason.map { l10n.tr("Capture Ended: \($0)", "画面采集已结束：\($0)") }
+                    toastOverride: reason.map { l10n.tr("Capture Ended: \($0)", "采集结束：\($0)") }
                 )
             }
         default:
@@ -1705,7 +1694,7 @@ public final class AppCoordinator {
             await stopScaling(
                 isManual: false,
                 showToast: true,
-                toastOverride: l10n.tr("Target Window Closed", "目标窗口已关闭，缩放已自动停止")
+                toastOverride: l10n.tr("Window Closed", "窗口已关闭")
             )
 
         case .targetMinimized:
@@ -1719,7 +1708,7 @@ public final class AppCoordinator {
             telemetry.state = .waitingForWindow
             showToast(
                 icon: "arrow.down.right.and.arrow.up.left",
-                title: l10n.tr("Waiting for Window Restore…", "目标窗口已最小化，等待恢复…"),
+                title: l10n.tr("Window Minimized", "窗口已最小化"),
                 style: .info
             )
 
@@ -1771,8 +1760,8 @@ public final class AppCoordinator {
                 isManual: false,
                 showToast: true,
                 toastOverride: l10n.tr(
-                    "3D Game Mode Stopped (Overlapped by \(overlapping.appName))",
-                    "3D 游戏模式已自动退出（检测到 \(overlapping.appName) 窗口遮挡）"
+                    "Stopped (Overlapped by \(overlapping.appName))",
+                    "已停止（\(overlapping.appName) 遮挡）"
                 )
             )
 
@@ -2093,7 +2082,7 @@ public final class AppCoordinator {
         PipelineLog.shared.error(.app, "Scaling session error: \(error.localizedDescription)")
         showToast(
             icon: "exclamationmark.octagon.fill",
-            title: l10n.tr("Unable to Start Scaling", "无法启动缩放"),
+            title: l10n.tr("Scaling Failed", "启动失败"),
             subtitle: error.localizedDescription,
             style: .warning
         )

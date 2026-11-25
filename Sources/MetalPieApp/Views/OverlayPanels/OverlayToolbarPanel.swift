@@ -307,8 +307,8 @@ private struct OverlayToolbarSwiftUIView: View {
                     symbol: state.isWindowedClickThrough ? "lock.fill" : "arrow.up.and.down.and.arrow.left.and.right",
                     active: !state.isWindowedClickThrough,
                     helpText: state.isWindowedClickThrough
-                        ? l10n.tr("Unlock Window Drag/Resize", "解锁窗口拖拽与调大小")
-                        : l10n.tr("Lock Click-Through", "锁定鼠标穿透")
+                        ? l10n.tr("Unlock Window", "解锁窗口")
+                        : l10n.tr("Lock Window", "锁定窗口")
                 ) {
                     actionsProvider()?.onToggleClickThrough()
                 }
@@ -318,7 +318,7 @@ private struct OverlayToolbarSwiftUIView: View {
             toolbarIconButton(
                 symbol: "chart.bar.xaxis",
                 active: state.isProfilerVisible,
-                helpText: l10n.tr("Toggle Performance Overlay", "显示 / 隐藏帧率信息")
+                helpText: l10n.tr("Profiler", "监视器")
             ) {
                 actionsProvider()?.onToggleProfilerHUD()
             }
@@ -327,7 +327,7 @@ private struct OverlayToolbarSwiftUIView: View {
             toolbarIconButton(
                 symbol: "camera.fill",
                 active: false,
-                helpText: l10n.tr("Cursor-Free Screenshot", "无光标高清截图")
+                helpText: l10n.tr("Screenshot", "截图")
             ) {
                 actionsProvider()?.onCaptureScreenshot()
             }
@@ -340,8 +340,8 @@ private struct OverlayToolbarSwiftUIView: View {
                         : "arrow.up.left.and.arrow.down.right",
                     active: false,
                     helpText: state.isFullscreen
-                        ? l10n.tr("Switch to Windowed Scaling", "切换为窗口放大")
-                        : l10n.tr("Switch to Fullscreen Scaling", "切换为全屏放大")
+                        ? l10n.tr("Windowed", "窗口")
+                        : l10n.tr("Fullscreen", "全屏")
                 ) {
                     actionsProvider()?.onTogglePresentationMode()
                 }
@@ -352,8 +352,8 @@ private struct OverlayToolbarSwiftUIView: View {
                 symbol: state.isPaused ? "play.fill" : "pause.fill",
                 active: state.isPaused,
                 helpText: state.isPaused
-                    ? l10n.tr("Resume Scaling", "继续缩放")
-                    : l10n.tr("Pause Scaling", "暂停缩放")
+                    ? l10n.tr("Resume", "继续")
+                    : l10n.tr("Pause", "暂停")
             ) {
                 actionsProvider()?.onTogglePause()
             }
@@ -367,7 +367,7 @@ private struct OverlayToolbarSwiftUIView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "stop.fill")
                         .font(.system(size: 10, weight: .bold))
-                    Text(l10n.tr("Stop", "退出"))
+                    Text(l10n.tr("Stop", "停止"))
                         .font(.system(size: 11.5, weight: .semibold))
                 }
                 .foregroundStyle(.white)
@@ -376,7 +376,7 @@ private struct OverlayToolbarSwiftUIView: View {
                 .background(Color.red.opacity(0.82), in: Capsule())
             }
             .buttonStyle(.plain)
-            .help(l10n.tr("Stop Scaling (⌃⌥⌘⎋ Force Exit)", "退出缩放（按 ⌃⌥⌘⎋ 随时强制退出）"))
+            .help(l10n.tr("Stop (⌃⌥⌘⎋)", "停止 (⌃⌥⌘⎋)"))
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)

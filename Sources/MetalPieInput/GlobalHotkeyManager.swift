@@ -5,18 +5,24 @@ import os
 
 /// Private memory-safe bridge passed as `userData` to Carbon's `InstallEventHandler`.
 private final class CarbonHotkeyBridge: @unchecked Sendable {
-    private let callbackLock = OSAllocatedUnfairLock<(@Sendable (UInt32) -> Void)?>(initialState: nil)
+    /// Concrete struct wrapper prevents Swift's generic `inout` closure reabstraction
+    /// writeback bug in `OSAllocatedUnfairLock<Closure?>`.
+    private struct CallbackState: Sendable {
+        var callback: (@Sendable (UInt32) -> Void)?
+    }
+
+    private let state: OSAllocatedUnfairLock<CallbackState>
 
     init(callback: @escaping @Sendable (UInt32) -> Void) {
-        callbackLock.withLock { $0 = callback }
+        self.state = OSAllocatedUnfairLock(initialState: CallbackState(callback: callback))
     }
 
     func invalidate() {
-        callbackLock.withLock { $0 = nil }
+        state.withLock { $0.callback = nil }
     }
 
     func handleHotKeyID(_ id: UInt32) {
-        let cb = callbackLock.withLock { $0 }
+        let cb = state.withLock(\.callback)
         cb?(id)
     }
 }

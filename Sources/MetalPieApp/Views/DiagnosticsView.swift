@@ -13,9 +13,9 @@ private enum BenchmarkResolutionPreset: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .p720to1440: return "720p → 2K (2×)"
-        case .p1080to4K: return "1080p → 4K (2×)"
-        case .p360to720: return "360p → 720p (2×)"
+        case .p720to1440: return "720p → 1440p"
+        case .p1080to4K: return "1080p → 4K"
+        case .p360to720: return "360p → 720p"
         }
     }
 
@@ -36,7 +36,7 @@ private enum BenchmarkResolutionPreset: String, CaseIterable, Identifiable {
     }
 }
 
-/// Hardware & Multi-Monitor Inspector, One-Click 30-Shader GPU Benchmark, Shader Cache & Logs (`显卡测速` / `Benchmark`).
+/// Hardware summary, connected displays, shader benchmark, cache, and logs (`性能测试` / `Benchmark`).
 struct DiagnosticsView: View {
     @Bindable var coordinator: AppCoordinator
 
@@ -57,23 +57,14 @@ struct DiagnosticsView: View {
 
     var body: some View {
         let l10n = coordinator.l10n
-        let effectCount = EffectID.allCases.count
 
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(l10n.tr("GPU Benchmark & Hardware Info", "显卡测速与硬件信息"))
-                            .font(.system(size: 22, weight: .bold))
-                        Text(l10n.tr(
-                            "Check your Apple Silicon GPU, connected multi-monitor setup, benchmark all \(effectCount) shaders, and inspect logs.",
-                            "查看本机芯片与多显示器状态、一键实测全部 \(effectCount) 种画质算法的帧率表现，并查看运行日志。"
-                        ))
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                    }
+                VStack(alignment: .leading, spacing: 14) {
+                    Text(l10n.tr("Benchmark", "性能测试"))
+                        .font(.system(size: 20, weight: .bold))
 
-                    hardwareCapabilitiesCard(l10n: l10n)
+                    hardwareSummaryBar(l10n: l10n)
                     connectedDisplaysCard(l10n: l10n)
                     gpuBenchmarkCard(l10n: l10n)
                         .id("gpuBenchmarkCard")
@@ -105,101 +96,76 @@ struct DiagnosticsView: View {
         }
     }
 
-    // MARK: - Hardware Capabilities
+    // MARK: - Compact Hardware Summary
 
-    private func hardwareCapabilitiesCard(l10n: L10n) -> some View {
+    private func hardwareSummaryBar(l10n: L10n) -> some View {
         let cap = coordinator.capabilities
-        let columns = [GridItem(.adaptive(minimum: 205), spacing: 10)]
-
-        return SectionCard(
-            title: l10n.tr("Apple Silicon GPU & Hardware Features", "芯片显卡与硬件加速"),
-            subtitle: cap.macOSVersionString,
-            symbol: "cpu.fill",
-            accent: .cyan
-        ) {
-            LazyVGrid(columns: columns, spacing: 10) {
-                capabilityTile(
-                    title: l10n.tr("Graphics (GPU)", "图形处理器"),
-                    value: cap.gpuName,
-                    detail: "\(cap.recommendedWorkingSetMB) MB \(l10n.tr("Unified Memory", "统一内存"))",
-                    ok: true
-                )
-                capabilityTile(
-                    title: l10n.tr("Metal Support", "Metal 支持"),
-                    value: cap.supportsMetal4 ? "Metal 4 + Metal 3" : (cap.supportsMetal3 ? "Metal 3" : "Metal 2"),
-                    detail: l10n.tr("GPU Shader Pipeline", "支持全部实时画质算法"),
-                    ok: cap.supportsMetal3
-                )
-                capabilityTile(
-                    title: l10n.tr("MetalFX Upscaler", "MetalFX 硬件超分"),
-                    value: cap.supportsMetalFXSpatial ? l10n.tr("SDR + HDR Ready", "支持 SDR 与 HDR") : l10n.tr("Unavailable", "不支持"),
-                    detail: l10n.tr("Apple Hardware Spatial Upscaling", "Apple 芯片原生硬件超分"),
-                    ok: cap.supportsMetalFXSpatial
-                )
-                capabilityTile(
-                    title: l10n.tr("Hardware Frame Gen", "硬件流畅补帧"),
-                    value: cap.supportsVTFrameInterpolation
-                        ? l10n.tr("Apple Silicon Hardware Ready", "支持 Apple 芯片硬件补帧")
-                        : l10n.tr("Metal Optical Flow", "使用 Metal 光流补帧"),
-                    detail: l10n.tr("2× / 3× / 4× Smooth Motion", "2× / 3× / 4× 丝滑插帧"),
-                    ok: cap.supportsVTFrameInterpolation
-                )
-                capabilityTile(
-                    title: l10n.tr("Apple ML Upscaler", "Apple 神经引擎超分"),
-                    value: cap.supportsVTSuperResolution
-                        ? l10n.tr("1.5× / 2× / 4× Ready", "支持 1.5× / 2× / 4×")
-                        : l10n.tr("Requires macOS 26+", "需 macOS 26+"),
-                    detail: l10n.tr("Neural Engine Super Resolution", "神经引擎 AI 超分辨率"),
-                    ok: cap.supportsVTSuperResolution
-                )
+        let memText: String = {
+            if cap.recommendedWorkingSetMB >= 1024 {
+                let gb = (Double(cap.recommendedWorkingSetMB) / 1024.0).rounded()
+                return String(format: "%.0f GB", gb)
             }
-        }
-    }
+            return "\(cap.recommendedWorkingSetMB) MB"
+        }()
+        let metalLabel = cap.supportsMetal4 ? "Metal 4" : (cap.supportsMetal3 ? "Metal 3" : "Metal 2")
 
-    private func capabilityTile(title: String, value: String, detail: String, ok: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(title)
-                    .font(.system(size: 11, weight: .semibold))
+        return HStack(spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "cpu")
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.secondary)
-                Spacer()
-                Circle()
-                    .fill(ok ? Color.green : Color.orange)
-                    .frame(width: 7, height: 7)
+                Text("\(cap.gpuName) · \(memText)")
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1)
             }
-            Text(value)
-                .font(.system(size: 13, weight: .bold))
-                .lineLimit(1)
-            Text(detail)
-                .font(.system(size: 10.5))
+
+            Divider().frame(height: 14)
+
+            capabilityChip(metalLabel, supported: cap.supportsMetal3)
+            capabilityChip("MetalFX", supported: cap.supportsMetalFXSpatial)
+            capabilityChip(l10n.tr("ML Frame Gen", "ML 补帧"), supported: cap.supportsVTFrameInterpolation)
+            capabilityChip(l10n.tr("ML Super Res", "ML 超分"), supported: cap.supportsVTSuperResolution)
+
+            Spacer(minLength: 4)
+
+            Text(cap.macOSVersionString)
+                .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
-        .padding(10)
-        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+        }
     }
 
-    // MARK: - Connected Multi-Monitor Table
+    private func capabilityChip(_ label: String, supported: Bool) -> some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(supported ? Color.green : Color.secondary.opacity(0.45))
+                .frame(width: 6.5, height: 6.5)
+            Text(label)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(supported ? .primary : .secondary)
+        }
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    // MARK: - Displays Table
 
     private func connectedDisplaysCard(l10n: L10n) -> some View {
-        let primaryDisplay = ScreenGeometry.primaryDisplay(in: coordinator.displays)
-
-        return SectionCard(
-            title: l10n.tr("Connected Displays (\(coordinator.displays.count))", "已连接的显示器（共 \(coordinator.displays.count) 台）"),
-            subtitle: l10n.tr(
-                "Shows resolution, HiDPI scaling, refresh rate, and multi-monitor layout position for each screen.",
-                "实时识别每块屏幕的分辨率、清晰度缩放（@2x/@1x）、刷新率与多屏相对位置。"
-            ),
-            symbol: "display.2",
-            accent: .blue
-        ) {
-            VStack(spacing: 6) {
+        SectionCard(title: l10n.tr("Displays", "显示器")) {
+            VStack(spacing: 5) {
                 HStack {
-                    Text(l10n.tr("Display & Position", "显示器与位置")).frame(maxWidth: .infinity, alignment: .leading)
-                    Text(l10n.tr("Resolution", "物理分辨率")).frame(width: 105, alignment: .trailing)
-                    Text("DPI").frame(width: 48, alignment: .trailing)
-                    Text(l10n.tr("Refresh", "刷新率")).frame(width: 68, alignment: .trailing)
-                    Text("HDR").frame(width: 82, alignment: .trailing)
+                    Text(l10n.tr("Display", "名称")).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(l10n.tr("Resolution", "分辨率")).frame(width: 96, alignment: .trailing)
+                    Text(l10n.tr("Scale", "缩放")).frame(width: 44, alignment: .trailing)
+                    Text(l10n.tr("Refresh", "刷新率")).frame(width: 64, alignment: .trailing)
+                    Text("HDR").frame(width: 72, alignment: .trailing)
                 }
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
@@ -208,94 +174,58 @@ struct DiagnosticsView: View {
                 Divider()
 
                 ForEach(coordinator.displays) { display in
-                    let posLabel = multiMonitorPositionBadge(for: display, relativeTo: primaryDisplay, l10n: l10n)
                     HStack {
                         HStack(spacing: 6) {
                             Image(systemName: display.isPrimary ? "laptopcomputer" : "display")
-                                .font(.system(size: 12))
+                                .font(.system(size: 11.5))
                                 .foregroundStyle(display.isPrimary ? .blue : .secondary)
                             Text(display.name)
                                 .font(.system(size: 12.5, weight: .medium))
                                 .lineLimit(1)
-                            if display.isPrimary {
-                                StatusBadge(l10n.tr("Primary", "主屏"), color: .blue)
-                            } else {
-                                StatusBadge(posLabel, color: .indigo)
-                            }
+                            StatusBadge(
+                                display.isPrimary ? l10n.tr("Primary", "主屏") : l10n.tr("External", "外接"),
+                                color: display.isPrimary ? .blue : .secondary
+                            )
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
                         Text(verbatim: "\(display.pixelSize.width)×\(display.pixelSize.height)")
                             .font(.system(size: 12, design: .monospaced))
                             .monospacedDigit()
-                            .frame(width: 105, alignment: .trailing)
+                            .frame(width: 96, alignment: .trailing)
 
                         Text(String(format: "@%.0fx", display.backingScaleFactor))
-                            .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                            .font(.system(size: 11.5, design: .monospaced))
                             .foregroundStyle(.secondary)
-                            .frame(width: 48, alignment: .trailing)
+                            .frame(width: 44, alignment: .trailing)
 
                         Text(String(format: "%.0f Hz", display.refreshRateHz))
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
                             .foregroundStyle(display.refreshRateHz >= 100 ? .cyan : .primary)
-                            .frame(width: 68, alignment: .trailing)
+                            .frame(width: 64, alignment: .trailing)
 
-                        Text(display.supportsHDR ? String(format: "%.1f× HDR", display.maxEDRHeadroom) : "SDR")
-                            .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                        Text(display.supportsHDR ? String(format: "HDR %.0f×", display.maxEDRHeadroom) : "SDR")
+                            .font(.system(size: 11.5, design: .monospaced))
                             .foregroundStyle(display.supportsHDR ? .orange : .secondary)
-                            .frame(width: 82, alignment: .trailing)
+                            .frame(width: 72, alignment: .trailing)
                     }
                     .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
+                    .padding(.vertical, 5)
                     .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
             }
         }
     }
 
-    private func multiMonitorPositionBadge(
-        for display: DisplayDescriptor,
-        relativeTo primary: DisplayDescriptor?,
-        l10n: L10n
-    ) -> String {
-        guard let primary, display.id != primary.id else {
-            return l10n.tr("Primary", "主屏")
-        }
-        var parts: [String] = []
-        if display.cgBounds.midX < primary.cgBounds.minX {
-            parts.append(l10n.tr("Left", "左侧外接"))
-        } else if display.cgBounds.midX > primary.cgBounds.maxX {
-            parts.append(l10n.tr("Right", "右侧外接"))
-        }
-        if display.cgBounds.midY < primary.cgBounds.minY {
-            parts.append(l10n.tr("Above", "上方"))
-        } else if display.cgBounds.midY > primary.cgBounds.maxY {
-            parts.append(l10n.tr("Below", "下方"))
-        }
-        if parts.isEmpty {
-            return l10n.tr("External", "外接屏")
-        }
-        return parts.joined(separator: " · ")
-    }
-
-    // MARK: - One-Click 30-Shader GPU Benchmark
+    // MARK: - Shader Benchmark
 
     private func gpuBenchmarkCard(l10n: L10n) -> some View {
-        let totalEffects = EffectID.allCases.count
         let maxMs = max(
             0.5,
             coordinator.benchmarkResults.filter(\.succeeded).map(\.averageGPUMilliseconds).max() ?? 4.0
         )
 
-        return SectionCard(
-            title: l10n.tr("One-Click \(totalEffects)-Shader GPU Benchmark", "一键显卡测速（全部 \(totalEffects) 种画质算法）"),
-            subtitle: l10n.tr(
-                "Measures real rendering speed of all \(totalEffects) built-in effects directly on \(coordinator.capabilities.gpuName).",
-                "在 \(coordinator.capabilities.gpuName) 上实地测试全部 \(totalEffects) 种超分与滤镜的单帧耗时与理论帧率。"
-            ),
-            symbol: "speedometer",
-            accent: .green
-        ) {
+        return SectionCard(title: l10n.tr("Shader Benchmark", "着色器基准测试")) {
             HStack(spacing: 10) {
                 Picker("", selection: $benchmarkPreset) {
                     ForEach(BenchmarkResolutionPreset.allCases) { preset in
@@ -304,7 +234,7 @@ struct DiagnosticsView: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(maxWidth: 360)
+                .frame(maxWidth: 320)
                 .disabled(coordinator.isBenchmarkRunning)
 
                 Spacer()
@@ -320,8 +250,8 @@ struct DiagnosticsView: View {
                 } label: {
                     Label(
                         coordinator.isBenchmarkRunning
-                            ? l10n.tr("Testing…", "测速中…")
-                            : l10n.tr("Start Benchmark", "开始一键测速"),
+                            ? l10n.tr("Running…", "测试中…")
+                            : l10n.tr("Start Benchmark", "开始测试"),
                         systemImage: "play.fill"
                     )
                 }
@@ -332,14 +262,14 @@ struct DiagnosticsView: View {
             if coordinator.isBenchmarkRunning {
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: coordinator.benchmarkProgress)
-                    Text("\(l10n.tr("Testing", "正在测试")): \(coordinator.benchmarkCurrentEffectName)")
-                        .font(.system(size: 11))
+                    Text(coordinator.benchmarkCurrentEffectName)
+                        .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
             }
 
             if !coordinator.benchmarkResults.isEmpty {
-                VStack(spacing: 6) {
+                VStack(spacing: 5) {
                     ForEach(coordinator.benchmarkResults) { result in
                         let desc = EffectCatalog.descriptor(for: result.effectID)
                         let frac = result.succeeded ? min(1.0, max(0.03, result.averageGPUMilliseconds / maxMs)) : 0
@@ -348,7 +278,7 @@ struct DiagnosticsView: View {
                         HStack(spacing: 10) {
                             Text(l10n.effectName(desc))
                                 .font(.system(size: 11.5, weight: .medium))
-                                .frame(width: 190, alignment: .leading)
+                                .frame(width: 175, alignment: .leading)
                                 .lineLimit(1)
 
                             GeometryReader { geo in
@@ -362,24 +292,24 @@ struct DiagnosticsView: View {
                                     }
                                 }
                             }
-                            .frame(height: 12)
+                            .frame(height: 10)
 
                             if result.succeeded {
                                 Text(String(format: "%.2f ms", result.averageGPUMilliseconds))
                                     .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                                     .monospacedDigit()
-                                    .frame(width: 64, alignment: .trailing)
+                                    .frame(width: 62, alignment: .trailing)
 
                                 Text(String(format: "%.0f FPS", result.estimatedFPS))
                                     .font(.system(size: 11, design: .monospaced))
                                     .monospacedDigit()
                                     .foregroundStyle(.secondary)
-                                    .frame(width: 68, alignment: .trailing)
+                                    .frame(width: 64, alignment: .trailing)
                             } else {
-                                Text(result.note ?? l10n.tr("Skipped", "已跳过"))
+                                Text(result.note ?? l10n.tr("Skipped", "跳过"))
                                     .font(.system(size: 10.5))
                                     .foregroundStyle(.orange)
-                                    .frame(width: 138, alignment: .trailing)
+                                    .frame(width: 132, alignment: .trailing)
                                     .lineLimit(1)
                             }
                         }
@@ -390,35 +320,26 @@ struct DiagnosticsView: View {
         }
     }
 
-    // MARK: - Shader Acceleration Cache
+    // MARK: - Shader Cache
 
     private func shaderBinaryCacheCard(l10n: L10n) -> some View {
         let formattedSize = ByteCountFormatter.string(fromByteCount: coordinator.shaderCacheSizeBytes, countStyle: .file)
+        let count = coordinator.effectChainRenderer?.shaderManager.cachedPipelineCount ?? 0
 
-        return SectionCard(
-            title: l10n.tr("Shader Pre-Compile Cache", "着色器加速缓存"),
-            subtitle: l10n.tr(
-                "Stores compiled Metal shaders on disk so future scaling starts in under 1 ms.",
-                "自动把编译好的画质算法缓存到本地，下次开启缩放几乎瞬间启动。"
-            ),
-            symbol: "memorychip.fill",
-            accent: .indigo
-        ) {
+        return SectionCard(title: l10n.tr("Shader Cache", "着色器缓存")) {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
+                    Text("\(formattedSize) · \(count) \(l10n.tr("pipelines", "个管线"))")
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
                     Text(coordinator.shaderCachePath.isEmpty ? "—" : coordinator.shaderCachePath)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text("\(l10n.tr("Cache Size", "缓存占用")): \(formattedSize) • \(coordinator.effectChainRenderer?.shaderManager.cachedPipelineCount ?? 0) \(l10n.tr("ready shaders", "个已就绪算法"))")
-                        .font(.system(size: 11.5, weight: .medium))
                 }
                 Spacer()
-                Button {
+                Button(l10n.tr("Rebuild", "重建缓存")) {
                     Task { await coordinator.clearAndRebuildShaderCache() }
-                } label: {
-                    Label(l10n.tr("Rebuild Cache", "清理并重建缓存"), systemImage: "arrow.triangle.2.circlepath")
                 }
                 .controlSize(.small)
                 .buttonStyle(.bordered)
@@ -426,36 +347,42 @@ struct DiagnosticsView: View {
         }
     }
 
-    // MARK: - Logs Console
+    // MARK: - Logs
 
     private func pipelineLogConsoleCard(l10n: L10n) -> some View {
-        SectionCard(
-            title: l10n.tr("Runtime Logs", "运行日志"),
-            subtitle: l10n.tr("Showing \(filteredLogs.count) of \(coordinator.logEntries.count) entries", "当前显示 \(filteredLogs.count) 条（共 \(coordinator.logEntries.count) 条）"),
-            symbol: "terminal.fill",
-            accent: .secondary
-        ) {
+        SectionCard {
             HStack(spacing: 8) {
-                Picker(l10n.tr("Module", "分类"), selection: $selectedLogCategory) {
-                    Text(l10n.tr("All", "全部分类")).tag(LogCategory?.none)
+                HStack(spacing: 5) {
+                    Text(l10n.tr("Logs", "日志"))
+                        .font(.system(size: 13.5, weight: .semibold))
+                    Text("(\(filteredLogs.count))")
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 6)
+
+                Picker("", selection: $selectedLogCategory) {
+                    Text(l10n.tr("All", "全部")).tag(LogCategory?.none)
                     ForEach(LogCategory.allCases) { cat in
                         Text(l10n.logCategory(cat)).tag(LogCategory?.some(cat))
                     }
                 }
                 .labelsHidden()
-                .frame(width: 130)
+                .frame(width: 96)
 
-                Picker(l10n.tr("Level", "级别"), selection: $minimumLogLevel) {
+                Picker("", selection: $minimumLogLevel) {
                     Text("DEBUG+").tag(LogLevel.debug)
                     Text("INFO+").tag(LogLevel.info)
                     Text("WARN+").tag(LogLevel.warning)
                     Text("ERROR").tag(LogLevel.error)
                 }
                 .labelsHidden()
-                .frame(width: 95)
+                .frame(width: 92)
 
-                TextField(l10n.tr("Search logs…", "搜索日志关键字…"), text: $logSearchQuery)
+                TextField(l10n.tr("Filter…", "筛选…"), text: $logSearchQuery)
                     .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 180)
 
                 Button {
                     let text = PipelineLog.shared.formattedExport(minimumLevel: minimumLogLevel, category: selectedLogCategory)
@@ -463,29 +390,33 @@ struct DiagnosticsView: View {
                     NSPasteboard.general.setString(text, forType: .string)
                     coordinator.showToast(
                         icon: "doc.on.clipboard.fill",
-                        title: l10n.tr("Logs Copied", "日志已复制到剪贴板"),
+                        title: l10n.tr("Logs Copied", "已复制日志"),
                         style: .info
                     )
                 } label: {
                     Image(systemName: "doc.on.doc")
                 }
+                .controlSize(.small)
                 .buttonStyle(.bordered)
-                .help(l10n.tr("Copy Logs", "复制日志"))
+                .help(l10n.tr("Copy", "复制"))
 
                 Button {
                     exportLogFile(l10n: l10n)
                 } label: {
-                    Label(l10n.tr("Export .log", "导出日志"), systemImage: "square.and.arrow.up")
+                    Image(systemName: "square.and.arrow.up")
                 }
+                .controlSize(.small)
                 .buttonStyle(.bordered)
+                .help(l10n.tr("Export", "导出"))
 
                 Button {
                     coordinator.clearLogs()
                 } label: {
                     Image(systemName: "trash")
                 }
+                .controlSize(.small)
                 .buttonStyle(.bordered)
-                .help(l10n.tr("Clear Logs", "清空日志"))
+                .help(l10n.tr("Clear", "清空"))
             }
 
             ScrollView {
@@ -511,7 +442,7 @@ struct DiagnosticsView: View {
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(height: 190)
+            .frame(height: 180)
             .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
     }
@@ -540,7 +471,7 @@ struct DiagnosticsView: View {
                 try PipelineLog.shared.export(to: url, minimumLevel: minimumLogLevel, category: selectedLogCategory)
                 coordinator.showToast(
                     icon: "checkmark.circle.fill",
-                    title: l10n.tr("Log Exported", "运行日志已导出"),
+                    title: l10n.tr("Logs Exported", "日志已导出"),
                     subtitle: url.lastPathComponent,
                     style: .success
                 )

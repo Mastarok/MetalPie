@@ -11,19 +11,19 @@ public enum ScenarioTag: String, Codable, Sendable, CaseIterable, Identifiable {
 
     public var labelEN: String {
         switch self {
-        case .game3D: return "3D Games"
-        case .anime: return "Anime & 2D"
-        case .pixelRetro: return "Pixel & Retro"
-        case .generalVideo: return "General & Video"
+        case .game3D: return "Games"
+        case .anime: return "Anime"
+        case .pixelRetro: return "Pixel"
+        case .generalVideo: return "General"
         }
     }
 
     public var labelZH: String {
         switch self {
-        case .game3D: return "3D 游戏"
-        case .anime: return "动漫番剧"
-        case .pixelRetro: return "像素复古"
-        case .generalVideo: return "通用高清"
+        case .game3D: return "游戏"
+        case .anime: return "动漫"
+        case .pixelRetro: return "像素"
+        case .generalVideo: return "通用"
         }
     }
 
@@ -178,10 +178,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         // MARK: - 3D Games
         ScalingMode(
             id: metalFXSpatialID,
-            name: "MetalFX Spatial",
-            nameZH: "MetalFX 硬件超分（推荐）",
-            localizedDescription: "Apple Silicon hardware spatial upscaling — fast, crisp, and HDR-capable.",
-            descriptionZH: "Apple 芯片原生硬件加速超分，速度极快、边缘锐利且完整支持 HDR，3D 游戏首选。",
+            name: "MetalFX",
+            nameZH: "MetalFX",
+            localizedDescription: "Apple hardware spatial upscaling with HDR support.",
+            descriptionZH: "Apple 原生硬件空间超分，支持 HDR。",
             scenario: .game3D,
             effects: [
                 EffectInstance(
@@ -194,10 +194,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: fsr1ID,
-            name: "FSR 1.0 (EASU + RCAS)",
-            nameZH: "FSR 1.0 超分锐化 (EASU + RCAS)",
-            localizedDescription: "AMD FidelityFX Super Resolution 1.0 edge-adaptive upscaling with noise-aware contrast sharpening.",
-            descriptionZH: "AMD 经典 3D 游戏超分搭配抗噪自适应锐化，在各种分辨率比例下都清晰硬朗。",
+            name: "FSR 1.0",
+            nameZH: "FSR 1.0",
+            localizedDescription: "EASU edge-adaptive upscaling with RCAS sharpening.",
+            descriptionZH: "EASU 边缘自适应超分 + RCAS 抗噪锐化。",
             scenario: .game3D,
             effects: [
                 EffectInstance(
@@ -219,10 +219,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: fxaaFSR1ID,
-            name: "FXAA + FSR 1.0 (Anti-Aliased 3D)",
-            nameZH: "FXAA 抗锯齿 + FSR 1.0 超分",
-            localizedDescription: "Smooths jagged 3D edges with FXAA 3.11 first, then upscales cleanly with FSR 1.0.",
-            descriptionZH: "先用 FXAA 3.11 抹平老游戏或低分辨率锯齿，再用 FSR 1.0 放大锐化，告别阶梯狗牙。",
+            name: "FXAA + FSR 1.0",
+            nameZH: "FXAA + FSR 1.0",
+            localizedDescription: "FXAA 3.11 edge anti-aliasing followed by FSR 1.0.",
+            descriptionZH: "FXAA 3.11 抗锯齿后接 FSR 1.0 超分。",
             scenario: .game3D,
             effects: [
                 EffectInstance(
@@ -254,10 +254,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: sgsrID,
-            name: "SGSR Fast Upscaler",
-            nameZH: "SGSR 低功耗快速超分",
-            localizedDescription: "Single-pass edge-directed upscaler designed for ultra-low GPU power draw.",
-            descriptionZH: "单通道轻量边缘超分，极低 GPU 占用与发热，适合 MacBook 续航模式高帧率游玩。",
+            name: "SGSR",
+            nameZH: "SGSR",
+            localizedDescription: "Single-pass edge-directed upscaling for low GPU load.",
+            descriptionZH: "单通道轻量边缘超分，GPU 占用低。",
             scenario: .game3D,
             effects: [
                 EffectInstance(
@@ -276,10 +276,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         // MARK: - Anime & 2D (6 Official bloc97 Anime4K v4.0.1 Modes + CuNNy + FSRCNNX)
         ScalingMode(
             id: anime4kModeAID,
-            name: "Anime4K Mode A (Recommended · Restore)",
-            nameZH: "Anime4K Mode A (推荐 · 通用修复)",
-            localizedDescription: "Official Mode A: best all-rounder for most blurry or compressed 1080p anime.",
-            descriptionZH: "适合大多数 1080p 模糊或有压缩感的番剧，线条清晰利落、一步到位。",
+            name: "Anime4K Mode A",
+            nameZH: "Anime4K Mode A",
+            localizedDescription: "General line restoration and 2× neural upscaling.",
+            descriptionZH: "通用修复，适合多数 1080p 动画。",
             scenario: .anime,
             effects: [
                 EffectInstance(
@@ -310,10 +310,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: anime4kModeBID,
-            name: "Anime4K Mode B (Soft · Balanced Denoise)",
-            nameZH: "Anime4K Mode B (柔和 · 均衡降噪)",
-            localizedDescription: "Official Mode B: gentle restoration and denoise tailored for 720p or soft-art anime.",
-            descriptionZH: "适合 720p 片源或柔和画风动画，温和降噪的同时保留自然质感。",
+            name: "Anime4K Mode B",
+            nameZH: "Anime4K Mode B",
+            localizedDescription: "Soft restoration and denoising for 720p sources.",
+            descriptionZH: "柔和降噪，适合 720p 或柔和画风动画。",
             scenario: .anime,
             effects: [
                 EffectInstance(
@@ -344,10 +344,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: anime4kModeCID,
-            name: "Anime4K Mode C (Blu-ray · Pure Upscale)",
-            nameZH: "Anime4K Mode C (原盘 · 纯净放大)",
-            localizedDescription: "Official Mode C: clean 2× neural upscaling for sharp high-bitrate Blu-ray anime.",
-            descriptionZH: "适合本身已很清晰的高码率原盘，纯净放大几乎不改变原始画风。",
+            name: "Anime4K Mode C",
+            nameZH: "Anime4K Mode C",
+            localizedDescription: "Pure 2× neural upscaling for clean high-bitrate sources.",
+            descriptionZH: "纯净放大，适合高码率原盘片源。",
             scenario: .anime,
             effects: [
                 EffectInstance(
@@ -369,10 +369,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: anime4kModeAAID,
-            name: "Anime4K Mode A+A (Heavy Restore)",
-            nameZH: "Anime4K Mode A+A (重度修复)",
-            localizedDescription: "Official Mode A+A: two-pass neural restoration for blurry low-bitrate anime.",
-            descriptionZH: "适合较糊的低码率番剧，双重神经修复让模糊线条重新锐利清晰。",
+            name: "Anime4K Mode A+A",
+            nameZH: "Anime4K Mode A+A",
+            localizedDescription: "Two-pass restoration for blurry or low-bitrate anime.",
+            descriptionZH: "双倍修复，适合模糊或低码率动画。",
             scenario: .anime,
             effects: [
                 EffectInstance(
@@ -412,10 +412,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: anime4kModeBBID,
-            name: "Anime4K Mode B+B (Soft Double Restore)",
-            nameZH: "Anime4K Mode B+B (柔和双倍修复)",
-            localizedDescription: "Official Mode B+B: balances noise cleanup with deeper soft line restoration.",
-            descriptionZH: "兼顾降噪与深度线条修复，适合老番或偏柔和的 720p 流媒体片源。",
+            name: "Anime4K Mode B+B",
+            nameZH: "Anime4K Mode B+B",
+            localizedDescription: "Two-pass soft restoration and denoise for older sources.",
+            descriptionZH: "双倍降噪，适合老番或 720p 流媒体。",
             scenario: .anime,
             effects: [
                 EffectInstance(
@@ -455,10 +455,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: anime4kModeCAID,
-            name: "Anime4K Mode C+A (Blu-ray Refined)",
-            nameZH: "Anime4K Mode C+A (原盘精修)",
-            localizedDescription: "Official Mode C+A: pure 2× upscaling followed by light line refinement for clean sources.",
-            descriptionZH: "高码率片源纯净放大后再做轻度精修，增强线条质感且不失原味。",
+            name: "Anime4K Mode C+A",
+            nameZH: "Anime4K Mode C+A",
+            localizedDescription: "Pure 2× upscaling followed by light line refinement.",
+            descriptionZH: "原盘精修，纯净放大后轻度修复线条。",
             scenario: .anime,
             effects: [
                 EffectInstance(
@@ -489,10 +489,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: cunnyAnimeID,
-            name: "CuNNy 2× Neural (Fast Anime & 2D)",
-            nameZH: "CuNNy 2× 轻量神经超分",
-            localizedDescription: "Magpie's crisp, low-artifact CuNNy2 2× neural upscaler for anime, visual novels, and 2D games.",
-            descriptionZH: "Magpie 广受好评的 CuNNy2 轻量级神经网络超分，画面干净通透、不涂抹文字，Galgame 绝配。",
+            name: "CuNNy 2×",
+            nameZH: "CuNNy 2×",
+            localizedDescription: "Compact 2× neural upscaler for anime and 2D games.",
+            descriptionZH: "轻量 2× 神经网络超分，适合动漫与 2D 游戏。",
             scenario: .anime,
             effects: [
                 EffectInstance(
@@ -509,10 +509,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: fsrcnnxID,
-            name: "FSRCNNX 2× Neural",
-            nameZH: "FSRCNNX 2× 神经网络",
-            localizedDescription: "Multi-pass 2× convolutional neural upscaler for high-detail artwork, anime, and games.",
-            descriptionZH: "经典 6 通道 2× 卷积神经网络超分，细节还原自然扎实，兼容写实与二次元画面。",
+            name: "FSRCNNX 2×",
+            nameZH: "FSRCNNX 2×",
+            localizedDescription: "6-pass 2× convolutional neural upscaler.",
+            descriptionZH: "6 通道 2× 卷积神经网络超分。",
             scenario: .anime,
             effects: [
                 EffectInstance(
@@ -532,10 +532,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         // MARK: - Pixel Art & Retro CRT
         ScalingMode(
             id: integerScaleID,
-            name: "Integer Scale (Crisp Pixels)",
-            nameZH: "整数倍原味像素缩放",
-            localizedDescription: "Exact whole-number pixel-perfect scaling using Nearest Neighbor.",
-            descriptionZH: "按整数倍无损放大每个像素，零模糊、零畸变，原汁原味呈现复古像素风。",
+            name: "Integer Scale",
+            nameZH: "整数缩放",
+            localizedDescription: "Exact whole-number nearest-neighbor pixel scaling.",
+            descriptionZH: "整数倍点采样，无模糊、无畸变。",
             scenario: .pixelRetro,
             effects: [
                 EffectInstance(
@@ -549,9 +549,9 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ScalingMode(
             id: sharpBilinearID,
             name: "Sharp Bilinear",
-            nameZH: "锐利双线性（全屏防闪烁）",
-            localizedDescription: "Shimmer-free crisp pixel art scaling that fills non-integer display sizes.",
-            descriptionZH: "无需留黑边即可铺满屏幕，同时保持像素颗粒锐利且滚动画面零波纹闪烁。",
+            nameZH: "锐利双线性",
+            localizedDescription: "Shimmer-free crisp pixel scaling at non-integer ratios.",
+            descriptionZH: "非整数倍像素缩放，消除滚动闪烁。",
             scenario: .pixelRetro,
             effects: [
                 EffectInstance(
@@ -565,10 +565,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: xbrzID,
-            name: "xBRZ Pixel Art",
-            nameZH: "xBRZ 矢量像素平滑",
-            localizedDescription: "Vectorized perceptual pixel-art smoothing at arbitrary scale ratios.",
-            descriptionZH: "自动识别像素斜边并圆滑成手绘矢量风格，适合 GBA/SNES/RPG Maker 等经典游戏。",
+            name: "xBRZ",
+            nameZH: "xBRZ",
+            localizedDescription: "Perceptual vector edge-smoothing for pixel art.",
+            descriptionZH: "感知矢量像素平滑，支持任意倍率。",
             scenario: .pixelRetro,
             effects: [
                 EffectInstance(
@@ -586,10 +586,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: crtGeomID,
-            name: "CRT-Geom Retro",
-            nameZH: "CRT-Geom 经典显像管",
-            localizedDescription: "Retro CRT scanlines, phosphor aperture grille, halation, and optional curvature.",
-            descriptionZH: "经典家用机彩电与监视器 CRT 模拟，带有柔和扫描线、荧光点栅与微弱光晕。",
+            name: "CRT-Geom",
+            nameZH: "CRT-Geom",
+            localizedDescription: "CRT scanlines, phosphor mask, halation, and optional curvature.",
+            descriptionZH: "经典 CRT 模拟，含扫描线、荧光掩膜与辉光。",
             scenario: .pixelRetro,
             effects: [
                 EffectInstance(
@@ -615,10 +615,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: crtLottesArcadeID,
-            name: "CRT-Lottes Arcade",
-            nameZH: "CRT-Lottes 街机显像管",
-            localizedDescription: "High-contrast arcade CRT shader with sharp Gaussian scanlines, subtle warp, and phosphor bloom.",
-            descriptionZH: "高对比度街机显像管滤镜，呈现凌厉扫描线、轻微弧度与鲜艳荧光粉光束。",
+            name: "CRT-Lottes",
+            nameZH: "CRT-Lottes",
+            localizedDescription: "High-contrast arcade CRT with Gaussian scanlines and shadow mask.",
+            descriptionZH: "高对比度街机 CRT，含高斯扫描线与阴影掩膜。",
             scenario: .pixelRetro,
             effects: [
                 EffectInstance(
@@ -643,10 +643,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         // MARK: - General & Video
         ScalingMode(
             id: lanczos6ID,
-            name: "Lanczos6 Anti-Ringing",
-            nameZH: "Lanczos6 抗振铃（文字/通用）",
-            localizedDescription: "Balanced 6-tap Lanczos filter with anti-ringing clamp for clean UI, text, and video.",
-            descriptionZH: "6 点可分离抗振铃滤波，文字界面与普通视频清晰锐利且极少白边，通用场景稳妥之选。",
+            name: "Lanczos6",
+            nameZH: "Lanczos6",
+            localizedDescription: "6-tap Lanczos filter with anti-ringing for UI, text, and video.",
+            descriptionZH: "6 点抗振铃滤波，适合文字、UI 与常规视频。",
             scenario: .generalVideo,
             effects: [
                 EffectInstance(
@@ -663,10 +663,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: jincVideoID,
-            name: "Jinc EWA Lanczos (Smooth Video & Text)",
-            nameZH: "Jinc 圆形滤波（高清视频）",
-            localizedDescription: "Circular 2D EWA Jinc filter for natural diagonal curves in movies, streams, and UI.",
-            descriptionZH: "2D 圆形对称高精滤波，消除斜线阶梯锯齿，观看电影、网课和高清直播观感极佳。",
+            name: "Jinc",
+            nameZH: "Jinc",
+            localizedDescription: "2D circular EWA Lanczos filter for smooth diagonals and video.",
+            descriptionZH: "2D 圆形对称滤波，斜线平滑，适合视频内容。",
             scenario: .generalVideo,
             effects: [
                 EffectInstance(
@@ -684,10 +684,10 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ),
         ScalingMode(
             id: bicubicCASID,
-            name: "Bicubic Catmull-Rom + CAS",
-            nameZH: "双三次插值 + CAS 锐化",
-            localizedDescription: "Smooth Catmull-Rom cubic interpolation paired with Contrast Adaptive Sharpening.",
-            descriptionZH: "平滑双三次放大结合 CAS 温和锐化，兼顾流畅观感与清晰细节，适合视频与浏览器窗口。",
+            name: "Bicubic + CAS",
+            nameZH: "Bicubic + CAS",
+            localizedDescription: "Catmull-Rom cubic scaling paired with contrast-adaptive sharpening.",
+            descriptionZH: "Catmull-Rom 双三次插值 + CAS 自适应锐化。",
             scenario: .generalVideo,
             effects: [
                 EffectInstance(
@@ -711,9 +711,9 @@ public struct ScalingMode: Identifiable, Hashable, Codable, Sendable {
         ScalingMode(
             id: appleMLSuperResID,
             name: "Apple ML Super Resolution",
-            nameZH: "Apple 神经引擎超分",
-            localizedDescription: "VideoToolbox low-latency Neural Engine super resolution (macOS 26+).",
-            descriptionZH: "使用苹果神经引擎进行低延迟 AI 超分（macOS 26+ 专享），低分辨率视频与窗口放大效果出众。",
+            nameZH: "Apple ML 超分",
+            localizedDescription: "VideoToolbox Neural Engine super resolution (macOS 26+).",
+            descriptionZH: "VideoToolbox 神经网络引擎超分（需 macOS 26+）。",
             scenario: .generalVideo,
             effects: [
                 EffectInstance(

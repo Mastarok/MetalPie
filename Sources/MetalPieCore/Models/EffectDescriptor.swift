@@ -17,28 +17,28 @@ public enum EffectCategory: String, Codable, Sendable, CaseIterable, Identifiabl
     public var labelEN: String {
         switch self {
         case .superResolution: return "Super Resolution"
-        case .mlUpscaler: return "Apple ML / Hardware"
+        case .mlUpscaler: return "Apple Hardware / ML"
         case .anime: return "Anime & Neural"
         case .pixelArt: return "Pixel Art"
-        case .crt: return "CRT & Retro"
+        case .crt: return "CRT"
         case .sharpening: return "Sharpening"
         case .interpolation: return "Interpolation"
         case .downscaling: return "Downscaling"
-        case .utility: return "Utility & Post-Process"
+        case .utility: return "Post-Process"
         }
     }
 
     public var labelZH: String {
         switch self {
-        case .superResolution: return "游戏超分辨率"
-        case .mlUpscaler: return "Apple 硬件 / 机器学习"
-        case .anime: return "动漫与神经网络"
-        case .pixelArt: return "像素艺术"
-        case .crt: return "CRT 复古显像管"
-        case .sharpening: return "锐化增强"
-        case .interpolation: return "经典插值滤波"
-        case .downscaling: return "高质量降采样"
-        case .utility: return "抗锯齿与色彩实用"
+        case .superResolution: return "超分辨率"
+        case .mlUpscaler: return "Apple 硬件 / ML"
+        case .anime: return "动漫 / 神经网络"
+        case .pixelArt: return "像素"
+        case .crt: return "CRT"
+        case .sharpening: return "锐化"
+        case .interpolation: return "插值滤波"
+        case .downscaling: return "降采样"
+        case .utility: return "后处理"
         }
     }
 }
@@ -359,9 +359,9 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .metalFXSpatial,
             nameEN: "MetalFX Spatial",
-            nameZH: "MetalFX 硬件超分",
-            summaryEN: "Apple Silicon hardware-accelerated spatial upscaler with crisp edges and native HDR support.",
-            summaryZH: "Apple 芯片原生硬件加速超分，放大速度快、画面锐利且完整支持 HDR。",
+            nameZH: "MetalFX Spatial",
+            summaryEN: "Apple Silicon hardware spatial upscaler with HDR support.",
+            summaryZH: "Apple 硬件空间超分，支持 HDR。",
             category: .mlUpscaler,
             scaleCapability: .arbitrary,
             supportsHDR: true,
@@ -369,16 +369,16 @@ public enum EffectCatalog: Sendable {
             parameters: [
                 EffectParameterDescriptor(
                     id: "colorProcessingMode",
-                    labelEN: "Color Space Mode",
-                    labelZH: "色彩处理模式",
-                    descriptionEN: "Choose perceptual (standard SDR), linear light, or HDR tone handling.",
-                    descriptionZH: "普通游戏和窗口建议选“感知 (SDR)”，开启高动态范围画面时选“HDR”。",
+                    labelEN: "Color Mode",
+                    labelZH: "色彩模式",
+                    descriptionEN: "Perceptual for SDR, linear light, or HDR tone handling.",
+                    descriptionZH: "SDR 使用感知色彩，HDR 画面切换至 HDR。",
                     kind: .choice(
                         defaultValue: "perceptual",
                         options: [
-                            EffectParameterChoice(value: "perceptual", labelEN: "Perceptual (SDR)", labelZH: "感知色彩 (SDR 推荐)"),
-                            EffectParameterChoice(value: "linear", labelEN: "Linear Light", labelZH: "线性光空间"),
-                            EffectParameterChoice(value: "hdr", labelEN: "HDR / EDR", labelZH: "高动态范围 (HDR)")
+                            EffectParameterChoice(value: "perceptual", labelEN: "Perceptual (SDR)", labelZH: "感知 (SDR)"),
+                            EffectParameterChoice(value: "linear", labelEN: "Linear", labelZH: "线性"),
+                            EffectParameterChoice(value: "hdr", labelEN: "HDR", labelZH: "HDR")
                         ]
                     )
                 )
@@ -387,9 +387,9 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .vtSuperResolution,
             nameEN: "Apple ML Super Resolution",
-            nameZH: "Apple 神经引擎超分",
-            summaryEN: "VideoToolbox low-latency Neural Engine super resolution (macOS 26+, discrete 1.5x/2x/4x).",
-            summaryZH: "调用苹果神经网络引擎进行低延迟 AI 超分（需 macOS 26+，支持 1.5×/2×/4×）。",
+            nameZH: "Apple ML 超分",
+            summaryEN: "VideoToolbox Neural Engine super resolution (macOS 26+).",
+            summaryZH: "VideoToolbox 神经网络引擎超分（需 macOS 26+）。",
             category: .mlUpscaler,
             scaleCapability: .discreteScales([1.5, 2.0, 4.0]),
             supportsHDR: false,
@@ -397,16 +397,16 @@ public enum EffectCatalog: Sendable {
             parameters: [
                 EffectParameterDescriptor(
                     id: "scaleFactor",
-                    labelEN: "ML Scale Factor",
-                    labelZH: "AI 放大倍率",
-                    descriptionEN: "Discrete Neural Engine scaling factor before final display fit.",
-                    descriptionZH: "选择神经网络引擎的原生放大倍数，常规窗口推荐使用 2 倍。",
+                    labelEN: "Scale Factor",
+                    labelZH: "倍率",
+                    descriptionEN: "Neural Engine native scale factor before display fit.",
+                    descriptionZH: "神经网络引擎原生放大倍率。",
                     kind: .choice(
                         defaultValue: "2.0",
                         options: [
-                            EffectParameterChoice(value: "1.5", labelEN: "1.5×", labelZH: "1.5 倍（轻量）"),
-                            EffectParameterChoice(value: "2.0", labelEN: "2.0×", labelZH: "2.0 倍（推荐）"),
-                            EffectParameterChoice(value: "4.0", labelEN: "4.0×", labelZH: "4.0 倍（低分辨率源）")
+                            EffectParameterChoice(value: "1.5", labelEN: "1.5×", labelZH: "1.5×"),
+                            EffectParameterChoice(value: "2.0", labelEN: "2×", labelZH: "2×"),
+                            EffectParameterChoice(value: "4.0", labelEN: "4×", labelZH: "4×")
                         ]
                     )
                 )
@@ -417,9 +417,9 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .fsr1EASU,
             nameEN: "FSR 1.0 EASU",
-            nameZH: "FSR 1.0 边缘自适应超分",
-            summaryEN: "AMD FidelityFX 1.0 directional edge-adaptive upscaler that reconstructs clean diagonal edges.",
-            summaryZH: "AMD 经典游戏超分算法，能沿物体边缘方向重建清晰轮廓，适合各类 3D/2D 游戏。",
+            nameZH: "FSR 1.0 EASU",
+            summaryEN: "AMD FidelityFX 1.0 edge-adaptive spatial upscaler.",
+            summaryZH: "AMD FidelityFX 1.0 边缘自适应超分。",
             category: .superResolution,
             scaleCapability: .arbitrary,
             supportsHDR: true
@@ -427,9 +427,9 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .fsr1RCAS,
             nameEN: "FSR 1.0 RCAS",
-            nameZH: "FSR 1.0 抗噪锐化 (RCAS)",
-            summaryEN: "Noise-aware contrast adaptive sharpening pass typically paired right after FSR EASU.",
-            summaryZH: "常搭配 FSR 超分使用的自适应锐化通道，增强纹理清晰度同时自动避开噪点。",
+            nameZH: "FSR 1.0 RCAS",
+            summaryEN: "Noise-aware contrast-adaptive sharpening pass.",
+            summaryZH: "抗噪对比度自适应锐化。",
             category: .sharpening,
             scaleCapability: .sameSize,
             supportsHDR: true,
@@ -437,27 +437,27 @@ public enum EffectCatalog: Sendable {
                 EffectParameterDescriptor(
                     id: "sharpness",
                     labelEN: "Sharpness",
-                    labelZH: "锐化强度",
-                    descriptionEN: "Controls how strongly local edges and textures are accentuated.",
-                    descriptionZH: "数值越高画面越锐利，推荐 0.75–0.90 兼顾清晰度与自然观感。",
+                    labelZH: "锐化",
+                    descriptionEN: "Local edge and texture sharpening intensity.",
+                    descriptionZH: "边缘与纹理锐化强度。",
                     kind: .float(defaultValue: 0.87, min: 0.0, max: 1.0, step: 0.01)
                 ),
                 EffectParameterDescriptor(
                     id: "denoise",
-                    labelEN: "Noise Suppression",
-                    labelZH: "智能抗噪保护",
-                    descriptionEN: "Attenuates sharpening on noisy or grainy regions to avoid amplifying film grain.",
-                    descriptionZH: "开启后会自动降低噪点区域的锐化力度，避免把画面颗粒感一并放大。",
+                    labelEN: "Denoise",
+                    labelZH: "降噪保护",
+                    descriptionEN: "Attenuates sharpening on noisy regions.",
+                    descriptionZH: "降低噪点区域的锐化强度。",
                     kind: .bool(defaultValue: true)
                 )
             ]
         ),
         EffectDescriptor(
             id: .sgsr,
-            nameEN: "SGSR v1",
-            nameZH: "SGSR v1 高效游戏超分",
-            summaryEN: "Qualcomm Snapdragon Game Super Resolution single-pass edge-directed upscaler for low GPU power.",
-            summaryZH: "单通道快速边缘超分算法，GPU 占用极低且省电，非常适合 MacBook 离电高帧率游玩。",
+            nameEN: "SGSR",
+            nameZH: "SGSR",
+            summaryEN: "Single-pass edge-directed upscaler with low GPU overhead.",
+            summaryZH: "单通道边缘定向超分，GPU 占用低。",
             category: .superResolution,
             scaleCapability: .arbitrary,
             supportsHDR: true,
@@ -465,17 +465,17 @@ public enum EffectCatalog: Sendable {
                 EffectParameterDescriptor(
                     id: "edgeSharpness",
                     labelEN: "Edge Sharpness",
-                    labelZH: "边缘锐利度",
-                    descriptionEN: "Boosts contrast along detected edges during directional reconstruction.",
-                    descriptionZH: "控制放大后物体轮廓的清晰程度，数值越大线条越硬朗。",
+                    labelZH: "边缘锐度",
+                    descriptionEN: "Contrast boost along reconstructed edges.",
+                    descriptionZH: "重建边缘的对比度增益。",
                     kind: .float(defaultValue: 2.0, min: 0.0, max: 4.0, step: 0.1)
                 ),
                 EffectParameterDescriptor(
                     id: "edgeThreshold",
-                    labelEN: "Edge Detection Threshold",
-                    labelZH: "边缘检测门槛",
-                    descriptionEN: "Minimum local contrast required to trigger edge-directed filtering instead of fast bilinear.",
-                    descriptionZH: "数值越小越敏感（更多细节参与锐化），数值越大则更省电且画面更柔和。",
+                    labelEN: "Edge Threshold",
+                    labelZH: "边缘阈值",
+                    descriptionEN: "Minimum local contrast required for edge-directed filtering.",
+                    descriptionZH: "触发边缘滤波的最小对比度阈值。",
                     kind: .float(defaultValue: 8.0, min: 0.0, max: 32.0, step: 0.5)
                 )
             ]
@@ -484,150 +484,150 @@ public enum EffectCatalog: Sendable {
         // MARK: - Official Anime4K v4.0.1 Suite + CuNNy + FSRCNNX
         EffectDescriptor(
             id: .anime4kRestore,
-            nameEN: "Anime4K Restore (CNN)",
-            nameZH: "Anime4K 画质修复",
-            summaryEN: "1× CReLU convolutional network that repairs compression blur, ringing, and fuzzy anime line art.",
-            summaryZH: "在原分辨率下用神经网络修复动漫模糊与压缩重影，支持标准与柔和档位。",
+            nameEN: "Anime4K Restore",
+            nameZH: "Anime4K 修复",
+            summaryEN: "1× CReLU CNN that restores compression blur and line art.",
+            summaryZH: "1× 卷积网络，修复压缩模糊与线条重影。",
             category: .anime,
             scaleCapability: .sameSize,
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "variant",
-                    labelEN: "Quality Tier",
-                    labelZH: "画质档位",
-                    descriptionEN: "Choose Fast (S), Balanced (M), High Quality (L), Ultra (VL), or Soft variants.",
-                    descriptionZH: "轻量到超高依次增强修复精度；柔和版更适合画质较好或偏暖画风的番剧。",
+                    labelEN: "Quality",
+                    labelZH: "画质",
+                    descriptionEN: "CNN model size (S/M/L/VL) or Soft variants.",
+                    descriptionZH: "网络规模（S/M/L/VL）或柔和变体。",
                     kind: .choice(
                         defaultValue: "M",
                         options: [
-                            EffectParameterChoice(value: "S", labelEN: "Fast (S)", labelZH: "轻量 (S)"),
-                            EffectParameterChoice(value: "M", labelEN: "Balanced (M)", labelZH: "标准 (M)"),
-                            EffectParameterChoice(value: "L", labelEN: "High Quality (L)", labelZH: "高画质 (L)"),
-                            EffectParameterChoice(value: "VL", labelEN: "Ultra (VL)", labelZH: "超高画质 (VL)"),
-                            EffectParameterChoice(value: "softM", labelEN: "Soft Balanced (Soft M)", labelZH: "柔和标准 (Soft M)"),
-                            EffectParameterChoice(value: "softL", labelEN: "Soft High Quality (Soft L)", labelZH: "柔和高清 (Soft L)")
+                            EffectParameterChoice(value: "S", labelEN: "S", labelZH: "S"),
+                            EffectParameterChoice(value: "M", labelEN: "M", labelZH: "M"),
+                            EffectParameterChoice(value: "L", labelEN: "L", labelZH: "L"),
+                            EffectParameterChoice(value: "VL", labelEN: "VL", labelZH: "VL"),
+                            EffectParameterChoice(value: "softM", labelEN: "Soft M", labelZH: "Soft M"),
+                            EffectParameterChoice(value: "softL", labelEN: "Soft L", labelZH: "Soft L")
                         ]
                     )
                 ),
                 EffectParameterDescriptor(
                     id: "clampHighlights",
                     labelEN: "Clamp Highlights",
-                    labelZH: "抑制白边",
-                    descriptionEN: "Prevents bright haloing and overshoot artifacts along high-contrast anime outlines.",
-                    descriptionZH: "防止修复后人物轮廓与暗色黑边周围出现发亮的白色光晕。",
+                    labelZH: "高光钳位",
+                    descriptionEN: "Prevents bright ringing halos along dark outlines.",
+                    descriptionZH: "抑制暗色轮廓周围的亮边光晕。",
                     kind: .bool(defaultValue: true)
                 )
             ]
         ),
         EffectDescriptor(
             id: .anime4kUpscaleDenoise,
-            nameEN: "Anime4K 2× Upscale + Denoise",
-            nameZH: "Anime4K 2× 超分降噪",
-            summaryEN: "2× Anime4K CNN upscaler trained to simultaneously remove compression noise and sharpen anime lines.",
-            summaryZH: "专为动漫番剧与视觉小说设计的 2× 神经网络放大与去噪，一举清理噪点并还原清晰线条。",
+            nameEN: "Anime4K Upscale + Denoise",
+            nameZH: "Anime4K 超分降噪",
+            summaryEN: "2× Anime4K CNN upscaler with integrated denoising.",
+            summaryZH: "2× 神经网络超分并同步降噪。",
             category: .anime,
             scaleCapability: .fixed(factor: 2.0),
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "variant",
-                    labelEN: "Quality Tier",
-                    labelZH: "画质档位",
-                    descriptionEN: "Select Fast (S), Balanced (M), High Quality (L), or Ultra (VL) neural network.",
-                    descriptionZH: "档位越高线条细节与降噪表现越出色，推荐标准或高画质档位。",
+                    labelEN: "Quality",
+                    labelZH: "画质",
+                    descriptionEN: "CNN model size from S (fastest) to VL (highest quality).",
+                    descriptionZH: "模型规模，从 S（最快）到 VL（最高画质）。",
                     kind: .choice(
                         defaultValue: "L",
                         options: [
-                            EffectParameterChoice(value: "S", labelEN: "Fast (S)", labelZH: "轻量 (S)"),
-                            EffectParameterChoice(value: "M", labelEN: "Balanced (M)", labelZH: "标准 (M)"),
-                            EffectParameterChoice(value: "L", labelEN: "High Quality (L)", labelZH: "高画质 (L)"),
-                            EffectParameterChoice(value: "VL", labelEN: "Ultra (VL)", labelZH: "超高画质 (VL)")
+                            EffectParameterChoice(value: "S", labelEN: "S", labelZH: "S"),
+                            EffectParameterChoice(value: "M", labelEN: "M", labelZH: "M"),
+                            EffectParameterChoice(value: "L", labelEN: "L", labelZH: "L"),
+                            EffectParameterChoice(value: "VL", labelEN: "VL", labelZH: "VL")
                         ]
                     )
                 ),
                 EffectParameterDescriptor(
                     id: "clampHighlights",
                     labelEN: "Clamp Highlights",
-                    labelZH: "抑制白边",
-                    descriptionEN: "Clamps bright overshoot spikes so highlights stay clean without white edge halos.",
-                    descriptionZH: "限制放大后的高亮过冲，避免人物发丝和黑边外侧出现发白光晕。",
+                    labelZH: "高光钳位",
+                    descriptionEN: "Clamps bright overshoot around high-contrast edges.",
+                    descriptionZH: "抑制高对比度边缘的过冲白边。",
                     kind: .bool(defaultValue: true)
                 )
             ]
         ),
         EffectDescriptor(
             id: .anime4kUpscale,
-            nameEN: "Anime4K 2× Pure Upscale",
-            nameZH: "Anime4K 2× 纯净超分",
-            summaryEN: "Pure 2× Anime4K CNN upscaler without aggressive denoising — ideal for clean Blu-ray anime and 2D games.",
-            summaryZH: "不含强力降噪的纯 2× 神经网络超分，最适合搭配修复模式或用于干净的二次元游戏。",
+            nameEN: "Anime4K Upscale",
+            nameZH: "Anime4K 超分",
+            summaryEN: "2× Anime4K CNN upscaler without aggressive denoising.",
+            summaryZH: "纯 2× 神经网络超分，不含强降噪。",
             category: .anime,
             scaleCapability: .fixed(factor: 2.0),
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "variant",
-                    labelEN: "Quality Tier",
-                    labelZH: "画质档位",
-                    descriptionEN: "Choose Fast (S), Balanced (M), High Quality (L), or Ultra (VL) 2× CNN.",
-                    descriptionZH: "轻量最快，高画质（L）为清晰度与帧率的黄金平衡，超高（VL）精度最高。",
+                    labelEN: "Quality",
+                    labelZH: "画质",
+                    descriptionEN: "CNN model size from S (fastest) to VL (highest quality).",
+                    descriptionZH: "模型规模，从 S（最快）到 VL（最高画质）。",
                     kind: .choice(
                         defaultValue: "L",
                         options: [
-                            EffectParameterChoice(value: "S", labelEN: "Fast (S)", labelZH: "轻量 (S)"),
-                            EffectParameterChoice(value: "M", labelEN: "Balanced (M)", labelZH: "标准 (M)"),
-                            EffectParameterChoice(value: "L", labelEN: "High Quality (L)", labelZH: "高画质 (L)"),
-                            EffectParameterChoice(value: "VL", labelEN: "Ultra (VL)", labelZH: "超高画质 (VL)")
+                            EffectParameterChoice(value: "S", labelEN: "S", labelZH: "S"),
+                            EffectParameterChoice(value: "M", labelEN: "M", labelZH: "M"),
+                            EffectParameterChoice(value: "L", labelEN: "L", labelZH: "L"),
+                            EffectParameterChoice(value: "VL", labelEN: "VL", labelZH: "VL")
                         ]
                     )
                 ),
                 EffectParameterDescriptor(
                     id: "clampHighlights",
                     labelEN: "Clamp Highlights",
-                    labelZH: "抑制白边",
-                    descriptionEN: "Prevents bright ringing halos around dark ink outlines after 2× upscaling.",
-                    descriptionZH: "防止放大后暗色线条边缘冒出白色亮边，保持画面通透自然。",
+                    labelZH: "高光钳位",
+                    descriptionEN: "Prevents ringing halos around dark outlines.",
+                    descriptionZH: "抑制暗色线条边缘的白色光晕。",
                     kind: .bool(defaultValue: true)
                 )
             ]
         ),
         EffectDescriptor(
             id: .anime4kThin,
-            nameEN: "Anime4K Line Thinning",
+            nameEN: "Anime4K Thin",
             nameZH: "Anime4K 线条细化",
-            summaryEN: "Narrows overly thick or bloated low-res anime ink outlines using gradient-guided warping.",
-            summaryZH: "自动收细低分辨率动漫中显得臃肿粗重的黑边，让轮廓更加精致纤细。",
+            summaryEN: "Narrows thick dark outlines via gradient-guided warping.",
+            summaryZH: "基于梯度收细偏粗的暗色线条。",
             category: .anime,
             scaleCapability: .sameSize,
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "strength",
-                    labelEN: "Thinning Strength",
-                    labelZH: "细化力度",
-                    descriptionEN: "Controls how much thick dark lines are narrowed (0.4–0.8 recommended).",
-                    descriptionZH: "控制线条收细的幅度，推荐 0.4–0.8，过高可能导致极细线条断裂。",
+                    labelEN: "Strength",
+                    labelZH: "强度",
+                    descriptionEN: "Line thinning strength (0.4–0.8 typical).",
+                    descriptionZH: "线条收细幅度（常用 0.4–0.8）。",
                     kind: .float(defaultValue: 0.6, min: 0.0, max: 1.5, step: 0.1)
                 )
             ]
         ),
         EffectDescriptor(
             id: .anime4kDarken,
-            nameEN: "Anime4K Line Darkening",
+            nameEN: "Anime4K Darken",
             nameZH: "Anime4K 线条加深",
-            summaryEN: "Selectively deepens faded anime ink lines to boost 2D contrast and depth without darkening flat fills.",
-            summaryZH: "精准加深发灰发淡的二次元黑边，提升画面立体感且不影响人物肤色与背景亮度。",
+            summaryEN: "Selectively deepens dark ink lines without darkening flat fills.",
+            summaryZH: "选择性加深暗色轮廓线条。",
             category: .anime,
             scaleCapability: .sameSize,
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "strength",
-                    labelEN: "Darken Strength",
-                    labelZH: "加深力度",
-                    descriptionEN: "Controls how strongly detected dark outlines are emphasized (0.3–0.7 recommended).",
-                    descriptionZH: "数值越高轮廓线条越乌黑醒目，常规番剧推荐 0.3–0.7。",
+                    labelEN: "Strength",
+                    labelZH: "强度",
+                    descriptionEN: "Line darkening strength (0.3–0.7 typical).",
+                    descriptionZH: "线条加深幅度（常用 0.3–0.7）。",
                     kind: .float(defaultValue: 0.5, min: 0.0, max: 1.5, step: 0.1)
                 )
             ]
@@ -635,25 +635,25 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .anime4kDenoiseBilateral,
             nameEN: "Anime4K Bilateral Denoise",
-            nameZH: "Anime4K 双边保边降噪",
-            summaryEN: "Edge-preserving bilateral denoiser with Mode, Mean, and Median filters for flat cel-shaded regions.",
-            summaryZH: "抹平动漫色块噪点的同时守住清晰边界，支持众数、均值、中值三种滤镜。",
+            nameZH: "Anime4K 双边降噪",
+            summaryEN: "Edge-preserving bilateral denoiser with Mode, Mean, and Median filters.",
+            summaryZH: "保边双边降噪，支持众数、均值与中值滤镜。",
             category: .anime,
             scaleCapability: .sameSize,
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "mode",
-                    labelEN: "Filter Mode",
-                    labelZH: "降噪模式",
-                    descriptionEN: "Mode keeps flat cel edges sharpest; Mean is smoothest; Median excels against speckle noise.",
-                    descriptionZH: "众数最保边，均值最柔滑，中值擅长去除椒盐杂点。",
+                    labelEN: "Mode",
+                    labelZH: "模式",
+                    descriptionEN: "Mode preserves edges; Mean smooths; Median removes speckles.",
+                    descriptionZH: "众数保边，均值平滑，中值去椒盐噪点。",
                     kind: .choice(
                         defaultValue: "mode",
                         options: [
-                            EffectParameterChoice(value: "mode", labelEN: "Mode (Edge-Preserving)", labelZH: "众数保边 (Mode)"),
-                            EffectParameterChoice(value: "mean", labelEN: "Mean (Smooth)", labelZH: "均值平滑 (Mean)"),
-                            EffectParameterChoice(value: "median", labelEN: "Median (Despeckle)", labelZH: "中值去杂点 (Median)")
+                            EffectParameterChoice(value: "mode", labelEN: "Mode", labelZH: "众数"),
+                            EffectParameterChoice(value: "mean", labelEN: "Mean", labelZH: "均值"),
+                            EffectParameterChoice(value: "median", labelEN: "Median", labelZH: "中值")
                         ]
                     )
                 )
@@ -662,9 +662,9 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .anime4kClampHighlights,
             nameEN: "Anime4K Clamp Highlights",
-            nameZH: "Anime4K 防白边抗振铃",
-            summaryEN: "Automatic anti-ringing pass that eliminates bright overshoot halos after neural upscaling.",
-            summaryZH: "自动防白边通道，放在超分或锐化之后可有效消除物体边缘刺眼的白色光晕。",
+            nameZH: "Anime4K 高光钳位",
+            summaryEN: "Post-pass anti-ringing clamp for bright overshoot halos.",
+            summaryZH: "消除超分或锐化后的边缘亮边过冲。",
             category: .anime,
             scaleCapability: .sameSize,
             supportsHDR: false,
@@ -672,78 +672,78 @@ public enum EffectCatalog: Sendable {
         ),
         EffectDescriptor(
             id: .cunny,
-            nameEN: "CuNNy 2× Neural",
-            nameZH: "CuNNy 2× 轻量神经超分",
-            summaryEN: "Magpie's signature compact 2× neural upscaler prized for clean anime, visual novels, and 2D games.",
-            summaryZH: "Magpie 标志性的轻量级 2× 神经网络超分，画质干净自然且几乎无涂抹感，极适合 Galgame 与二次元游戏。",
+            nameEN: "CuNNy 2×",
+            nameZH: "CuNNy 2×",
+            summaryEN: "Compact 2× neural upscaler for anime, visual novels, and 2D games.",
+            summaryZH: "轻量级 2× 神经网络超分，适合动漫与 2D 游戏。",
             category: .anime,
             scaleCapability: .fixed(factor: 2.0),
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "variant",
-                    labelEN: "Model Tier",
-                    labelZH: "模型档位",
-                    descriptionEN: "Fast (veryfast 8ch), Balanced (fast 12ch), or High Quality (full RGB 3×12 neural network).",
-                    descriptionZH: "快速版极省电，均衡版兼顾锐利与速度，高质量版采用全 RGB 三通道神经网络还原色彩细节。",
+                    labelEN: "Model",
+                    labelZH: "模型",
+                    descriptionEN: "8ch fast, 12ch balanced, or full RGB 3×12 neural network.",
+                    descriptionZH: "8 通道快速、12 通道均衡或全彩 RGB 3×12 模型。",
                     kind: .choice(
                         defaultValue: "balanced",
                         options: [
-                            EffectParameterChoice(value: "fast", labelEN: "Fast (VeryFast 8ch)", labelZH: "快速 (轻量 8 通道)"),
-                            EffectParameterChoice(value: "balanced", labelEN: "Balanced (Fast 12ch)", labelZH: "均衡 (推荐 12 通道)"),
-                            EffectParameterChoice(value: "highQuality", labelEN: "High Quality (RGB 3×12)", labelZH: "高质量 (全彩 RGB 3×12)")
-                        ]
-                    )
-                ),
-                EffectParameterDescriptor(
-                    id: "sharpness",
-                    labelEN: "Detail Sharpness",
-                    labelZH: "细节锐度",
-                    descriptionEN: "Scales the neural high-frequency detail residual added during 2× reconstruction.",
-                    descriptionZH: "调节神经网络重建细节的强弱，1.0 为标准值，调高可让线条与文字更醒目。",
-                    kind: .float(defaultValue: 1.0, min: 0.0, max: 2.0, step: 0.05)
-                )
-            ]
-        ),
-        EffectDescriptor(
-            id: .fsrcnnx,
-            nameEN: "FSRCNNX 2× Neural",
-            nameZH: "FSRCNNX 2× 神经网络超分",
-            summaryEN: "6-pass 2× convolutional neural network upscaler with dedicated Standard, LineArt, and Enhanced Detail modes.",
-            summaryZH: "经典 6 通道 2× 卷积神经网络超分，提供通用、二次元线条与细节强化三种模式。",
-            category: .anime,
-            scaleCapability: .fixed(factor: 2.0),
-            supportsHDR: false,
-            parameters: [
-                EffectParameterDescriptor(
-                    id: "variant",
-                    labelEN: "Model Variant",
-                    labelZH: "模型风格",
-                    descriptionEN: "Standard for general video/games, LineArt for crisp 2D outlines, Enhanced Detail for extra micro-contrast.",
-                    descriptionZH: "标准版适合影视与综合游戏，线条版专攻动漫与手绘，细节强化版进一步突出微弱纹理。",
-                    kind: .choice(
-                        defaultValue: "standard",
-                        options: [
-                            EffectParameterChoice(value: "standard", labelEN: "Standard 8-0-4-1", labelZH: "标准版 (8-0-4-1)"),
-                            EffectParameterChoice(value: "lineArt", labelEN: "LineArt 8-0-4-1", labelZH: "二次元线条版 (8-0-4-1)"),
-                            EffectParameterChoice(value: "enhancedDetail", labelEN: "Enhanced Detail", labelZH: "细节强化版")
+                            EffectParameterChoice(value: "fast", labelEN: "Fast (8ch)", labelZH: "快速 (8ch)"),
+                            EffectParameterChoice(value: "balanced", labelEN: "Balanced (12ch)", labelZH: "均衡 (12ch)"),
+                            EffectParameterChoice(value: "highQuality", labelEN: "High (RGB 3×12)", labelZH: "高画质 (RGB 3×12)")
                         ]
                     )
                 ),
                 EffectParameterDescriptor(
                     id: "sharpness",
                     labelEN: "Sharpness",
-                    labelZH: "细节锐度",
-                    descriptionEN: "Scales the reconstructed high-frequency luminance detail relative to smooth upsampling.",
-                    descriptionZH: "控制放大后的高频细节增益，1.0 为模型原生输出，可按观感微调。",
+                    labelZH: "锐度",
+                    descriptionEN: "High-frequency detail residual scale (1.0 native).",
+                    descriptionZH: "高频细节残差倍率（1.0 为原生值）。",
+                    kind: .float(defaultValue: 1.0, min: 0.0, max: 2.0, step: 0.05)
+                )
+            ]
+        ),
+        EffectDescriptor(
+            id: .fsrcnnx,
+            nameEN: "FSRCNNX 2×",
+            nameZH: "FSRCNNX 2×",
+            summaryEN: "6-pass 2× convolutional neural upscaler.",
+            summaryZH: "6 通道 2× 卷积神经网络超分。",
+            category: .anime,
+            scaleCapability: .fixed(factor: 2.0),
+            supportsHDR: false,
+            parameters: [
+                EffectParameterDescriptor(
+                    id: "variant",
+                    labelEN: "Model",
+                    labelZH: "模型",
+                    descriptionEN: "Standard, LineArt for 2D outlines, or Enhanced Detail.",
+                    descriptionZH: "标准、二次元线条或细节增强模型。",
+                    kind: .choice(
+                        defaultValue: "standard",
+                        options: [
+                            EffectParameterChoice(value: "standard", labelEN: "Standard", labelZH: "标准"),
+                            EffectParameterChoice(value: "lineArt", labelEN: "LineArt", labelZH: "线条"),
+                            EffectParameterChoice(value: "enhancedDetail", labelEN: "Enhanced", labelZH: "细节增强")
+                        ]
+                    )
+                ),
+                EffectParameterDescriptor(
+                    id: "sharpness",
+                    labelEN: "Sharpness",
+                    labelZH: "锐度",
+                    descriptionEN: "High-frequency luminance gain (1.0 native).",
+                    descriptionZH: "高频亮度细节增益（1.0 为原生值）。",
                     kind: .float(defaultValue: 1.0, min: 0.0, max: 1.5, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "antiRinging",
                     labelEN: "Anti-Ringing",
-                    labelZH: "抑制边缘白边",
-                    descriptionEN: "Clamps neural overshoot toward local source bounds to keep high-contrast edges clean.",
-                    descriptionZH: "抑制神经网络在文字与黑边旁产生的白边光晕，推荐 0.25–0.50。",
+                    labelZH: "抗振铃",
+                    descriptionEN: "Clamps neural overshoot to local source bounds.",
+                    descriptionZH: "限制神经网络过冲以抑制白边。",
                     kind: .float(defaultValue: 0.35, min: 0.0, max: 1.0, step: 0.05)
                 )
             ]
@@ -752,36 +752,36 @@ public enum EffectCatalog: Sendable {
         // MARK: - Pixel Art
         EffectDescriptor(
             id: .xbrzFreescale,
-            nameEN: "xBRZ Freescale",
-            nameZH: "xBRZ 矢量像素平滑",
-            summaryEN: "Two-pass perceptual pixel-art vectorizing upscaler that turns jagged sprites into smooth curves at any ratio.",
-            summaryZH: "双通道感知像素画矢量平滑算法，可将复古像素锯齿自动圆滑成清晰曲线，支持任意倍率。",
+            nameEN: "xBRZ",
+            nameZH: "xBRZ",
+            summaryEN: "Perceptual vector edge-smoothing for pixel art at arbitrary ratios.",
+            summaryZH: "感知矢量像素平滑，支持任意缩放比例。",
             category: .pixelArt,
             scaleCapability: .arbitrary,
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "equalColorTolerance",
-                    labelEN: "Equal Color Tolerance",
-                    labelZH: "相似色合并容差",
-                    descriptionEN: "Perceptual YCbCr distance below which neighboring pixels are treated as the same region.",
-                    descriptionZH: "决定多接近的颜色被视为同一色块，调大更容易平滑渐变像素，默认 30。",
+                    labelEN: "Color Tolerance",
+                    labelZH: "色差容差",
+                    descriptionEN: "Perceptual YCbCr distance for treating neighbors as equal.",
+                    descriptionZH: "相邻像素视为同色的 YCbCr 距离阈值。",
                     kind: .float(defaultValue: 30.0, min: 5.0, max: 60.0, step: 1.0)
                 ),
                 EffectParameterDescriptor(
                     id: "edgeThreshold",
-                    labelEN: "Steep Edge Threshold",
-                    labelZH: "斜边平滑阈值",
-                    descriptionEN: "Ratio threshold controlling when shallow/steep 2:1 pixel slopes are interpolated smoothly.",
-                    descriptionZH: "控制 2:1 斜线锯齿触发平滑的灵敏度，数值越小斜边越圆润（默认 2.2）。",
+                    labelEN: "Edge Threshold",
+                    labelZH: "斜边阈值",
+                    descriptionEN: "Threshold controlling 2:1 slope interpolation.",
+                    descriptionZH: "2:1 斜边平滑触发阈值。",
                     kind: .float(defaultValue: 2.2, min: 1.2, max: 4.0, step: 0.1)
                 ),
                 EffectParameterDescriptor(
                     id: "dominantDirectionThreshold",
-                    labelEN: "Dominant Direction Threshold",
-                    labelZH: "主导边缘判定阈值",
-                    descriptionEN: "Controls how strongly one diagonal direction must dominate to force full corner blending.",
-                    descriptionZH: "决定强斜边覆盖拐角的门槛，数值越低曲线更连贯，越高越忠于原像素方格（默认 3.6）。",
+                    labelEN: "Direction Threshold",
+                    labelZH: "主方向阈值",
+                    descriptionEN: "Dominance threshold for full diagonal corner blending.",
+                    descriptionZH: "强斜边覆盖拐角的判定阈值。",
                     kind: .float(defaultValue: 3.6, min: 1.5, max: 6.0, step: 0.1)
                 )
             ]
@@ -789,19 +789,19 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .sharpBilinear,
             nameEN: "Sharp Bilinear",
-            nameZH: "锐利双线性（像素防闪烁）",
-            summaryEN: "Keeps pixel-art interiors crisp while smoothly blending only 1-pixel boundaries at non-integer ratios.",
-            summaryZH: "在非整数倍率全屏游玩像素游戏时，既保留方正像素颗粒又消除画面移动时的波纹闪烁。",
+            nameZH: "锐利双线性",
+            summaryEN: "Crisp pixel scaling with 1-pixel boundary blending at non-integer ratios.",
+            summaryZH: "非整数倍像素缩放，保留像素轮廓并消除闪烁。",
             category: .pixelArt,
             scaleCapability: .arbitrary,
             supportsHDR: true,
             parameters: [
                 EffectParameterDescriptor(
                     id: "sharpness",
-                    labelEN: "Edge Crispness",
-                    labelZH: "像素边缘锐度",
-                    descriptionEN: "Blends between soft bilinear (0.0) and razor-sharp single-pixel transitions (1.0).",
-                    descriptionZH: "1.0 呈现最锐利的像素方格，略微调低（0.6–0.8）可让边缘更柔和。",
+                    labelEN: "Sharpness",
+                    labelZH: "锐度",
+                    descriptionEN: "Blends between bilinear (0.0) and crisp pixel transitions (1.0).",
+                    descriptionZH: "0.0 为双线性，1.0 为最锐利像素过渡。",
                     kind: .float(defaultValue: 1.0, min: 0.0, max: 1.0, step: 0.05)
                 )
             ]
@@ -809,19 +809,19 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .pixellate,
             nameEN: "Pixellate",
-            nameZH: "面积积分像素缩放",
-            summaryEN: "Analytical texel-area box integration eliminating shimmer on non-integer pixel-art scaling.",
-            summaryZH: "通过精确计算像素覆盖面积进行缩放，任意屏幕比例下均零闪烁、像素大小均匀一致。",
+            nameZH: "Pixellate",
+            summaryEN: "Texel-area box integration for shimmer-free non-integer pixel scaling.",
+            summaryZH: "像素面积积分缩放，非整数倍下像素均匀无闪烁。",
             category: .pixelArt,
             scaleCapability: .arbitrary,
             supportsHDR: true
         ),
         EffectDescriptor(
             id: .nearest,
-            nameEN: "Nearest Neighbor",
-            nameZH: "点采样（整数倍原味像素）",
-            summaryEN: "Zero-blur point sampling ideal for exact integer scaling of retro pixel games.",
-            summaryZH: "完全无模糊的原始像素点采样，搭配“整数倍适应”还原刀削般锐利的复古像素点。",
+            nameEN: "Nearest",
+            nameZH: "最近邻",
+            summaryEN: "Point sampling without interpolation.",
+            summaryZH: "无插值点采样，适合整数倍像素缩放。",
             category: .pixelArt,
             scaleCapability: .arbitrary,
             supportsHDR: true
@@ -831,107 +831,107 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .crtGeom,
             nameEN: "CRT-Geom",
-            nameZH: "CRT-Geom 经典球面显像管",
-            summaryEN: "Authentic curved CRT simulation with beam scanlines, selectable phosphor masks, halation, vignette, and gamma.",
-            summaryZH: "高度还原经典彩电与监视器 CRT 观感，可自由调节曲率、扫描线、荧光掩膜、辉光与暗角。",
+            nameZH: "CRT-Geom",
+            summaryEN: "CRT simulation with scanlines, phosphor masks, halation, vignette, and curvature.",
+            summaryZH: "CRT 显像管模拟，含扫描线、掩膜、辉光、暗角与曲率。",
             category: .crt,
             scaleCapability: .arbitrary,
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "curvature",
-                    labelEN: "Screen Curvature",
-                    labelZH: "启用球面曲率",
-                    descriptionEN: "Simulates the curved glass face of a vintage CRT television tube.",
-                    descriptionZH: "模拟老式球面显像管的玻璃弧度与圆角边框，关闭则为平面 CRT。",
+                    labelEN: "Curvature",
+                    labelZH: "球面曲率",
+                    descriptionEN: "Simulates curved CRT glass geometry.",
+                    descriptionZH: "启用显像管球面弧度。",
                     kind: .bool(defaultValue: false)
                 ),
                 EffectParameterDescriptor(
                     id: "curvatureRadius",
-                    labelEN: "Curvature Radius",
+                    labelEN: "Radius",
                     labelZH: "曲率半径",
-                    descriptionEN: "Smaller values produce stronger glass curvature when Screen Curvature is enabled.",
-                    descriptionZH: "开启球面曲率时生效，数值越小屏幕鼓起弯曲越明显，默认 2.0。",
+                    descriptionEN: "Smaller values produce stronger curvature.",
+                    descriptionZH: "数值越小曲率越明显。",
                     kind: .float(defaultValue: 2.0, min: 0.8, max: 5.0, step: 0.1)
                 ),
                 EffectParameterDescriptor(
                     id: "scanlineWeight",
-                    labelEN: "Scanline Weight",
-                    labelZH: "扫描线粗细",
-                    descriptionEN: "Controls the vertical beam width and darkness of horizontal CRT scanlines.",
-                    descriptionZH: "数值越小扫描线黑缝越明显、复古感越强，数值越大扫描线越柔和饱满。",
+                    labelEN: "Scanlines",
+                    labelZH: "扫描线",
+                    descriptionEN: "Vertical beam width and darkness of horizontal scanlines.",
+                    descriptionZH: "水平扫描线宽度与深浅。",
                     kind: .float(defaultValue: 0.3, min: 0.1, max: 0.6, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "maskType",
-                    labelEN: "Phosphor Mask Type",
-                    labelZH: "荧光粉掩膜样式",
-                    descriptionEN: "Choose Trinitron Aperture Grille, classic Shadow Mask, arcade Slot Mask, or Off.",
-                    descriptionZH: "模拟不同显像管亚像素排列：特丽珑条纹光栅、经典圆点阴影掩膜或街机槽栅。",
+                    labelEN: "Phosphor Mask",
+                    labelZH: "掩膜样式",
+                    descriptionEN: "Aperture grille, shadow mask, slot mask, or off.",
+                    descriptionZH: "荧光粉亚像素掩膜排列方式。",
                     kind: .choice(
                         defaultValue: "apertureGrille",
                         options: [
-                            EffectParameterChoice(value: "apertureGrille", labelEN: "Aperture Grille", labelZH: "条纹光栅 (特丽珑)"),
-                            EffectParameterChoice(value: "shadowMask", labelEN: "Shadow Mask", labelZH: "阴影点阵 (彩电)"),
-                            EffectParameterChoice(value: "slotMask", labelEN: "Slot Mask", labelZH: "槽形掩膜 (街机)"),
-                            EffectParameterChoice(value: "off", labelEN: "Off", labelZH: "关闭掩膜")
+                            EffectParameterChoice(value: "apertureGrille", labelEN: "Aperture Grille", labelZH: "条纹光栅"),
+                            EffectParameterChoice(value: "shadowMask", labelEN: "Shadow Mask", labelZH: "阴影掩膜"),
+                            EffectParameterChoice(value: "slotMask", labelEN: "Slot Mask", labelZH: "槽形掩膜"),
+                            EffectParameterChoice(value: "off", labelEN: "Off", labelZH: "关闭")
                         ]
                     )
                 ),
                 EffectParameterDescriptor(
                     id: "dotMask",
-                    labelEN: "Phosphor Mask Strength",
-                    labelZH: "掩膜纹理强度",
-                    descriptionEN: "Controls how visible the RGB phosphor subpixel mask pattern appears.",
-                    descriptionZH: "调节荧光粉网格的明显程度，0 为完全关闭，推荐 0.25–0.45。",
+                    labelEN: "Mask Strength",
+                    labelZH: "掩膜强度",
+                    descriptionEN: "Visibility of the RGB phosphor subpixel mask.",
+                    descriptionZH: "RGB 掩膜纹理明显程度。",
                     kind: .float(defaultValue: 0.3, min: 0.0, max: 1.0, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "halation",
-                    labelEN: "Phosphor Halation / Glow",
-                    labelZH: "荧光辉光",
-                    descriptionEN: "Adds soft luminous phosphor bloom around bright pixels and scanlines.",
-                    descriptionZH: "为高亮像素增添柔和的显像管荧光光晕，提升暗场氛围与通透度。",
+                    labelEN: "Halation",
+                    labelZH: "辉光",
+                    descriptionEN: "Phosphor bloom around bright pixels.",
+                    descriptionZH: "高亮像素周围的荧光光晕。",
                     kind: .float(defaultValue: 0.15, min: 0.0, max: 1.0, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "vignette",
-                    labelEN: "Tube Vignette",
-                    labelZH: "显像管暗角",
-                    descriptionEN: "Subtle brightness falloff toward the four corners of the CRT glass.",
-                    descriptionZH: "模拟显像管四角轻微变暗的光学暗角，0 为关闭。",
+                    labelEN: "Vignette",
+                    labelZH: "暗角",
+                    descriptionEN: "Corner brightness falloff.",
+                    descriptionZH: "屏幕四角暗角衰减。",
                     kind: .float(defaultValue: 0.15, min: 0.0, max: 1.0, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "brightness",
-                    labelEN: "Brightness Boost",
-                    labelZH: "亮度补偿",
-                    descriptionEN: "Compensates for brightness lost to dark scanlines and phosphor masks.",
-                    descriptionZH: "补偿扫描线和掩膜带来的画面变暗，让色彩在现代屏幕上依旧鲜艳。",
+                    labelEN: "Brightness",
+                    labelZH: "亮度",
+                    descriptionEN: "Brightness compensation for scanlines and mask.",
+                    descriptionZH: "扫描线与掩膜造成的亮度补偿。",
                     kind: .float(defaultValue: 1.05, min: 0.5, max: 1.5, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "crtGamma",
                     labelEN: "CRT Gamma",
-                    labelZH: "模拟 CRT 伽马",
-                    descriptionEN: "Input gamma curve of the simulated CRT tube (higher = deeper contrast).",
-                    descriptionZH: "模拟老式显像管的对比度曲线，数值越高暗部越深邃（推荐 1.8–2.4）。",
+                    labelZH: "CRT 伽马",
+                    descriptionEN: "Simulated CRT input gamma curve.",
+                    descriptionZH: "模拟显像管输入伽马。",
                     kind: .float(defaultValue: 2.4, min: 1.0, max: 4.0, step: 0.1)
                 ),
                 EffectParameterDescriptor(
                     id: "monitorGamma",
-                    labelEN: "Monitor Gamma",
-                    labelZH: "当前屏幕伽马",
-                    descriptionEN: "Output gamma calibration matching your Mac display (2.2 standard).",
-                    descriptionZH: "匹配现代 Mac 显示器的输出伽马，一般保持 2.2 即可。",
+                    labelEN: "Display Gamma",
+                    labelZH: "屏幕伽马",
+                    descriptionEN: "Output gamma matching the host display (2.2 standard).",
+                    descriptionZH: "目标显示器输出伽马（标准 2.2）。",
                     kind: .float(defaultValue: 2.2, min: 1.0, max: 4.0, step: 0.1)
                 ),
                 EffectParameterDescriptor(
                     id: "cornerSize",
                     labelEN: "Corner Radius",
-                    labelZH: "边角圆弧大小",
-                    descriptionEN: "Rounds the four outer corners of the simulated CRT bezel.",
-                    descriptionZH: "控制屏幕四角的黑色圆角大小，调小至 0.005 可获得近似直角画面。",
+                    labelZH: "圆角",
+                    descriptionEN: "Outer bezel corner rounding.",
+                    descriptionZH: "屏幕四角圆弧半径。",
                     kind: .float(defaultValue: 0.01, min: 0.001, max: 0.1, step: 0.005)
                 )
             ]
@@ -939,9 +939,9 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .crtLottes,
             nameEN: "CRT-Lottes",
-            nameZH: "CRT-Lottes 街机显像管",
-            summaryEN: "Timothy Lottes' high-contrast arcade CRT shader with fine Gaussian scanlines, bloom, and 4 shadow masks.",
-            summaryZH: "著名街机 CRT 着色器，拥有清晰锐利的高斯扫描线、街机光束辉光与多种阴影掩膜。",
+            nameZH: "CRT-Lottes",
+            summaryEN: "Arcade CRT shader with Gaussian scanlines and shadow masks.",
+            summaryZH: "街机 CRT 着色器，含高斯扫描线与阴影掩膜。",
             category: .crt,
             scaleCapability: .arbitrary,
             supportsHDR: false,
@@ -950,73 +950,73 @@ public enum EffectCatalog: Sendable {
                     id: "hardScan",
                     labelEN: "Scanline Hardness",
                     labelZH: "扫描线锐度",
-                    descriptionEN: "More negative values create sharper, higher-contrast scanline gaps (-8 balanced, -12 crisp).",
-                    descriptionZH: "数值越负扫描线黑缝越清晰锋利，-8 为标准街机，-12 适合高对比复古感。",
+                    descriptionEN: "More negative values create sharper scanlines (-8 default).",
+                    descriptionZH: "越负扫描线越锐利（默认 -8）。",
                     kind: .float(defaultValue: -8.0, min: -16.0, max: -2.0, step: 0.5)
                 ),
                 EffectParameterDescriptor(
                     id: "hardPix",
                     labelEN: "Pixel Hardness",
-                    labelZH: "水平像素锐度",
-                    descriptionEN: "Controls horizontal pixel focus (-2 soft composite, -3 balanced RGB, -5 crisp).",
-                    descriptionZH: "控制水平方向像素清晰度，-2 偏柔和电视感，-3 平衡，-5 接近高清单色监视器。",
+                    labelZH: "像素锐度",
+                    descriptionEN: "Horizontal pixel focus (-2 soft, -3 balanced, -5 sharp).",
+                    descriptionZH: "水平像素锐度（-2 柔和，-3 均衡，-5 锐利）。",
                     kind: .float(defaultValue: -3.0, min: -6.0, max: -1.0, step: 0.25)
                 ),
                 EffectParameterDescriptor(
                     id: "warpX",
-                    labelEN: "Horizontal Warp",
-                    labelZH: "水平屏幕弯曲",
-                    descriptionEN: "Horizontal barrel curvature (0.0 = flat, 0.03 = classic arcade).",
-                    descriptionZH: "画面左右边缘的显像管弧度弯曲，0 为平面，0.03 为经典街机曲率。",
+                    labelEN: "Warp X",
+                    labelZH: "水平弯曲",
+                    descriptionEN: "Horizontal barrel curvature (0.0 = flat).",
+                    descriptionZH: "水平桶形曲率（0 为平面）。",
                     kind: .float(defaultValue: 0.0, min: 0.0, max: 0.125, step: 0.005)
                 ),
                 EffectParameterDescriptor(
                     id: "warpY",
-                    labelEN: "Vertical Warp",
-                    labelZH: "垂直屏幕弯曲",
-                    descriptionEN: "Vertical barrel curvature (0.0 = flat, 0.04 = classic arcade).",
-                    descriptionZH: "画面上下边缘的显像管弧度弯曲，0 为平面，0.04 为经典街机曲率。",
+                    labelEN: "Warp Y",
+                    labelZH: "垂直弯曲",
+                    descriptionEN: "Vertical barrel curvature (0.0 = flat).",
+                    descriptionZH: "垂直桶形曲率（0 为平面）。",
                     kind: .float(defaultValue: 0.0, min: 0.0, max: 0.125, step: 0.005)
                 ),
                 EffectParameterDescriptor(
                     id: "shadowMask",
-                    labelEN: "Shadow Mask Style",
-                    labelZH: "阴影掩膜类型",
-                    descriptionEN: "Selects the CRT phosphor grid layout overlaid on the scanlines.",
-                    descriptionZH: "选择不同年代显像管的荧光粉像素排列风格。",
+                    labelEN: "Shadow Mask",
+                    labelZH: "掩膜样式",
+                    descriptionEN: "Phosphor grid layout.",
+                    descriptionZH: "荧光粉网格样式。",
                     kind: .choice(
                         defaultValue: "apertureGrille",
                         options: [
-                            EffectParameterChoice(value: "none", labelEN: "None", labelZH: "关闭"),
-                            EffectParameterChoice(value: "compressedTV", labelEN: "Compressed TV", labelZH: "经典彩电点阵"),
-                            EffectParameterChoice(value: "apertureGrille", labelEN: "Aperture Grille", labelZH: "特丽珑光栅条纹"),
-                            EffectParameterChoice(value: "stretchedVGA", labelEN: "Stretched VGA", labelZH: "宽距 VGA 掩膜"),
-                            EffectParameterChoice(value: "vga", labelEN: "VGA Fine", labelZH: "精细 VGA 显示器")
+                            EffectParameterChoice(value: "none", labelEN: "Off", labelZH: "关闭"),
+                            EffectParameterChoice(value: "compressedTV", labelEN: "TV Mask", labelZH: "彩电点阵"),
+                            EffectParameterChoice(value: "apertureGrille", labelEN: "Aperture Grille", labelZH: "条纹光栅"),
+                            EffectParameterChoice(value: "stretchedVGA", labelEN: "Stretched VGA", labelZH: "宽距 VGA"),
+                            EffectParameterChoice(value: "vga", labelEN: "VGA", labelZH: "精细 VGA")
                         ]
                     )
                 ),
                 EffectParameterDescriptor(
                     id: "brightBoost",
-                    labelEN: "Brightness Boost",
-                    labelZH: "画面亮度增益",
-                    descriptionEN: "Linear brightness multiplier compensating for scanline and mask attenuation.",
-                    descriptionZH: "补偿扫描线与掩膜造成的亮度衰减，推荐 1.0–1.25。",
+                    labelEN: "Brightness",
+                    labelZH: "亮度",
+                    descriptionEN: "Linear brightness multiplier.",
+                    descriptionZH: "线性亮度增益。",
                     kind: .float(defaultValue: 1.0, min: 0.5, max: 2.0, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "maskDark",
-                    labelEN: "Mask Dark Level",
-                    labelZH: "掩膜暗部深度",
-                    descriptionEN: "Minimum brightness of darkened subpixels in the shadow mask.",
-                    descriptionZH: "数值越低掩膜网格对比越强烈，调高则掩膜更柔和。",
+                    labelEN: "Mask Dark",
+                    labelZH: "掩膜暗部",
+                    descriptionEN: "Minimum brightness of darkened mask subpixels.",
+                    descriptionZH: "掩膜暗部亚像素下限。",
                     kind: .float(defaultValue: 0.5, min: 0.0, max: 1.0, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "maskLight",
-                    labelEN: "Mask Light Level",
-                    labelZH: "掩膜亮部增益",
-                    descriptionEN: "Peak brightness of illuminated RGB phosphor stripes.",
-                    descriptionZH: "提升发光荧光条的亮度，与“掩膜暗部”配合平衡整体明暗。",
+                    labelEN: "Mask Light",
+                    labelZH: "掩膜亮部",
+                    descriptionEN: "Peak brightness of illuminated phosphor stripes.",
+                    descriptionZH: "掩膜亮部亚像素上限。",
                     kind: .float(defaultValue: 1.5, min: 1.0, max: 2.0, step: 0.05)
                 )
             ]
@@ -1025,10 +1025,10 @@ public enum EffectCatalog: Sendable {
         // MARK: - Classic Interpolation
         EffectDescriptor(
             id: .lanczos6,
-            nameEN: "Lanczos6 (Anti-Ringing)",
-            nameZH: "Lanczos6 抗振铃滤波",
-            summaryEN: "6-tap separable Lanczos3 scaler with anti-ringing clamp and adjustable sharpness for crisp UI and text.",
-            summaryZH: "经典 6 点可分离 Lanczos 缩放算法，文字与界面边缘清晰自然且自带防白边抑制。",
+            nameEN: "Lanczos6",
+            nameZH: "Lanczos6",
+            summaryEN: "6-tap separable Lanczos3 filter with anti-ringing clamp.",
+            summaryZH: "6 点可分离 Lanczos3 滤波，内置抗振铃。",
             category: .interpolation,
             scaleCapability: .arbitrary,
             supportsHDR: true,
@@ -1036,81 +1036,81 @@ public enum EffectCatalog: Sendable {
                 EffectParameterDescriptor(
                     id: "antiRinging",
                     labelEN: "Anti-Ringing",
-                    labelZH: "抑制边缘白边",
-                    descriptionEN: "Suppresses ringing halos around high-contrast text and dark borders.",
-                    descriptionZH: "防止缩放后文字和物体边缘出现发亮光晕，推荐 0.5–0.8。",
+                    labelZH: "抗振铃",
+                    descriptionEN: "Suppresses ringing halos around high-contrast edges.",
+                    descriptionZH: "抑制高对比度边缘的振铃白边。",
                     kind: .float(defaultValue: 0.5, min: 0.0, max: 1.0, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "sharpness",
-                    labelEN: "Filter Sharpness",
-                    labelZH: "滤波锐利度",
-                    descriptionEN: "Tightens or relaxes the Lanczos lobe response (1.0 = exact Lanczos3).",
-                    descriptionZH: "1.0 为标准 Lanczos3，调高画面更紧凑锐利，调低更柔和顺滑。",
+                    labelEN: "Sharpness",
+                    labelZH: "锐度",
+                    descriptionEN: "Lobe response scale (1.0 = exact Lanczos3).",
+                    descriptionZH: "滤波核锐度（1.0 为标准 Lanczos3）。",
                     kind: .float(defaultValue: 1.0, min: 0.5, max: 1.5, step: 0.05)
                 )
             ]
         ),
         EffectDescriptor(
             id: .jinc,
-            nameEN: "Jinc (EWA Lanczos)",
-            nameZH: "Jinc 圆形高精滤波",
-            summaryEN: "2D elliptical circular Jinc2 filter that avoids horizontal/vertical staircase artifacts on diagonals and video.",
-            summaryZH: "采用 2D 圆形对称卷积核的经典高质量缩放，斜线与高清视频过渡比常规算法更圆润无锯齿。",
+            nameEN: "Jinc",
+            nameZH: "Jinc",
+            summaryEN: "2D circular EWA Jinc2 filter for smooth diagonals.",
+            summaryZH: "2D 圆形对称 EWA Jinc2 滤波，斜线平滑。",
             category: .interpolation,
             scaleCapability: .arbitrary,
             supportsHDR: true,
             parameters: [
                 EffectParameterDescriptor(
                     id: "windowSinc",
-                    labelEN: "Window Sinc (A)",
-                    labelZH: "窗口柔和度 (A)",
-                    descriptionEN: "Controls the Jinc window rolloff: lower values sharpen, higher values soften (0.50 optimal).",
-                    descriptionZH: "控制滤波器柔和程度：数值越小画面越锐利，越大越柔和（0.50 为经典最优值）。",
+                    labelEN: "Window (A)",
+                    labelZH: "窗口 (A)",
+                    descriptionEN: "Window rolloff: lower is sharper, higher is softer.",
+                    descriptionZH: "窗函数滚降：越小越锐利，越大越柔和。",
                     kind: .float(defaultValue: 0.5, min: 0.1, max: 1.0, step: 0.01)
                 ),
                 EffectParameterDescriptor(
                     id: "sinc",
-                    labelEN: "Sinc Frequency (B)",
-                    labelZH: "细节采样系数 (B)",
-                    descriptionEN: "0.825 suppresses dithering cleanly; values near 1.0 increase fine sharpness like Lanczos.",
-                    descriptionZH: "0.825 可兼顾细节与去抖动，调近 1.0 可获得接近 Lanczos 的高锐度。",
+                    labelEN: "Frequency (B)",
+                    labelZH: "频率 (B)",
+                    descriptionEN: "0.825 balances smoothness; closer to 1.0 increases sharpness.",
+                    descriptionZH: "0.825 均衡平滑，接近 1.0 提高锐度。",
                     kind: .float(defaultValue: 0.825, min: 0.5, max: 1.0, step: 0.01)
                 ),
                 EffectParameterDescriptor(
                     id: "antiRinging",
                     labelEN: "Anti-Ringing",
-                    labelZH: "抑制边缘白边",
-                    descriptionEN: "Clamps overshoot halos to local 2×2 source bounds while preserving diagonal smoothness.",
-                    descriptionZH: "消除高对比度边缘的过冲白边，同时保留圆形滤波的自然斜线过渡。",
+                    labelZH: "抗振铃",
+                    descriptionEN: "Clamps overshoot halos to local 2×2 source bounds.",
+                    descriptionZH: "将过冲钳位至局部 2×2 源像素范围。",
                     kind: .float(defaultValue: 0.5, min: 0.0, max: 1.0, step: 0.05)
                 )
             ]
         ),
         EffectDescriptor(
             id: .bicubic,
-            nameEN: "Bicubic (Mitchell / Catmull-Rom)",
-            nameZH: "双三次插值 (Bicubic)",
-            summaryEN: "Hardware-optimized 9-tap Mitchell-Netravali cubic filter (Catmull-Rom B=0, C=0.5 default).",
-            summaryZH: "高效 9 点硬件优化双三次缩放，可通过 B/C 系数在平滑与锐利之间自由切换。",
+            nameEN: "Bicubic",
+            nameZH: "双三次",
+            summaryEN: "9-tap Mitchell-Netravali cubic filter (Catmull-Rom default).",
+            summaryZH: "9 点 Mitchell-Netravali 双三次滤波（默认 Catmull-Rom）。",
             category: .interpolation,
             scaleCapability: .arbitrary,
             supportsHDR: true,
             parameters: [
                 EffectParameterDescriptor(
                     id: "b",
-                    labelEN: "Smoothness (B)",
-                    labelZH: "平滑系数 (B)",
-                    descriptionEN: "Higher B yields softer smoothing (Catmull-Rom = 0.0, Mitchell = 0.33, B-Spline = 1.0).",
-                    descriptionZH: "数值越大画面越柔和（Catmull-Rom 为 0，Mitchell 均衡为 0.33）。",
+                    labelEN: "B",
+                    labelZH: "B（平滑）",
+                    descriptionEN: "Cubic B parameter (Catmull-Rom = 0.0, Mitchell = 0.33).",
+                    descriptionZH: "双三次 B 系数（Catmull-Rom = 0，Mitchell = 0.33）。",
                     kind: .float(defaultValue: 0.0, min: 0.0, max: 1.0, step: 0.01)
                 ),
                 EffectParameterDescriptor(
                     id: "c",
-                    labelEN: "Crispness (C)",
-                    labelZH: "锐度系数 (C)",
-                    descriptionEN: "Higher C increases edge crispness (Catmull-Rom = 0.50, Mitchell = 0.33, Sharp = 0.75).",
-                    descriptionZH: "数值越大边缘越清晰（Catmull-Rom 为 0.50，过高可能产生轻微白边）。",
+                    labelEN: "C",
+                    labelZH: "C（锐度）",
+                    descriptionEN: "Cubic C parameter (Catmull-Rom = 0.50, Mitchell = 0.33).",
+                    descriptionZH: "双三次 C 系数（Catmull-Rom = 0.50，Mitchell = 0.33）。",
                     kind: .float(defaultValue: 0.5, min: 0.0, max: 1.0, step: 0.01)
                 )
             ]
@@ -1118,9 +1118,9 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .bilinear,
             nameEN: "Bilinear",
-            nameZH: "双线性快速插值",
-            summaryEN: "Ultra-lightweight hardware bilinear resampling with virtually zero GPU overhead.",
-            summaryZH: "开销几乎为零的基础双线性平滑缩放，适合极低功耗或调试对比。",
+            nameZH: "双线性",
+            summaryEN: "Hardware bilinear interpolation.",
+            summaryZH: "硬件双线性插值。",
             category: .interpolation,
             scaleCapability: .arbitrary,
             supportsHDR: true
@@ -1129,10 +1129,10 @@ public enum EffectCatalog: Sendable {
         // MARK: - Sharpening
         EffectDescriptor(
             id: .cas,
-            nameEN: "CAS (Contrast Adaptive Sharpen)",
-            nameZH: "CAS 对比度自适应锐化",
-            summaryEN: "AMD FidelityFX Contrast Adaptive Sharpening restoring crisp detail without edge halos.",
-            summaryZH: "AMD 对比度自适应锐化，可放在任意超分之后温和提清细节，不易产生刺眼白边。",
+            nameEN: "CAS",
+            nameZH: "CAS 锐化",
+            summaryEN: "AMD FidelityFX Contrast Adaptive Sharpening.",
+            summaryZH: "AMD FidelityFX 对比度自适应锐化。",
             category: .sharpening,
             scaleCapability: .sameSize,
             supportsHDR: true,
@@ -1140,9 +1140,9 @@ public enum EffectCatalog: Sendable {
                 EffectParameterDescriptor(
                     id: "sharpness",
                     labelEN: "Sharpness",
-                    labelZH: "锐化强度",
-                    descriptionEN: "Controls local contrast sharpening intensity (0.3–0.6 recommended).",
-                    descriptionZH: "数值越高纹理越清晰，常规视频和游戏推荐 0.3–0.6。",
+                    labelZH: "锐化",
+                    descriptionEN: "Local contrast sharpening intensity.",
+                    descriptionZH: "局部对比度锐化强度。",
                     kind: .float(defaultValue: 0.4, min: 0.0, max: 1.0, step: 0.02)
                 )
             ]
@@ -1150,19 +1150,19 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .adaptiveSharpen,
             nameEN: "Adaptive Sharpen",
-            nameZH: "自适应曲面锐化",
-            summaryEN: "Two-pass edge-aware curve sharpening that boosts subtle textures while protecting crisp contours.",
-            summaryZH: "双通道智能曲线锐化，重点提升暗部和柔和区域的微弱纹理，同时保护已有清晰边缘不过锐。",
+            nameZH: "自适应锐化",
+            summaryEN: "Two-pass edge-aware curve sharpening.",
+            summaryZH: "双通道边缘感知曲线锐化。",
             category: .sharpening,
             scaleCapability: .sameSize,
             supportsHDR: true,
             parameters: [
                 EffectParameterDescriptor(
                     id: "curveHeight",
-                    labelEN: "Sharpen Strength",
-                    labelZH: "锐化力度",
-                    descriptionEN: "Height of the adaptive sharpening curve (0.2–0.6 natural, >1.0 strong).",
-                    descriptionZH: "决定细节拉升幅度，0.2–0.5 最自然，调高可获得更强烈的锐化观感。",
+                    labelEN: "Strength",
+                    labelZH: "强度",
+                    descriptionEN: "Height of the adaptive sharpening curve.",
+                    descriptionZH: "自适应锐化曲线幅度。",
                     kind: .float(defaultValue: 0.3, min: 0.05, max: 2.0, step: 0.05)
                 )
             ]
@@ -1172,19 +1172,19 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .ssimDownscaler,
             nameEN: "SSimDownscaler",
-            nameZH: "SSIM 感知高精降采样",
-            summaryEN: "5-pass structural-similarity downscaler that keeps 2× supersampled edges razor sharp when scaling down.",
-            summaryZH: "5 通道结构相似度降采样，搭配 2× 神经网络超分缩小到目标屏幕时能完美保留清晰纹理。",
+            nameZH: "SSIM 降采样",
+            summaryEN: "5-pass structural-similarity downscaler for supersampled chains.",
+            summaryZH: "5 通道结构相似度降采样。",
             category: .downscaling,
             scaleCapability: .downscaleOnly,
             supportsHDR: true,
             parameters: [
                 EffectParameterDescriptor(
                     id: "oversharp",
-                    labelEN: "Detail Preservation",
-                    labelZH: "细节保留力度",
-                    descriptionEN: "Structural contrast gain during downscaling (1.0 accurate, >1.0 extra crisp).",
-                    descriptionZH: "1.0 为精准还原原图结构对比度，适当调高可让缩小后的画面更锐利。",
+                    labelEN: "Detail Gain",
+                    labelZH: "细节保留",
+                    descriptionEN: "Structural contrast gain during downscaling (1.0 neutral).",
+                    descriptionZH: "降采样结构对比度增益（1.0 为标准）。",
                     kind: .float(defaultValue: 1.0, min: 0.0, max: 3.0, step: 0.1)
                 )
             ]
@@ -1193,44 +1193,44 @@ public enum EffectCatalog: Sendable {
         // MARK: - Utility, Anti-Aliasing & Color
         EffectDescriptor(
             id: .fxaa,
-            nameEN: "FXAA 3.11 Anti-Aliasing",
-            nameZH: "FXAA 3.11 边缘抗锯齿",
-            summaryEN: "Fast approximate anti-aliasing pre-pass that smooths jagged 3D/2D edges before upscaling.",
-            summaryZH: "经典快速抗锯齿滤镜，放在超分前可预先消除老游戏与低分辨率画面的阶梯状锯齿。",
+            nameEN: "FXAA 3.11",
+            nameZH: "FXAA 3.11",
+            summaryEN: "Fast approximate edge anti-aliasing pre-pass.",
+            summaryZH: "快速近似边缘抗锯齿。",
             category: .utility,
             scaleCapability: .sameSize,
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "qualityPreset",
-                    labelEN: "Quality Preset",
-                    labelZH: "抗锯齿精度",
-                    descriptionEN: "Higher presets trace longer diagonal edges (Low=8, Medium=16, High=24, Ultra=32 steps).",
-                    descriptionZH: "档位越高对长斜线锯齿的追踪修复越彻底，推荐“高”或“极致”。",
+                    labelEN: "Quality",
+                    labelZH: "精度",
+                    descriptionEN: "Edge search steps (Low=8, Medium=16, High=24, Ultra=32).",
+                    descriptionZH: "边缘搜索步数（低 8 / 中 16 / 高 24 / 极高 32）。",
                     kind: .choice(
                         defaultValue: "high",
                         options: [
-                            EffectParameterChoice(value: "low", labelEN: "Low (Fast)", labelZH: "低 (8 步 · 极速)"),
-                            EffectParameterChoice(value: "medium", labelEN: "Medium", labelZH: "中 (16 步 · 均衡)"),
-                            EffectParameterChoice(value: "high", labelEN: "High (Recommended)", labelZH: "高 (24 步 · 推荐)"),
-                            EffectParameterChoice(value: "ultra", labelEN: "Ultra", labelZH: "极致 (32 步 · 精细)")
+                            EffectParameterChoice(value: "low", labelEN: "Low", labelZH: "低"),
+                            EffectParameterChoice(value: "medium", labelEN: "Medium", labelZH: "中"),
+                            EffectParameterChoice(value: "high", labelEN: "High", labelZH: "高"),
+                            EffectParameterChoice(value: "ultra", labelEN: "Ultra", labelZH: "极高")
                         ]
                     )
                 ),
                 EffectParameterDescriptor(
                     id: "edgeThreshold",
                     labelEN: "Edge Threshold",
-                    labelZH: "锯齿检测阈值",
-                    descriptionEN: "Minimum local contrast needed to trigger AA (lower smooths more subtle edges).",
-                    descriptionZH: "数值越小越容易触发抗锯齿（处理更多微弱边缘），推荐 0.125。",
+                    labelZH: "边缘阈值",
+                    descriptionEN: "Minimum local contrast required to trigger anti-aliasing.",
+                    descriptionZH: "触发抗锯齿的最小局部对比度。",
                     kind: .float(defaultValue: 0.125, min: 0.06, max: 0.33, step: 0.005)
                 ),
                 EffectParameterDescriptor(
                     id: "subpixelQuality",
-                    labelEN: "Subpixel Smoothing",
-                    labelZH: "亚像素平滑度",
-                    descriptionEN: "Controls how much subpixel aliasing is softened (lower keeps fine text/wires sharper).",
-                    descriptionZH: "数值越高抗锯齿越柔和，调低可更好地保留细小文字与铁丝网等高频细节。",
+                    labelEN: "Subpixel",
+                    labelZH: "亚像素平滑",
+                    descriptionEN: "Subpixel aliasing blend factor.",
+                    descriptionZH: "亚像素锯齿平滑系数。",
                     kind: .float(defaultValue: 0.75, min: 0.0, max: 1.0, step: 0.05)
                 )
             ]
@@ -1238,35 +1238,35 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .deband,
             nameEN: "Deband",
-            nameZH: "去色带断层 (Deband)",
-            summaryEN: "Smooths 8-bit color banding in dark skies and compressed video using stochastic dithering.",
-            summaryZH: "消除暗部夜景、天空渐变与低码率视频中的一层层色块断层，让色彩过渡如丝般顺滑。",
+            nameZH: "去色带",
+            summaryEN: "Stochastic dithering pass removing 8-bit gradient banding.",
+            summaryZH: "消除 8-bit 渐变色带断层。",
             category: .utility,
             scaleCapability: .sameSize,
             supportsHDR: false,
             parameters: [
                 EffectParameterDescriptor(
                     id: "threshold",
-                    labelEN: "Smooth Threshold",
-                    labelZH: "去色带阈值",
-                    descriptionEN: "Maximum color difference smoothed as banding; higher values remove stronger bands.",
-                    descriptionZH: "数值越大可抚平越明显的色带断层，过高可能轻微模糊暗部细微纹理。",
+                    labelEN: "Threshold",
+                    labelZH: "阈值",
+                    descriptionEN: "Maximum color delta blended as banding.",
+                    descriptionZH: "判定为色带的最大色差阈值。",
                     kind: .float(defaultValue: 0.015, min: 0.001, max: 0.1, step: 0.002)
                 ),
                 EffectParameterDescriptor(
                     id: "range",
-                    labelEN: "Sample Radius",
-                    labelZH: "采样搜索范围",
-                    descriptionEN: "Pixel radius searched when blending banded gradients.",
-                    descriptionZH: "搜寻相似颜色的像素范围，宽色带视频可适当调大至 16–24。",
+                    labelEN: "Range",
+                    labelZH: "范围",
+                    descriptionEN: "Pixel radius sampled around each pixel.",
+                    descriptionZH: "采样搜索半径（像素）。",
                     kind: .float(defaultValue: 16.0, min: 4.0, max: 32.0, step: 1.0)
                 ),
                 EffectParameterDescriptor(
                     id: "grain",
-                    labelEN: "Dither Grain",
-                    labelZH: "微粒抖动掩蔽",
-                    descriptionEN: "Adds subtle micro-dither to prevent 8-bit quantization from reintroducing bands.",
-                    descriptionZH: "加入肉眼几乎不可察觉的微弱抖动颗粒，防止输出回 8-bit 时色带再次出现。",
+                    labelEN: "Grain",
+                    labelZH: "抖动",
+                    descriptionEN: "Micro-dither amplitude to prevent requantization.",
+                    descriptionZH: "微粒抖动强度，防止 8-bit 输出重现色带。",
                     kind: .float(defaultValue: 0.006, min: 0.0, max: 0.05, step: 0.002)
                 )
             ]
@@ -1274,9 +1274,9 @@ public enum EffectCatalog: Sendable {
         EffectDescriptor(
             id: .imageAdjustment,
             nameEN: "Image Adjustment",
-            nameZH: "色彩与画面调节",
-            summaryEN: "Fine-tune gamma, brightness, contrast, saturation, vibrance, and color temperature at the end of a chain.",
-            summaryZH: "在管线末端微调伽马、亮度、对比度、饱和度、自然鲜艳度与冷暖色温。",
+            nameZH: "画面调节",
+            summaryEN: "Gamma, brightness, contrast, saturation, vibrance, and temperature.",
+            summaryZH: "调节伽马、亮度、对比度、饱和度、鲜艳度与色温。",
             category: .utility,
             scaleCapability: .sameSize,
             supportsHDR: true,
@@ -1284,49 +1284,49 @@ public enum EffectCatalog: Sendable {
                 EffectParameterDescriptor(
                     id: "gamma",
                     labelEN: "Gamma",
-                    labelZH: "伽马明暗曲线",
-                    descriptionEN: "Adjusts midtone brightness curve (1.0 = neutral, >1.0 brightens shadows).",
-                    descriptionZH: "调节画面中间调明暗，大于 1.0 可提亮发暗的老游戏场景。",
+                    labelZH: "伽马",
+                    descriptionEN: "Midtone gamma curve (1.0 neutral).",
+                    descriptionZH: "中间调伽马曲线（1.0 为中性）。",
                     kind: .float(defaultValue: 1.0, min: 0.5, max: 2.5, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "brightness",
                     labelEN: "Brightness",
-                    labelZH: "整体亮度",
-                    descriptionEN: "Uniform brightness offset applied to the full image.",
-                    descriptionZH: "整体提亮或压暗画面，0.0 为原始亮度。",
+                    labelZH: "亮度",
+                    descriptionEN: "Uniform brightness offset.",
+                    descriptionZH: "整体亮度偏移。",
                     kind: .float(defaultValue: 0.0, min: -0.5, max: 0.5, step: 0.01)
                 ),
                 EffectParameterDescriptor(
                     id: "contrast",
                     labelEN: "Contrast",
-                    labelZH: "画面对比度",
-                    descriptionEN: "Expands or compresses separation between darks and highlights.",
-                    descriptionZH: "拉开明暗层次对比，略微调高（1.05–1.15）可让泛白画面更有通透感。",
+                    labelZH: "对比度",
+                    descriptionEN: "Luminance contrast multiplier.",
+                    descriptionZH: "明暗对比度倍率。",
                     kind: .float(defaultValue: 1.0, min: 0.5, max: 2.0, step: 0.02)
                 ),
                 EffectParameterDescriptor(
                     id: "saturation",
                     labelEN: "Saturation",
-                    labelZH: "色彩饱和度",
-                    descriptionEN: "Uniformly boosts or mutes color intensity across all channels.",
-                    descriptionZH: "全局增强或减弱色彩浓淡，1.0 为原色，0.0 为黑白画面。",
+                    labelZH: "饱和度",
+                    descriptionEN: "Global color saturation multiplier.",
+                    descriptionZH: "全局色彩饱和度。",
                     kind: .float(defaultValue: 1.0, min: 0.0, max: 2.0, step: 0.02)
                 ),
                 EffectParameterDescriptor(
                     id: "vibrance",
-                    labelEN: "Smart Vibrance",
-                    labelZH: "自然鲜艳度",
-                    descriptionEN: "Boosts muted colors while protecting already-saturated tones and skin hues.",
-                    descriptionZH: "优先提亮偏灰淡的颜色而不让高饱和区域过曝，比直接拉饱和度更自然。",
+                    labelEN: "Vibrance",
+                    labelZH: "鲜艳度",
+                    descriptionEN: "Selectively boosts muted colors.",
+                    descriptionZH: "优先增强低饱和色彩。",
                     kind: .float(defaultValue: 0.0, min: -0.5, max: 1.0, step: 0.05)
                 ),
                 EffectParameterDescriptor(
                     id: "temperature",
-                    labelEN: "Color Temperature",
-                    labelZH: "画面冷暖色温",
-                    descriptionEN: "Shifts image warmth (negative = cooler blue, positive = warmer amber).",
-                    descriptionZH: "负值偏向清冷通透，正值偏向暖黄护眼，0.0 保持原始白平衡。",
+                    labelEN: "Temperature",
+                    labelZH: "色温",
+                    descriptionEN: "White balance shift (negative cooler, positive warmer).",
+                    descriptionZH: "色温偏移（负值偏冷，正值偏暖）。",
                     kind: .float(defaultValue: 0.0, min: -1.0, max: 1.0, step: 0.05)
                 )
             ]

@@ -4,19 +4,7 @@ import MetalPieCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Unified, beginner-friendly Settings workspace (`设置` / `Settings`):
-///
-/// Tier 1 (Visible by Default — Everyday Controls):
-/// 1. 常用快捷键 (Global Shortcuts + System-Reserved Force Exit `⌃⌥⌘⎋`)
-/// 2. 鼠标与光标 (Honest Accessibility status, cursor alignment, confinement, speed, idle hide, size)
-/// 3. 流畅补帧 (One-click 2×/3×/4× Frame Generation with clear guidance)
-/// 4. 常规、语言与截图 (Instant Language Switcher, Countdown, Menu Bar, Screenshot folder & template)
-///
-/// Tier 2 (Collapsed by Default — `高级设置` DisclosureGroup):
-/// - Display Color & HDR, Low-Latency Direct Present, ProMotion VRR Direct-Scanout,
-///   Idle Power-Saving, Wine/Emulator 1× Low-Res Auto Detection, Capture FPS Cap
-/// - Frame Gen Engine & Anti-Ghosting Sensitivity
-/// - Auto-Scale Excluded Apps & Config Backup/Reset
+/// Clean native macOS Settings workspace (`设置` / `Settings`).
 struct SettingsView: View {
     @Bindable var coordinator: AppCoordinator
     @State private var isAdvancedExpanded: Bool = false
@@ -33,77 +21,69 @@ struct SettingsView: View {
         let targetID = activeEditedProfile.id
 
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                // Page Header
+            VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .center, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(l10n.tr("Settings", "设置"))
-                            .font(.system(size: 22, weight: .bold))
-                        Text(l10n.tr(
-                            "Everyday shortcuts, cursor alignment, frame generation, and language — advanced tuning is neatly tucked below.",
-                            "常用快捷键、鼠标对齐、流畅补帧与界面语言都在这里，进阶性能选项收纳在底部「高级设置」中。"
-                        ))
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                    }
+                    Text(l10n.tr("Settings", "设置"))
+                        .font(.system(size: 20, weight: .bold))
                     Spacer()
 
                     if coordinator.config.profiles.count > 1 {
                         HStack(spacing: 6) {
-                            Text(l10n.tr("Applies to:", "当前编辑:"))
-                                .font(.system(size: 11.5))
+                            Text(l10n.tr("Profile", "配置"))
+                                .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
                             Picker("", selection: $coordinator.selectedProfileID) {
                                 ForEach(coordinator.config.profiles) { p in
-                                    Text(p.isDefault ? l10n.tr("Default", "全局默认") : p.name).tag(p.id)
+                                    Text(p.isDefault ? l10n.tr("Default", "默认") : p.name).tag(p.id)
                                 }
                             }
                             .labelsHidden()
                             .pickerStyle(.menu)
-                            .frame(maxWidth: 165)
+                            .frame(maxWidth: 160)
                         }
                     }
                 }
 
-                // Tier 1: Everyday Controls
                 hotkeysCard(l10n: l10n)
-                cursorAndMouseCard(profileID: targetID, l10n: l10n)
+                cursorCard(profileID: targetID, l10n: l10n)
                 frameGenerationCard(profileID: targetID, l10n: l10n)
-                generalLanguageAndScreenshotsCard(l10n: l10n)
-
-                // Tier 2: Collapsible Advanced Settings
-                advancedSettingsSection(profileID: targetID, l10n: l10n)
+                generalCard(l10n: l10n)
+                advancedSection(profileID: targetID, l10n: l10n)
             }
             .padding(20)
         }
         .alert(
-            l10n.tr("Reset All Settings to Defaults?", "确认恢复所有默认设置？"),
+            l10n.tr("Reset Configuration?", "重置配置？"),
             isPresented: $showResetConfirmation
         ) {
             Button(l10n.tr("Cancel", "取消"), role: .cancel) {}
-            Button(l10n.tr("Reset", "确认恢复"), role: .destructive) {
+            Button(l10n.tr("Reset", "重置"), role: .destructive) {
                 coordinator.resetConfigToDefaults()
             }
         } message: {
             Text(l10n.tr(
-                "Custom profiles, shortcuts, and custom scaling modes will be restored to factory defaults.",
-                "所有自定义配置文件、快捷键与自定义缩放模式都会恢复为出厂默认值。"
+                "All profiles, shortcuts, and custom scaling modes will be restored to defaults.",
+                "所有配置文件、快捷键与自定义缩放模式将恢复为默认。"
             ))
         }
     }
 
-    // MARK: - 1. Everyday Shortcuts
+    // MARK: - Shortcuts
 
     private func hotkeysCard(l10n: L10n) -> some View {
-        SectionCard(
-            title: l10n.tr("Shortcuts", "常用快捷键"),
-            subtitle: l10n.tr(
-                "Works globally inside games and fullscreen apps.",
-                "在任意游戏和全屏应用内按下即可直接触发。"
-            ),
-            symbol: "keyboard.fill",
-            accent: .indigo
-        ) {
+        SectionCard {
+            HStack {
+                Text(l10n.tr("Shortcuts", "快捷键"))
+                    .font(.system(size: 13.5, weight: .semibold))
+                Spacer()
+                Button(l10n.tr("Reset Defaults", "恢复默认")) {
+                    coordinator.config.hotkeys = HotkeyConfig()
+                    coordinator.persistConfig(reconfigureHotkeys: true, reconfigureSession: false)
+                }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+            }
+
             if let warning = coordinator.hotkeyWarning {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -116,7 +96,7 @@ struct SettingsView: View {
                 .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
 
-            VStack(spacing: 10) {
+            VStack(spacing: 9) {
                 hotkeyRow(
                     action: .toggleFullscreen,
                     binding: coordinator.config.hotkeys.toggleFullscreen,
@@ -167,31 +147,21 @@ struct SettingsView: View {
 
                 Divider()
 
-                // System-reserved Force Exit chord
                 HStack {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(l10n.hotkeyAction(.panicStop))
-                            .font(.system(size: 12.5, weight: .semibold))
-                        Text(l10n.tr(
-                            "Always active — immediately exits scaling and restores your mouse cursor.",
-                            "任何时候按下都会立刻退出放大画面并恢复系统鼠标指针。"
-                        ))
-                        .font(.system(size: 11))
+                    Text(l10n.hotkeyAction(.panicStop))
+                        .font(.system(size: 12.5))
+                    Spacer()
+                    Text(HotkeyBinding.panicStop.displayString)
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    StatusBadge(HotkeyBinding.panicStop.displayString, color: .red, symbol: "shield.lefthalf.filled")
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
-
-                HStack {
-                    Spacer()
-                    Button(l10n.tr("Reset Default Shortcuts", "恢复默认快捷键")) {
-                        coordinator.config.hotkeys = HotkeyConfig()
-                        coordinator.persistConfig(reconfigureHotkeys: true, reconfigureSession: false)
-                    }
-                    .controlSize(.small)
-                    .buttonStyle(.bordered)
-                }
+                .help(l10n.tr(
+                    "Immediately stops scaling and restores the system cursor.",
+                    "立即停止缩放并恢复系统光标"
+                ))
             }
         }
     }
@@ -205,7 +175,7 @@ struct SettingsView: View {
     ) -> some View {
         HStack {
             Text(l10n.hotkeyAction(action))
-                .font(.system(size: 12.5, weight: .medium))
+                .font(.system(size: 12.5))
             Spacer()
             HotkeyRecorderField(
                 binding: binding,
@@ -216,9 +186,9 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 2. Mouse & Cursor
+    // MARK: - Cursor
 
-    private func cursorAndMouseCard(profileID: UUID, l10n: L10n) -> some View {
+    private func cursorCard(profileID: UUID, l10n: L10n) -> some View {
         let cur = activeEditedProfile.cursor
         let axGranted = coordinator.permissions.accessibilityGranted
 
@@ -239,253 +209,191 @@ struct SettingsView: View {
             }
         )
 
-        return SectionCard(
-            title: l10n.tr("Mouse & Cursor Alignment", "鼠标与光标"),
-            subtitle: l10n.tr(
-                "Accurate click alignment & window confinement so scaled buttons work accurately without accidentally clicking the desktop.",
-                "鼠标精准对齐与范围限制（放大后点按钮指哪打哪，防止移出画面误点桌面退出）。"
-            ),
-            symbol: "cursorarrow.and.square.on.square.dashed",
-            accent: .green
-        ) {
-            // Honest Accessibility guidance banner inside Mouse & Cursor settings
+        return SectionCard(title: l10n.tr("Cursor", "光标")) {
             if !axGranted {
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
                         .foregroundStyle(.orange)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(l10n.tr(
-                            "Accessibility Permission Needed for Scaled Click Alignment",
-                            "缩放后鼠标精准点击必需（仅 1:1 缩放可不开）"
-                        ))
-                        .font(.system(size: 12, weight: .semibold))
-                        Text(l10n.tr(
-                            "macOS requires Accessibility access so MetalPie can align clicks to enlarged buttons and prevent accidental exit.",
-                            "未开启辅助功能时，放大画面后点击按钮会错位，点到窗口外会直接退回桌面。"
-                        ))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    }
+                    Text(l10n.tr(
+                        "Accessibility disabled — scaled clicks will be offset.",
+                        "未开启辅助功能，缩放后光标点击将偏移"
+                    ))
+                    .font(.system(size: 12))
                     Spacer()
-                    Button(l10n.tr("Enable", "一键开启")) {
+                    Button(l10n.tr("Grant", "授权")) {
                         coordinator.requestAccessibilityPermission()
                     }
-                    .controlSize(.small)
+                    .controlSize(.mini)
                     .buttonStyle(.borderedProminent)
                     .tint(.orange)
                 }
-                .padding(10)
-                .background(Color.orange.opacity(0.13), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
 
-            VStack(alignment: .leading, spacing: 10) {
-                Toggle(isOn: binding(profileID, \.cursor.renderScaledCursor)) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(l10n.tr("Show Scaled Cursor (Prevents Double Cursor)", "显示放大光标（避免出现双光标）"))
-                            .font(.system(size: 12.5, weight: .semibold))
-                        Text(l10n.tr(
-                            "Hides the original cursor cleanly and draws a sharp synced pointer at screen refresh rate.",
-                            "放大时自动隐藏系统原指针，并在正确位置实时绘制同步光标。"
-                        ))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 9) {
+                Toggle(
+                    l10n.tr("Render Scaled Cursor", "绘制缩放光标"),
+                    isOn: binding(profileID, \.cursor.renderScaledCursor)
+                )
+                .help(l10n.tr("Hides the system pointer and renders a synced cursor on the scaled overlay.", "隐藏系统指针并在缩放层同步绘制光标"))
+
+                Toggle(
+                    l10n.tr("Confine Cursor", "限制光标范围"),
+                    isOn: binding(profileID, \.cursor.confineCursor)
+                )
+                .help(l10n.tr("Keeps the pointer within the scaled window bounds.", "将光标限制在缩放窗口范围内"))
+
+                Toggle(
+                    l10n.tr("Adjust Cursor Speed", "按比例调整光标速度"),
+                    isOn: binding(profileID, \.cursor.adjustCursorSpeed)
+                )
+                .help(l10n.tr("Matches pointer travel speed to the scaled output dimensions.", "按缩放比例匹配光标移动速度"))
+
+                HStack(spacing: 12) {
+                    Toggle(
+                        l10n.tr("Hide When Idle", "空闲隐藏"),
+                        isOn: idleEnabled
+                    )
+                    if cur.hideOnIdleSeconds != nil {
+                        Slider(value: idleSeconds, in: 0.5...10.0, step: 0.5)
+                            .frame(maxWidth: 150)
+                        Text(String(format: "%.1fs", idleSeconds.wrappedValue))
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                            .monospacedDigit()
+                            .frame(width: 40, alignment: .trailing)
                     }
                 }
-
-                Toggle(isOn: binding(profileID, \.cursor.confineCursor)) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(l10n.tr("Keep Mouse Inside Scaled Window", "锁定鼠标在画面内（防误点桌面退出）"))
-                            .font(.system(size: 12.5, weight: .medium))
-                        Text(l10n.tr(
-                            "Prevents the pointer from slipping outside the target window while playing or clicking edges.",
-                            "防止鼠标移出游戏或窗口边缘时误点到桌面导致缩放退出。"
-                        ))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    }
-                }
-
-                Toggle(isOn: binding(profileID, \.cursor.adjustCursorSpeed)) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(l10n.tr("Auto-Match Mouse Speed to Scale", "自动适配鼠标移速"))
-                            .font(.system(size: 12.5, weight: .medium))
-                        Text(l10n.tr(
-                            "Keeps pointer movement feeling natural after upscaling without changing macOS mouse preferences.",
-                            "让放大后的鼠标移动速度与平时桌面手感一致，不会改动系统设置。"
-                        ))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    }
-                }
-
-                Divider()
-
-                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 10) {
-                    GridRow {
-                        Text(l10n.tr("Cursor Size", "光标大小"))
-                            .font(.system(size: 12.5, weight: .medium))
-                            .frame(width: 155, alignment: .leading)
-                        Picker("", selection: binding(profileID, \.cursor.cursorScaleMode)) {
-                            ForEach(CursorScaleMode.allCases) { mode in
-                                Text(l10n.cursorScaleMode(mode)).tag(mode)
-                            }
-                        }
-                        .labelsHidden()
-                        .frame(maxWidth: 260)
-                    }
-
-                    if cur.cursorScaleMode == .multiplier {
-                        GridRow {
-                            Text(l10n.tr("Size Multiplier", "放大倍数"))
-                                .font(.system(size: 12.5, weight: .medium))
-                            HStack(spacing: 10) {
-                                Slider(
-                                    value: binding(profileID, \.cursor.cursorScaleMultiplier),
-                                    in: 0.5...2.0,
-                                    step: 0.05
-                                )
-                                .frame(maxWidth: 200)
-                                Text(String(format: "%.2f×", cur.cursorScaleMultiplier))
-                                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                    .monospacedDigit()
-                                    .frame(width: 48, alignment: .trailing)
-                            }
-                        }
-                    }
-
-                    GridRow {
-                        Text(l10n.tr("Cursor Sharpness", "光标清晰度"))
-                            .font(.system(size: 12.5, weight: .medium))
-                        Picker("", selection: binding(profileID, \.cursor.interpolation)) {
-                            ForEach(CursorInterpolation.allCases) { interp in
-                                Text(l10n.cursorInterpolation(interp)).tag(interp)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.segmented)
-                        .frame(width: 240)
-                    }
-
-                    GridRow {
-                        Text(l10n.tr("Auto-Hide When Idle", "空闲自动隐藏光标"))
-                            .font(.system(size: 12.5, weight: .medium))
-                        HStack(spacing: 10) {
-                            Toggle("", isOn: idleEnabled)
-                                .labelsHidden()
-                            if cur.hideOnIdleSeconds != nil {
-                                Slider(value: idleSeconds, in: 0.5...10.0, step: 0.5)
-                                    .frame(maxWidth: 160)
-                                Text(l10n.tr(
-                                    String(format: "%.1fs", idleSeconds.wrappedValue),
-                                    String(format: "%.1f 秒", idleSeconds.wrappedValue)
-                                ))
-                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                .monospacedDigit()
-                            } else {
-                                Text(l10n.tr("Always Visible", "始终显示"))
-                                    .font(.system(size: 11.5))
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-
-                Divider()
 
                 HStack(spacing: 24) {
                     Toggle(
-                        l10n.tr("Hide Cursor in Screenshots", "截图时自动隐藏光标"),
+                        l10n.tr("Hide in Screenshots", "截图时隐藏"),
                         isOn: binding(profileID, \.cursor.hideInScreenshots)
                     )
                     Toggle(
-                        l10n.tr("Auto-Detect 3D/FPS Game Mouse Lock", "自动识别 3D/FPS 游戏锁鼠"),
+                        l10n.tr("Respect Game Mouse Grab", "响应游戏鼠标捕获"),
                         isOn: binding(profileID, \.cursor.respectGameMouseGrab)
                     )
+                    .help(l10n.tr("Yields cursor control when 3D games capture relative mouse input.", "3D 游戏捕获相对鼠标输入时自动让出光标控制"))
                 }
-                .font(.system(size: 12))
+            }
+            .font(.system(size: 12.5))
+
+            Divider()
+
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 9) {
+                GridRow {
+                    Text(l10n.tr("Cursor Scale", "光标缩放"))
+                        .font(.system(size: 12.5))
+                        .frame(width: 120, alignment: .leading)
+                    Picker("", selection: binding(profileID, \.cursor.cursorScaleMode)) {
+                        ForEach(CursorScaleMode.allCases) { mode in
+                            Text(l10n.cursorScaleMode(mode)).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 260)
+                }
+
+                if cur.cursorScaleMode == .multiplier {
+                    GridRow {
+                        Text(l10n.tr("Multiplier", "倍率"))
+                            .font(.system(size: 12.5))
+                        HStack(spacing: 10) {
+                            Slider(
+                                value: binding(profileID, \.cursor.cursorScaleMultiplier),
+                                in: 0.5...2.0,
+                                step: 0.05
+                            )
+                            .frame(maxWidth: 180)
+                            Text(String(format: "%.2f×", cur.cursorScaleMultiplier))
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .monospacedDigit()
+                                .frame(width: 46, alignment: .trailing)
+                        }
+                    }
+                }
+
+                GridRow {
+                    Text(l10n.tr("Interpolation", "插值"))
+                        .font(.system(size: 12.5))
+                    Picker("", selection: binding(profileID, \.cursor.interpolation)) {
+                        ForEach(CursorInterpolation.allCases) { interp in
+                            Text(l10n.cursorInterpolation(interp)).tag(interp)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 200)
+                }
             }
         }
     }
 
-    // MARK: - 3. Smooth Frame Generation
+    // MARK: - Frame Generation
 
     private func frameGenerationCard(profileID: UUID, l10n: L10n) -> some View {
         let fg = activeEditedProfile.frameGen
         let aneReady = coordinator.capabilities.supportsVTFrameInterpolation
 
-        return SectionCard(
-            title: l10n.tr("Smooth Frame Generation (2× / 3× / 4×)", "流畅补帧（2× / 3× / 4×）"),
-            subtitle: l10n.tr(
-                "Great for 30/60 FPS games and anime/video — not recommended for competitive FPS where lowest input lag matters most.",
-                "适合 30/60 帧游戏和视频，让动态画面更丝滑（不建议竞技类 FPS 游戏开启）。"
-            ),
-            symbol: "waveform.path.ecg.rectangle.fill",
-            accent: .cyan
-        ) {
+        return SectionCard(title: l10n.tr("Frame Generation", "帧生成")) {
             HStack {
                 Toggle(
-                    l10n.tr("Enable Smooth Frame Generation", "开启流畅补帧"),
+                    l10n.tr("Enable Frame Generation", "启用帧生成"),
                     isOn: binding(profileID, \.frameGen.enabled)
                 )
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 12.5))
 
                 Spacer()
 
-                StatusBadge(
-                    aneReady
-                        ? l10n.tr("Apple Silicon Hardware Ready", "支持 Apple 芯片硬件补帧")
-                        : l10n.tr("Metal Optical Flow Ready", "Metal 光流补帧就绪"),
-                    color: aneReady ? .green : .blue,
-                    symbol: aneReady ? "cpu.fill" : "sparkles"
-                )
+                Text(aneReady ? "VideoToolbox ML" : l10n.tr("Metal Optical Flow", "Metal 光流"))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
             }
 
             if fg.enabled {
                 Divider()
-                HStack(spacing: 14) {
-                    Text(l10n.tr("Frame Multiplier", "帧率倍数"))
-                        .font(.system(size: 12.5, weight: .medium))
-                        .frame(width: 155, alignment: .leading)
-                    Picker("", selection: binding(profileID, \.frameGen.multiplier)) {
-                        ForEach(FrameGenMultiplier.allCases) { mult in
-                            Text(mult.label).tag(mult)
+
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 9) {
+                    GridRow {
+                        Text(l10n.tr("Multiplier", "倍率"))
+                            .font(.system(size: 12.5))
+                            .frame(width: 120, alignment: .leading)
+                        Picker("", selection: binding(profileID, \.frameGen.multiplier)) {
+                            ForEach(FrameGenMultiplier.allCases) { mult in
+                                Text(mult.label).tag(mult)
+                            }
                         }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 190)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .frame(width: 220)
-                    Spacer()
                 }
 
                 Toggle(
-                    l10n.tr("Auto-Disable in 3D Game Mode (Lowest Latency)", "在 3D 游戏模式下自动关闭补帧（优先低延迟）"),
+                    l10n.tr("Disable in 3D Mode", "3D 模式自动关闭"),
                     isOn: binding(profileID, \.frameGen.disableIn3DGameMode)
                 )
-                .font(.system(size: 12))
+                .font(.system(size: 12.5))
+                .help(l10n.tr("Disables frame generation in 3D Game Mode to minimize input latency.", "在 3D 游戏模式下自动关闭以降低输入延迟"))
             }
         }
     }
 
-    // MARK: - 4. General, Language & Screenshots
+    // MARK: - General
 
-    private func generalLanguageAndScreenshotsCard(l10n: L10n) -> some View {
+    private func generalCard(l10n: L10n) -> some View {
         let validation = ScreenshotFilenameTemplate.validate(coordinator.config.screenshotFilenameTemplate)
-        let exampleName = ScreenshotFilenameTemplate.expand(
-            template: coordinator.config.screenshotFilenameTemplate,
-            processName: "HollowKnight",
-            windowTitle: "City of Tears"
-        ) + ".png"
 
-        return SectionCard(
-            title: l10n.tr("General, Language & Screenshots", "常规、语言与截图"),
-            symbol: "globe",
-            accent: .blue
-        ) {
-            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 10) {
+        return SectionCard(title: l10n.tr("General", "常规")) {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
                 GridRow {
-                    Text(l10n.tr("Interface Language", "界面语言"))
-                        .font(.system(size: 12.5, weight: .medium))
-                        .frame(width: 155, alignment: .leading)
+                    Text(l10n.tr("Language", "语言"))
+                        .font(.system(size: 12.5))
+                        .frame(width: 120, alignment: .leading)
                     Picker("", selection: Binding(
                         get: { coordinator.config.language },
                         set: { lang in
@@ -501,12 +409,12 @@ struct SettingsView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                    .frame(width: 310)
+                    .frame(maxWidth: 280)
                 }
 
                 GridRow {
-                    Text(l10n.tr("Countdown Delay", "倒计时秒数"))
-                        .font(.system(size: 12.5, weight: .medium))
+                    Text(l10n.tr("Countdown", "倒计时"))
+                        .font(.system(size: 12.5))
                     Stepper(
                         value: Binding(
                             get: { coordinator.config.countdownSeconds },
@@ -517,39 +425,36 @@ struct SettingsView: View {
                         ),
                         in: 1...5
                     ) {
-                        Text(l10n.tr("\(coordinator.config.countdownSeconds) second(s)", "\(coordinator.config.countdownSeconds) 秒"))
+                        Text("\(coordinator.config.countdownSeconds)s")
                             .font(.system(size: 12.5, weight: .semibold, design: .monospaced))
                             .monospacedDigit()
                     }
                 }
             }
 
-            Toggle(isOn: Binding(
-                get: { coordinator.config.keepRunningInMenuBar },
-                set: { keep in
-                    coordinator.config.keepRunningInMenuBar = keep
-                    coordinator.persistConfig(reconfigureSession: false)
-                }
-            )) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(l10n.tr("Keep Running in Menu Bar When Closed", "关闭窗口后保持在顶部菜单栏运行"))
-                        .font(.system(size: 12.5, weight: .medium))
-                    Text(l10n.tr(
-                        "Keeps global shortcuts and auto-scaling ready even after closing this window.",
-                        "关掉主窗口后仍可通过快捷键或顶部菜单栏随时启动缩放。"
-                    ))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                }
-            }
+            Toggle(
+                l10n.tr("Keep in Menu Bar", "菜单栏驻留"),
+                isOn: Binding(
+                    get: { coordinator.config.keepRunningInMenuBar },
+                    set: { keep in
+                        coordinator.config.keepRunningInMenuBar = keep
+                        coordinator.persistConfig(reconfigureSession: false)
+                    }
+                )
+            )
+            .font(.system(size: 12.5))
+            .help(l10n.tr(
+                "Keeps global shortcuts and auto-scale active after closing the main window.",
+                "关闭主窗口后继续在菜单栏保持快捷键与自动缩放运行"
+            ))
 
             Divider()
 
-            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 10) {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
                 GridRow {
-                    Text(l10n.tr("Screenshot Folder", "截图保存文件夹"))
-                        .font(.system(size: 12.5, weight: .medium))
-                        .frame(width: 155, alignment: .leading)
+                    Text(l10n.tr("Screenshot Folder", "截图目录"))
+                        .font(.system(size: 12.5))
+                        .frame(width: 120, alignment: .leading)
                     HStack(spacing: 8) {
                         TextField(
                             "~/Pictures/MetalPie",
@@ -564,52 +469,47 @@ struct SettingsView: View {
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 12, design: .monospaced))
 
-                        Button(l10n.tr("Choose…", "选择文件夹…")) {
+                        Button(l10n.tr("Choose…", "选择…")) {
                             chooseScreenshotDirectory()
                         }
+                        .controlSize(.small)
                         .buttonStyle(.bordered)
                     }
                 }
 
                 GridRow {
-                    Text(l10n.tr("Filename Template", "截图文件名模板"))
-                        .font(.system(size: 12.5, weight: .medium))
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            TextField(
-                                AppConfig.defaultScreenshotFilenameTemplate,
-                                text: Binding(
-                                    get: { coordinator.config.screenshotFilenameTemplate },
-                                    set: { val in
-                                        coordinator.config.screenshotFilenameTemplate = val
-                                        coordinator.persistConfig(reconfigureSession: false)
-                                    }
-                                )
+                    Text(l10n.tr("Filename Template", "文件名模板"))
+                        .font(.system(size: 12.5))
+                    HStack(spacing: 8) {
+                        TextField(
+                            AppConfig.defaultScreenshotFilenameTemplate,
+                            text: Binding(
+                                get: { coordinator.config.screenshotFilenameTemplate },
+                                set: { val in
+                                    coordinator.config.screenshotFilenameTemplate = val
+                                    coordinator.persistConfig(reconfigureSession: false)
+                                }
                             )
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 12, design: .monospaced))
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
 
-                            switch validation {
-                            case .valid:
-                                StatusBadge(l10n.tr("Valid", "格式正确"), color: .green)
-                            case .invalid(let reason):
-                                StatusBadge(localizedTemplateValidationReason(reason, l10n: l10n), color: .red)
-                            }
+                        if case .invalid(let reason) = validation {
+                            StatusBadge(localizedTemplateValidationReason(reason, l10n: l10n), color: .red)
                         }
-
-                        Text("\(l10n.tr("Example:", "示例：")) \(exampleName)   •   %PN% \(l10n.tr("App", "应用名")), %WT% \(l10n.tr("Title", "标题")), %Y%%M%%D%")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
                     }
+                    .help(l10n.tr(
+                        "Tokens: %PN% (App), %WT% (Window Title), %Y%, %M%, %D%, %H%, %m%, %S%",
+                        "可用变量：%PN% 应用名，%WT% 窗口标题，%Y%%M%%D% 日期，%H%%m%%S% 时间"
+                    ))
                 }
             }
         }
     }
 
-    // MARK: - 5. Collapsible Advanced Settings (Tier 2)
+    // MARK: - Advanced (Collapsed)
 
-    private func advancedSettingsSection(profileID: UUID, l10n: L10n) -> some View {
+    private func advancedSection(profileID: UUID, l10n: L10n) -> some View {
         let cap = activeEditedProfile.capture
         let fpsLimited = Binding<Bool>(
             get: { cap.frameRateLimit != nil },
@@ -630,183 +530,157 @@ struct SettingsView: View {
 
         return SectionCard {
             DisclosureGroup(isExpanded: $isAdvancedExpanded) {
-                VStack(alignment: .leading, spacing: 14) {
-                    // Display, Color & Performance
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(l10n.tr("Display Color, HDR & Performance", "画面色彩、HDR 与性能微调"))
-                            .font(.system(size: 12.5, weight: .bold))
-                            .padding(.top, 6)
-
-                        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 10) {
-                            GridRow {
-                                Text(l10n.tr("Color Format", "色彩深度"))
-                                    .font(.system(size: 12, weight: .medium))
-                                    .frame(width: 175, alignment: .leading)
-                                Picker("", selection: binding(profileID, \.capture.preferredPixelFormat)) {
-                                    ForEach(CapturePixelFormat.allCases) { fmt in
-                                        Text(l10n.pixelFormat(fmt)).tag(fmt)
-                                    }
-                                }
-                                .labelsHidden()
-                                .frame(maxWidth: 300)
-                            }
-
-                            GridRow {
-                                Text(l10n.tr("Dynamic Range (SDR / HDR)", "动态范围 (SDR / HDR)"))
-                                    .font(.system(size: 12, weight: .medium))
-                                Picker("", selection: binding(profileID, \.capture.dynamicRange)) {
-                                    ForEach(DynamicRangeMode.allCases) { dr in
-                                        Text(l10n.dynamicRange(dr)).tag(dr)
-                                    }
-                                }
-                                .labelsHidden()
-                                .frame(maxWidth: 300)
-                            }
-
-                            GridRow {
-                                Text(l10n.tr("Static Screen Power Saving", "静止画面自动省电"))
-                                    .font(.system(size: 12, weight: .medium))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Picker("", selection: binding(profileID, \.capture.duplicateFrameMode)) {
-                                        ForEach(DuplicateFrameMode.allCases) { mode in
-                                            Text(l10n.duplicateFrameMode(mode)).tag(mode)
-                                        }
-                                    }
-                                    .labelsHidden()
-                                    .frame(maxWidth: 300)
-                                    Text(l10n.tr(
-                                        "Skips redundant GPU work when window contents stop changing to reduce heat and battery drain.",
-                                        "窗口画面无变化时跳过重复渲染，降低发热与耗电。"
-                                    ))
-                                    .font(.system(size: 10.5))
-                                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 12) {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                        GridRow {
+                            Text(l10n.tr("Pixel Format", "像素格式"))
+                                .font(.system(size: 12.5))
+                                .frame(width: 130, alignment: .leading)
+                            Picker("", selection: binding(profileID, \.capture.preferredPixelFormat)) {
+                                ForEach(CapturePixelFormat.allCases) { fmt in
+                                    Text(l10n.pixelFormat(fmt)).tag(fmt)
                                 }
                             }
-
-                            GridRow {
-                                Text(l10n.tr("Wine / Emulator Low-Res Auto Detect", "自动识别低分辨率窗口（Wine / 模拟器优化）"))
-                                    .font(.system(size: 12, weight: .medium))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 8) {
-                                        Picker("", selection: $coordinator.nonRetinaMode) {
-                                            Text(l10n.tr("Auto Detect (Recommended)", "自动识别（推荐）")).tag(NonRetinaDetectionMode.auto)
-                                            Text(l10n.tr("Always Use Original 1× Pixels", "始终还原原始 1× 画面（更清晰省电）")).tag(NonRetinaDetectionMode.force1x)
-                                            Text(l10n.tr("Keep macOS 2× Retina", "保持系统 2× Retina 画面")).tag(NonRetinaDetectionMode.force2x)
-                                        }
-                                        .labelsHidden()
-                                        .frame(maxWidth: 280)
-
-                                        if coordinator.detectedContentResolution != .nativeFull {
-                                            StatusBadge(l10n.tr("1× Active", "已启用 1× 还原"), color: .green)
-                                        }
-                                    }
-                                    Text(l10n.tr(
-                                        "Skips macOS blurry 2× stretch and upscales straight from original pixels — sharper and faster.",
-                                        "跳过系统模糊放大，直接从原始画面超分，更清晰且省电。"
-                                    ))
-                                    .font(.system(size: 10.5))
-                                    .foregroundStyle(.secondary)
-                                }
-                            }
-
-                            GridRow {
-                                Text(l10n.tr("Capture Frame Rate Limit", "画面采集帧率上限"))
-                                    .font(.system(size: 12, weight: .medium))
-                                HStack(spacing: 10) {
-                                    Toggle(l10n.tr("Cap FPS", "限制帧率"), isOn: fpsLimited)
-                                    if cap.frameRateLimit != nil {
-                                        Stepper(value: fpsValue, in: 15...240, step: 5) {
-                                            Text("\(fpsValue.wrappedValue) FPS")
-                                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                                .monospacedDigit()
-                                        }
-                                    } else {
-                                        Text(l10n.tr("Uncapped (Matches Display Refresh)", "不限（跟随显示器刷新率）"))
-                                            .font(.system(size: 11.5))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 220)
                         }
 
-                        Toggle(isOn: binding(profileID, \.capture.lowLatencyPresent)) {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(l10n.tr("Ultra-Low-Latency Direct Present (Recommended when Frame Gen is OFF)", "超低延迟直出（不开补帧时推荐）"))
-                                    .font(.system(size: 12, weight: .medium))
-                                Text(l10n.tr(
-                                    "Skips extra display compositor buffering for snappier mouse and keyboard response.",
-                                    "跳过系统合成缓冲，操作更跟手。"
-                                ))
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.secondary)
+                        GridRow {
+                            Text(l10n.tr("Dynamic Range", "动态范围"))
+                                .font(.system(size: 12.5))
+                            Picker("", selection: binding(profileID, \.capture.dynamicRange)) {
+                                ForEach(DynamicRangeMode.allCases) { dr in
+                                    Text(l10n.dynamicRange(dr)).tag(dr)
+                                }
                             }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 160)
                         }
 
-                        Toggle(isOn: $coordinator.vrrDirectScanoutEnabled) {
-                            VStack(alignment: .leading, spacing: 1) {
-                                HStack(spacing: 6) {
-                                    Text(l10n.tr("ProMotion VRR Direct-Scanout Mode", "高刷自适应刷新率（ProMotion VRR）直出模式"))
-                                        .font(.system(size: 12, weight: .medium))
-                                    StatusBadge("ProMotion VRR", color: .purple)
+                        GridRow {
+                            Text(l10n.tr("Duplicate Frames", "重复帧检测"))
+                                .font(.system(size: 12.5))
+                            Picker("", selection: binding(profileID, \.capture.duplicateFrameMode)) {
+                                ForEach(DuplicateFrameMode.allCases) { mode in
+                                    Text(l10n.duplicateFrameMode(mode)).tag(mode)
                                 }
-                                Text(l10n.tr(
-                                    "Disables floating helper windows and draws cursor & FPS directly inside the scaled frame so ProMotion locks cleanly.",
-                                    "关闭独立悬浮层，把光标与帧率直接画进画面，让高刷屏更跟手。"
-                                ))
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.secondary)
                             }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 220)
                         }
-                    }
+                        .help(l10n.tr(
+                            "Skips redundant GPU passes when source frames are static.",
+                            "画面静止时跳过重复渲染以降低功耗"
+                        ))
 
-                    Divider()
-
-                    // Frame Gen Advanced
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(l10n.tr("Frame Generation Engine", "补帧引擎进阶"))
-                            .font(.system(size: 12.5, weight: .bold))
-
-                        Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 10) {
-                            GridRow {
-                                Text(l10n.tr("Interpolation Engine", "补帧引擎选择"))
-                                    .font(.system(size: 12, weight: .medium))
-                                    .frame(width: 175, alignment: .leading)
-                                Picker("", selection: binding(profileID, \.frameGen.backend)) {
-                                    ForEach(FrameGenBackend.allCases) { backend in
-                                        Text(l10n.frameGenBackend(backend)).tag(backend)
-                                    }
-                                }
-                                .labelsHidden()
-                                .frame(maxWidth: 300)
-                            }
-
-                            GridRow {
-                                Text(l10n.tr("Anti-Ghosting Sensitivity", "防鬼影灵敏度"))
-                                    .font(.system(size: 12, weight: .medium))
-                                Picker("", selection: binding(profileID, \.frameGen.artifactGuardSensitivity)) {
-                                    ForEach(ArtifactGuardSensitivity.allCases) { sens in
-                                        Text(l10n.artifactGuard(sens)).tag(sens)
-                                    }
+                        GridRow {
+                            Text(l10n.tr("1× Demagnify", "1× 窗口反放大"))
+                                .font(.system(size: 12.5))
+                            HStack(spacing: 8) {
+                                Picker("", selection: $coordinator.nonRetinaMode) {
+                                    Text(l10n.tr("Auto", "自动")).tag(NonRetinaDetectionMode.auto)
+                                    Text(l10n.tr("Force 1×", "强制 1×")).tag(NonRetinaDetectionMode.force1x)
+                                    Text(l10n.tr("Off (2×)", "关闭")).tag(NonRetinaDetectionMode.force2x)
                                 }
                                 .labelsHidden()
                                 .pickerStyle(.segmented)
-                                .frame(width: 260)
+                                .frame(maxWidth: 220)
+
+                                if coordinator.detectedContentResolution != .nativeFull {
+                                    StatusBadge("1×", color: .green)
+                                }
                             }
                         }
+                        .help(l10n.tr(
+                            "Recovers native 1× pixels from macOS-magnified Wine and retro windows.",
+                            "还原 Wine 或低分辨率窗口被系统 2× 放大的原始像素"
+                        ))
+
+                        GridRow {
+                            Text(l10n.tr("Frame Rate Limit", "帧率上限"))
+                                .font(.system(size: 12.5))
+                            HStack(spacing: 10) {
+                                Toggle("", isOn: fpsLimited)
+                                    .labelsHidden()
+                                if cap.frameRateLimit != nil {
+                                    Stepper(value: fpsValue, in: 15...240, step: 5) {
+                                        Text("\(fpsValue.wrappedValue) FPS")
+                                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                            .monospacedDigit()
+                                    }
+                                } else {
+                                    Text(l10n.tr("Uncapped", "不限"))
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+
+                    HStack(spacing: 24) {
+                        Toggle(
+                            l10n.tr("Low-Latency Present", "低延迟呈现"),
+                            isOn: binding(profileID, \.capture.lowLatencyPresent)
+                        )
+                        .help(l10n.tr(
+                            "Disables extra compositor buffering when frame generation is off.",
+                            "未启用帧生成时跳过额外合成缓冲以降低延迟"
+                        ))
+
+                        Toggle(
+                            l10n.tr("VRR Direct-Scanout", "VRR 直出"),
+                            isOn: $coordinator.vrrDirectScanoutEnabled
+                        )
+                        .help(l10n.tr(
+                            "Composites cursor and HUD directly in Metal with zero sub-windows for ProMotion VRR.",
+                            "在 Metal 内直接合成光标与监视器，避免悬浮层影响 ProMotion VRR"
+                        ))
+                    }
+                    .font(.system(size: 12.5))
+
+                    Divider()
+
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                        GridRow {
+                            Text(l10n.tr("Frame Gen Backend", "补帧后端"))
+                                .font(.system(size: 12.5))
+                                .frame(width: 130, alignment: .leading)
+                            Picker("", selection: binding(profileID, \.frameGen.backend)) {
+                                ForEach(FrameGenBackend.allCases) { backend in
+                                    Text(l10n.frameGenBackend(backend)).tag(backend)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 220)
+                        }
+
+                        GridRow {
+                            Text(l10n.tr("Artifact Guard", "伪影抑制"))
+                                .font(.system(size: 12.5))
+                            Picker("", selection: binding(profileID, \.frameGen.artifactGuardSensitivity)) {
+                                ForEach(ArtifactGuardSensitivity.allCases) { sens in
+                                    Text(l10n.artifactGuard(sens)).tag(sens)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 220)
+                        }
+                        .help(l10n.tr(
+                            "Suppresses ghosting and occlusion artifacts during frame generation.",
+                            "抑制帧生成过程中的残影与遮挡伪影"
+                        ))
                     }
 
                     Divider()
 
-                    // Auto-Scale Ignore List
+                    // Ignore List
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(l10n.tr("Auto-Scale Ignore List", "自动缩放忽略名单"))
-                            .font(.system(size: 12.5, weight: .bold))
-                        Text(l10n.tr(
-                            "System apps and listed Bundle IDs will never be triggered by Auto-Scale.",
-                            "下列系统进程与应用永远不会被「自动缩放」误触发。"
-                        ))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+                        Text(l10n.tr("Ignore List", "忽略列表"))
+                            .font(.system(size: 12.5, weight: .medium))
 
                         HStack(spacing: 8) {
                             TextField("com.vendor.helper", text: $newExcludedBundleID)
@@ -821,6 +695,7 @@ struct SettingsView: View {
                                 newExcludedBundleID = ""
                                 coordinator.persistConfig(reconfigureSession: false)
                             }
+                            .controlSize(.small)
                             .buttonStyle(.bordered)
                             .disabled(newExcludedBundleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
@@ -834,7 +709,9 @@ struct SettingsView: View {
                                             .font(.system(size: 11.5, design: .monospaced))
                                         Spacer()
                                         if isProtected {
-                                            StatusBadge(l10n.tr("Protected", "内置保护"), color: .secondary)
+                                            Text(l10n.tr("Built-in", "内置"))
+                                                .font(.system(size: 10.5))
+                                                .foregroundStyle(.secondary)
                                         } else {
                                             Button {
                                                 coordinator.config.autoScaleExcludedBundleIDs.removeAll { $0 == bundleID }
@@ -852,36 +729,31 @@ struct SettingsView: View {
                                 }
                             }
                         }
-                        .frame(maxHeight: 120)
+                        .frame(maxHeight: 110)
                     }
 
                     Divider()
 
-                    // Config Storage & Reset
-                    HStack(spacing: 10) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(l10n.tr("Configuration File", "配置文件备份与恢复"))
-                                .font(.system(size: 12, weight: .semibold))
-                            Text(coordinator.configStore.fileURL.path)
-                                .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
+                    HStack(spacing: 8) {
+                        Text(coordinator.configStore.fileURL.path)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                         Spacer()
-                        Button(l10n.tr("Reveal in Finder", "在访达中打开")) {
+                        Button(l10n.tr("Reveal", "在访达中显示")) {
                             NSWorkspace.shared.activateFileViewerSelecting([coordinator.configStore.fileURL])
                         }
                         .controlSize(.small)
                         .buttonStyle(.bordered)
 
-                        Button(l10n.tr("Export…", "导出备份…")) {
+                        Button(l10n.tr("Export…", "导出…")) {
                             exportFullConfig(l10n: l10n)
                         }
                         .controlSize(.small)
                         .buttonStyle(.bordered)
 
-                        Button(l10n.tr("Reset Defaults…", "恢复默认设置…"), role: .destructive) {
+                        Button(l10n.tr("Reset Config…", "重置配置…"), role: .destructive) {
                             showResetConfirmation = true
                         }
                         .controlSize(.small)
@@ -889,24 +761,8 @@ struct SettingsView: View {
                     }
                 }
             } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "slider.horizontal.below.square.filled.and.square")
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 22, height: 22)
-                        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(l10n.tr("Advanced Settings", "高级设置"))
-                            .font(.system(size: 13.5, weight: .semibold))
-                        Text(l10n.tr(
-                            "HDR/10-bit color, ProMotion VRR, Wine 1× detection, power-saving, ignore list & reset",
-                            "色彩与 HDR、高刷 VRR 直出、Wine 低清优化、静止省电、忽略名单与恢复默认"
-                        ))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
+                Text(l10n.tr("Advanced", "高级"))
+                    .font(.system(size: 13.5, weight: .semibold))
             }
         }
     }
@@ -926,14 +782,14 @@ struct SettingsView: View {
 
     private func localizedTemplateValidationReason(_ reason: String, l10n: L10n) -> String {
         if reason.contains("empty") {
-            return l10n.tr("Template cannot be empty", "文件名模板不能为空")
+            return l10n.tr("Empty", "不能为空")
         }
         if reason.contains("Unclosed") {
-            return l10n.tr("Unclosed '%' token", "存在未闭合的 '%' 变量")
+            return l10n.tr("Unclosed '%'", "未闭合 '%'")
         }
         if reason.hasPrefix("Unknown token") {
             let suffix = reason.replacingOccurrences(of: "Unknown token ", with: "")
-            return l10n.tr("Unknown token \(suffix)", "未知变量 \(suffix)")
+            return l10n.tr("Unknown \(suffix)", "未知 \(suffix)")
         }
         return reason
     }
@@ -963,7 +819,7 @@ struct SettingsView: View {
                 try data.write(to: url, options: [.atomic])
                 coordinator.showToast(
                     icon: "checkmark.circle.fill",
-                    title: l10n.tr("Configuration Exported", "配置已导出"),
+                    title: l10n.tr("Config Exported", "配置已导出"),
                     subtitle: url.lastPathComponent,
                     style: .success
                 )

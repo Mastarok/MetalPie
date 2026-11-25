@@ -16,9 +16,9 @@ public struct MainWindowView: View {
         NavigationSplitView {
             VStack(spacing: 0) {
                 // Brand Header
-                HStack(spacing: 10) {
+                HStack(spacing: 9) {
                     ZStack {
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
                             .fill(
                                 LinearGradient(
                                     colors: [Color.cyan, Color.blue, Color.indigo],
@@ -27,19 +27,13 @@ public struct MainWindowView: View {
                                 )
                             )
                         Image(systemName: "sparkles")
-                            .font(.system(size: 14, weight: .bold))
+                            .font(.system(size: 13, weight: .bold))
                             .foregroundStyle(.white)
                     }
-                    .frame(width: 28, height: 28)
+                    .frame(width: 24, height: 24)
 
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text("MetalPie")
-                            .font(.system(size: 14, weight: .bold))
-                        Text(l10n.tr("GPU Upscaler & Frame Gen", "窗口高清放大与补帧"))
-                            .font(.system(size: 9.5))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
+                    Text("MetalPie")
+                        .font(.system(size: 14, weight: .bold))
                     Spacer()
                 }
                 .padding(.horizontal, 14)
@@ -122,7 +116,7 @@ public struct MainWindowView: View {
 
             HStack(spacing: 6) {
                 Text(l10n.sessionState(coordinator.telemetry.state))
-                    .font(.system(size: 10.5))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
@@ -138,21 +132,12 @@ public struct MainWindowView: View {
                     Button {
                         Task { await coordinator.stopScaling(isManual: true, showToast: true) }
                     } label: {
-                        Label(l10n.tr("Exit", "退出"), systemImage: "stop.fill")
+                        Label(l10n.tr("Stop", "停止"), systemImage: "stop.fill")
                             .font(.system(size: 10.5, weight: .semibold))
                     }
                     .controlSize(.mini)
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
-                } else {
-                    Text(coordinator.capabilities.supportsVTFrameInterpolation
-                         ? l10n.tr("Apple ML", "芯片补帧")
-                         : "Metal 3")
-                        .font(.system(size: 9.5, weight: .bold))
-                        .foregroundStyle(Color.cyan)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1.5)
-                        .background(Color.cyan.opacity(0.14), in: Capsule())
                 }
             }
         }

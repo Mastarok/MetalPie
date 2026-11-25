@@ -10,13 +10,49 @@ public enum RectEdge: String, Hashable, Codable, Sendable, CaseIterable {
     case bottom
 }
 
+/// Zero-allocation bitmask of cardinal rectangle edges for the high-frequency `CGEventTap` hot path.
+/// Replaces heap-allocated `Set<RectEdge>` in `constrainSourcePoint(_:)` and `touchedBorders(_:tolerance:)`.
+public struct RectEdges: OptionSet, Hashable, Codable, Sendable {
+    public let rawValue: UInt8
+
+    public init(rawValue: UInt8) {
+        self.rawValue = rawValue
+    }
+
+    public static let left   = RectEdges(rawValue: 1 << 0)
+    public static let right  = RectEdges(rawValue: 1 << 1)
+    public static let top    = RectEdges(rawValue: 1 << 2)
+    public static let bottom = RectEdges(rawValue: 1 << 3)
+    public static let all: RectEdges = [.left, .right, .top, .bottom]
+
+    @inlinable
+    public func contains(_ edge: RectEdge) -> Bool {
+        switch edge {
+        case .left: return (rawValue & Self.left.rawValue) != 0
+        case .right: return (rawValue & Self.right.rawValue) != 0
+        case .top: return (rawValue & Self.top.rawValue) != 0
+        case .bottom: return (rawValue & Self.bottom.rawValue) != 0
+        }
+    }
+
+    @inlinable
+    public mutating func insert(_ edge: RectEdge) {
+        switch edge {
+        case .left: formUnion(Self.left)
+        case .right: formUnion(Self.right)
+        case .top: formUnion(Self.top)
+        case .bottom: formUnion(Self.bottom)
+        }
+    }
+}
+
 /// Result of constraining a CoreGraphics pointer coordinate inside a source window's reachable bounds.
 public struct ConstrainResult: Hashable, Sendable {
     public let point: CGPoint
     public let wasClamped: Bool
-    public let clampedEdges: Set<RectEdge>
+    public let clampedEdges: RectEdges
 
-    public init(point: CGPoint, wasClamped: Bool, clampedEdges: Set<RectEdge>) {
+    public init(point: CGPoint, wasClamped: Bool, clampedEdges: RectEdges) {
         self.point = point
         self.wasClamped = wasClamped
         self.clampedEdges = clampedEdges
@@ -26,9 +62,7 @@ public struct ConstrainResult: Hashable, Sendable {
         hasher.combine(point.x)
         hasher.combine(point.y)
         hasher.combine(wasClamped)
-        for edge in RectEdge.allCases where clampedEdges.contains(edge) {
-            hasher.combine(edge)
-        }
+        hasher.combine(clampedEdges.rawValue)
     }
 }
 
@@ -157,6 +191,8 @@ public struct PointerMapping: Hashable, Sendable {
     public let edgeInset: CGFloat
     /// Individual display intersections of `sourceRect` that the OS cursor can physically reach.
     public let reachableSourceRects: [CGRect]
+    /// Pre-inset reachable display intersections so `constrainSourcePoint(_:)` performs zero heap allocations.
+    private let insetReachableSourceRects: [CGRect]
     /// Effective inset confinement bounds in global CG (Y-down) logical points.
     public let confinementRect: CGRect
 
@@ -186,6 +222,7 @@ public struct PointerMapping: Hashable, Sendable {
 
         let reachable = Self.computeReachableRects(sourceRect: normalizedSource, displays: displays)
         self.reachableSourceRects = reachable
+        self.insetReachableSourceRects = reachable.map { Self.insetConfinementRect($0, edgeInset: clampedInset) }
 
         let baseConfinement: CGRect
         if let first = reachable.first {
@@ -344,13 +381,18 @@ public struct PointerMapping: Hashable, Sendable {
         return min(max(raw, 0.25), 8.0)
     }
 
-    /// Per-axis delta multiplier (`1 / scale`) applied when `adjustCursorSpeed` is enabled outside 3D Game Mode.
+    /// Per-axis delta multiplier (`srcSpan / dstSpan`) applied when `adjustCursorSpeed` is enabled outside
+    /// 3D Game Mode so moving the physical desktop cursor by `+N pt` moves the visual scaled cursor by exact `+N pt`.
     public var speedCompensationScale: CGSize {
         guard settings.adjustCursorSpeed, !isIdentity, !threeDGameMode, isValid else {
             return CGSize(width: 1.0, height: 1.0)
         }
-        let sx = min(max(1.0 / max(scaleX, 0.125), 0.1), 4.0)
-        let sy = min(max(1.0 / max(scaleY, 0.125), 0.1), 4.0)
+        let srcSpanX = max(1.0, Double(sourceRect.width - 1.0))
+        let srcSpanY = max(1.0, Double(sourceRect.height - 1.0))
+        let dstSpanX = max(1.0, Double(contentRect.width - 1.0))
+        let dstSpanY = max(1.0, Double(contentRect.height - 1.0))
+        let sx = min(max(srcSpanX / dstSpanX, 0.05), 4.0)
+        let sy = min(max(srcSpanY / dstSpanY, 0.05), 4.0)
         return CGSize(width: sx, height: sy)
     }
 
@@ -359,7 +401,7 @@ public struct PointerMapping: Hashable, Sendable {
         guard settings.adjustCursorSpeed, !isIdentity, !threeDGameMode, isValid else {
             return 1.0
         }
-        return min(max(1.0 / max(averageScale, 0.125), 0.1), 4.0)
+        return min(max(1.0 / max(averageScale, 0.125), 0.05), 4.0)
     }
 
     // MARK: - Fencepost (N - 1) Coordinate Mapping
@@ -405,13 +447,13 @@ public struct PointerMapping: Hashable, Sendable {
     // MARK: - Confinement & Letterbox Handling
 
     /// Constrains a CG global pointer coordinate inside the source window's reachable confinement bounds.
-    /// Does not modify relative mouse deltas.
+    /// Zero heap allocations — safe for the high-frequency `CGEventTap` hot path.
     public func constrainSourcePoint(_ cgPoint: CGPoint) -> ConstrainResult {
         guard isValid else {
             return ConstrainResult(point: cgPoint, wasClamped: false, clampedEdges: [])
         }
 
-        var clampedEdges = Set<RectEdge>()
+        var clampedEdges: RectEdges = []
         var x = cgPoint.x
         var y = cgPoint.y
 
@@ -434,14 +476,18 @@ public struct PointerMapping: Hashable, Sendable {
         var candidate = CGPoint(x: x, y: y)
 
         // For non-rectangular L-shaped multi-monitor unions, ensure the confined point actually
-        // resides within one of the physical reachable display intersections.
-        if reachableSourceRects.count > 1 {
-            let insetRects = reachableSourceRects.map { Self.insetConfinementRect($0, edgeInset: edgeInset) }
-            let insideAny = insetRects.contains { rect in
-                candidate.x >= rect.minX && candidate.x <= rect.maxX &&
+        // resides within one of the physical reachable display intersections (precomputed; zero alloc).
+        if insetReachableSourceRects.count > 1 {
+            var insideAny = false
+            for rect in insetReachableSourceRects {
+                if candidate.x >= rect.minX && candidate.x <= rect.maxX &&
                     candidate.y >= rect.minY && candidate.y <= rect.maxY
+                {
+                    insideAny = true
+                    break
+                }
             }
-            if !insideAny, let nearest = Self.nearestPoint(to: candidate, in: insetRects) {
+            if !insideAny, let nearest = Self.nearestPoint(to: candidate, in: insetReachableSourceRects) {
                 if nearest.x > candidate.x { clampedEdges.insert(.left) }
                 if nearest.x < candidate.x { clampedEdges.insert(.right) }
                 if nearest.y > candidate.y { clampedEdges.insert(.top) }
@@ -590,17 +636,60 @@ public struct PointerMapping: Hashable, Sendable {
         }
     }
 
-    // MARK: - Border & FPS Grab Helpers
+    // MARK: - Border & FPS Grab Helpers (Zero Heap Allocation)
 
     /// Returns which edges of `confinementRect` the source point is currently touching within `tolerance`.
-    public func touchedBorders(_ sourcePoint: CGPoint, tolerance: CGFloat = 1.5) -> Set<RectEdge> {
+    /// Uses stack-allocated `RectEdges` bitmask (zero heap allocations per mouse event).
+    public func touchedBorders(_ sourcePoint: CGPoint, tolerance: CGFloat = 1.5) -> RectEdges {
         guard isValid else { return [] }
-        var edges = Set<RectEdge>()
+        var edges: RectEdges = []
         if sourcePoint.x <= confinementRect.minX + tolerance { edges.insert(.left) }
         if sourcePoint.x >= confinementRect.maxX - tolerance { edges.insert(.right) }
         if sourcePoint.y <= confinementRect.minY + tolerance { edges.insert(.top) }
         if sourcePoint.y >= confinementRect.maxY - tolerance { edges.insert(.bottom) }
         return edges
+    }
+
+    /// Returns which physical outer display bezel edges `cgPoint` is currently touching within `tolerance`.
+    /// Used to distinguish monitor-bezel clamping from an FPS game locking the cursor in place.
+    public func touchedDisplayEdges(_ cgPoint: CGPoint, tolerance: CGFloat = 2.0) -> RectEdges {
+        guard !displays.isEmpty else { return [] }
+        var containing: CGRect?
+        for display in displays {
+            let b = display.cgBounds.standardized
+            if cgPoint.x >= b.minX - tolerance && cgPoint.x <= b.maxX + tolerance &&
+                cgPoint.y >= b.minY - tolerance && cgPoint.y <= b.maxY + tolerance
+            {
+                containing = b
+                break
+            }
+        }
+        guard let b = containing else { return [] }
+
+        var edges: RectEdges = []
+        if cgPoint.x <= b.minX + tolerance && !hasDisplay(covering: CGPoint(x: b.minX - tolerance - 2.0, y: cgPoint.y)) {
+            edges.insert(.left)
+        }
+        if cgPoint.x >= b.maxX - tolerance && !hasDisplay(covering: CGPoint(x: b.maxX + tolerance + 2.0, y: cgPoint.y)) {
+            edges.insert(.right)
+        }
+        if cgPoint.y <= b.minY + tolerance && !hasDisplay(covering: CGPoint(x: cgPoint.x, y: b.minY - tolerance - 2.0)) {
+            edges.insert(.top)
+        }
+        if cgPoint.y >= b.maxY - tolerance && !hasDisplay(covering: CGPoint(x: cgPoint.x, y: b.maxY + tolerance + 2.0)) {
+            edges.insert(.bottom)
+        }
+        return edges
+    }
+
+    private func hasDisplay(covering point: CGPoint) -> Bool {
+        for display in displays {
+            let b = display.cgBounds.standardized
+            if point.x >= b.minX && point.x < b.maxX && point.y >= b.minY && point.y < b.maxY {
+                return true
+            }
+        }
+        return false
     }
 
     /// True if `sourcePoint` lies within `tolerance` points of any edge of `confinementRect`.

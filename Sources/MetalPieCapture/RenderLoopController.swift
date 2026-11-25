@@ -886,6 +886,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private var fgPreparedSettings: FrameGenSettings?
     private var fgPendingBeats: [ScheduledFGBeat] = []
     private var fgHysteresisSuppressedByHighFPS = false
+    private var fgLastPassTiming: PassTiming?
     private var cadenceTracker = CadenceTracker()
 
     public init(
@@ -1703,7 +1704,19 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         emitFirstFrameIfNeeded()
 
         // Update telemetry snapshot & publish at ~5 Hz.
+        // Preserve the most recent `"frame-gen"` PassTiming across real source frames while Frame Gen
+        // stays active so the 5 Hz telemetry snapshots & Profiler HUD never flicker `"frame-gen"` off
+        // when a publish tick lands on a real source beat; clear immediately when `!fgActive`.
         var combinedTimings = extraPassTimings
+        if fgActive {
+            if let freshFG = extraPassTimings.first(where: { $0.id == "frame-gen" }) {
+                fgLastPassTiming = freshFG
+            } else if let cachedFG = fgLastPassTiming {
+                combinedTimings.append(cachedFG)
+            }
+        } else {
+            fgLastPassTiming = nil
+        }
         combinedTimings.append(contentsOf: effectReport.passTimings)
         telemetry.updateSessionMetadata(
             state: .running,
@@ -1963,6 +1976,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         fgPreparedSettings = nil
         fgPendingBeats.removeAll()
         fgHysteresisSuppressedByHighFPS = false
+        fgLastPassTiming = nil
         cadenceTracker.reset()
         frameInterpolator?.reset()
     }

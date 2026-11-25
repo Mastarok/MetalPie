@@ -298,9 +298,9 @@ public struct ProfilerHUDCardView: View {
 
             // FPS & Frame Time Metrics Grid
             HStack(spacing: 10) {
-                metricCell(label: l10n.tr("SRC", "原始帧"), value: String(format: "%.1f", telemetry.sourceFPS), unit: "fps", accent: .white)
-                metricCell(label: l10n.tr("OUT", "输出帧"), value: String(format: "%.1f", telemetry.outputFPS), unit: "fps", accent: .green)
-                metricCell(label: l10n.tr("DISP", "实显"), value: String(format: "%.1f", telemetry.presentedFPS), unit: "fps", accent: .cyan)
+                metricCell(label: l10n.tr("SRC", "源"), value: String(format: "%.1f", telemetry.sourceFPS), unit: "fps", accent: .white)
+                metricCell(label: l10n.tr("OUT", "输出"), value: String(format: "%.1f", telemetry.outputFPS), unit: "fps", accent: .green)
+                metricCell(label: l10n.tr("DISP", "显示"), value: String(format: "%.1f", telemetry.presentedFPS), unit: "fps", accent: .cyan)
                 metricCell(label: "GPU", value: String(format: "%.2f", totalMs), unit: "ms", accent: totalMs > 8.0 ? .orange : .mint)
             }
             .padding(.vertical, 5)
@@ -348,11 +348,11 @@ public struct ProfilerHUDCardView: View {
 
             // Footer counters
             HStack {
-                Text("\(l10n.tr("Idle Skip", "省电跳过")): \(telemetry.duplicateFramesSkipped)")
+                Text("\(l10n.tr("Skip", "跳过")): \(telemetry.duplicateFramesSkipped)")
                     .font(.system(size: 9.5, design: .monospaced))
                     .foregroundStyle(Color.white.opacity(0.55))
                 Spacer()
-                Text("\(l10n.tr("Dropped", "丢帧")): \(telemetry.droppedFrames)")
+                Text("\(l10n.tr("Drop", "丢帧")): \(telemetry.droppedFrames)")
                     .font(.system(size: 9.5, design: .monospaced))
                     .foregroundStyle(telemetry.droppedFrames > 0 ? Color.orange.opacity(0.9) : Color.white.opacity(0.55))
             }

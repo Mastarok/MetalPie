@@ -86,18 +86,24 @@ public struct RawWindowSnapshot: Hashable, Sendable {
 // MARK: - Memory-Safe AXObserver Callback Box
 
 private final class AXObserverCallbackBox: @unchecked Sendable {
-    private let handlerLock = OSAllocatedUnfairLock<(@Sendable (String) -> Void)?>(initialState: nil)
+    /// Concrete struct wrapper prevents Swift's generic `inout` closure reabstraction
+    /// writeback bug in `OSAllocatedUnfairLock<Closure?>`.
+    private struct CallbackState: Sendable {
+        var handler: (@Sendable (String) -> Void)?
+    }
+
+    private let state: OSAllocatedUnfairLock<CallbackState>
 
     init(handler: @escaping @Sendable (String) -> Void) {
-        handlerLock.withLock { $0 = handler }
+        self.state = OSAllocatedUnfairLock(initialState: CallbackState(handler: handler))
     }
 
     func invalidate() {
-        handlerLock.withLock { $0 = nil }
+        state.withLock { $0.handler = nil }
     }
 
     func notify(_ notificationName: String) {
-        let cb = handlerLock.withLock { $0 }
+        let cb = state.withLock(\.handler)
         cb?(notificationName)
     }
 }

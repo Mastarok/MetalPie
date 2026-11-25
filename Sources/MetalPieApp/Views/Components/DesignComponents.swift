@@ -164,7 +164,7 @@ struct HotkeyRecorderField: View {
                             Circle()
                                 .fill(Color.red)
                                 .frame(width: 7, height: 7)
-                            Text(l10n.tr("Press shortcut…", "请按下快捷键…"))
+                            Text(l10n.tr("Press keys…", "按下快捷键…"))
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(Color.accentColor)
                         } else if binding.isEnabled {
@@ -172,7 +172,7 @@ struct HotkeyRecorderField: View {
                                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
                                 .foregroundStyle(.primary)
                         } else {
-                            Text(l10n.tr("Disabled", "已禁用"))
+                            Text(l10n.tr("None", "无"))
                                 .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
                         }
@@ -220,7 +220,7 @@ struct HotkeyRecorderField: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help(l10n.tr("Disable Shortcut", "禁用快捷键"))
+                .help(l10n.tr("Clear", "清除"))
             }
         }
     }

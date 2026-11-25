@@ -56,21 +56,21 @@ struct MetalPieApp: App {
             CommandGroup(replacing: .newItem) {}
             CommandMenu("MetalPie") {
                 let l10n = coordinator.l10n
-                Button(l10n.tr("Scale Frontmost Fullscreen", "全屏放大当前窗口")) {
+                Button(l10n.tr("Fullscreen Scale", "全屏缩放")) {
                     Task { await coordinator.startScalingFrontmost(presentationOverride: .fullscreen) }
                 }
-                Button(l10n.tr("Scale Frontmost Windowed", "窗口放大当前窗口")) {
+                Button(l10n.tr("Windowed Scale", "窗口缩放")) {
                     Task { await coordinator.startScalingFrontmost(presentationOverride: .windowed()) }
                 }
-                Button(l10n.tr("Scale in \(coordinator.config.countdownSeconds)s", "\(coordinator.config.countdownSeconds) 秒后放大当前窗口")) {
+                Button(l10n.tr("Countdown (\(coordinator.config.countdownSeconds)s)", "倒计时 \(coordinator.config.countdownSeconds)s")) {
                     coordinator.startCountdownScale(mode: .fullscreen)
                 }
                 Divider()
-                Button(l10n.tr("Take Cursor-Free Screenshot", "无光标高清截图")) {
+                Button(l10n.tr("Screenshot", "截图")) {
                     Task { await coordinator.captureCursorFreeScreenshot() }
                 }
                 .disabled(!coordinator.isScalingSessionOpen)
-                Button(l10n.tr("Stop Scaling", "退出缩放")) {
+                Button(l10n.tr("Stop", "停止")) {
                     Task { await coordinator.stopScaling(isManual: true, showToast: true) }
                 }
                 .disabled(!coordinator.isScalingSessionOpen)
@@ -108,17 +108,17 @@ struct MetalPieApp: App {
 
         Divider()
 
-        Button(l10n.tr("Scale Frontmost Fullscreen", "全屏放大当前窗口")) {
+        Button(l10n.tr("Fullscreen Scale", "全屏缩放")) {
             Task { await coordinator.startScalingFrontmost(presentationOverride: .fullscreen) }
         }
         .disabled(!coordinator.permissions.screenRecordingGranted)
 
-        Button(l10n.tr("Scale Frontmost Windowed", "窗口放大当前窗口")) {
+        Button(l10n.tr("Windowed Scale", "窗口缩放")) {
             Task { await coordinator.startScalingFrontmost(presentationOverride: .windowed()) }
         }
         .disabled(!coordinator.permissions.screenRecordingGranted)
 
-        Button(l10n.tr("Scale in \(coordinator.config.countdownSeconds)s", "\(coordinator.config.countdownSeconds) 秒后放大当前窗口")) {
+        Button(l10n.tr("Countdown (\(coordinator.config.countdownSeconds)s)", "倒计时 \(coordinator.config.countdownSeconds)s")) {
             coordinator.startCountdownScale(mode: .fullscreen)
         }
         .disabled(!coordinator.permissions.screenRecordingGranted)
@@ -126,7 +126,7 @@ struct MetalPieApp: App {
         Divider()
 
         // Scenario-Grouped Quick Scaling Mode Picker
-        Menu(l10n.tr("Scaling Mode", "切换缩放模式")) {
+        Menu(l10n.tr("Scaling Mode", "缩放模式")) {
             let activeID = coordinator.config.defaultProfile.scalingModeID
             ForEach(ScenarioTag.allCases) { tag in
                 let modes = coordinator.orderedBuiltInModes(for: tag)
@@ -167,27 +167,24 @@ struct MetalPieApp: App {
 
         Divider()
 
-        Button(l10n.tr("Show / Hide Floating Toolbar", "显示 / 隐藏顶部工具栏")) {
+        Button(l10n.tr("Toolbar", "工具栏")) {
             coordinator.toggleToolbarVisibility()
         }
         .disabled(!coordinator.isScalingSessionOpen)
 
-        Button(coordinator.isProfilerHUDActive
-            ? l10n.tr("Hide Performance Overlay", "隐藏帧率信息")
-            : l10n.tr("Show Performance Overlay", "显示帧率信息"))
-        {
+        Button(l10n.tr("Profiler", "监视器")) {
             coordinator.toggleProfilerHUD()
         }
         .disabled(!coordinator.isScalingSessionOpen)
 
-        Button(l10n.tr("Take Cursor-Free Screenshot", "无光标高清截图")) {
+        Button(l10n.tr("Screenshot", "截图")) {
             Task { await coordinator.captureCursorFreeScreenshot() }
         }
         .disabled(!coordinator.isScalingSessionOpen)
 
         if coordinator.isScalingSessionOpen {
             Divider()
-            Button(l10n.tr("Stop Scaling", "退出缩放")) {
+            Button(l10n.tr("Stop", "停止")) {
                 Task { await coordinator.stopScaling(isManual: true, showToast: true) }
             }
         } else if coordinator.countdownRemaining != nil {
@@ -199,7 +196,7 @@ struct MetalPieApp: App {
 
         Divider()
 
-        Button(l10n.tr("Open MetalPie Window", "打开 MetalPie 主窗口")) {
+        Button(l10n.tr("Open Window", "打开窗口")) {
             NSApp.activate(ignoringOtherApps: true)
             if let existing = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }) {
                 existing.makeKeyAndOrderFront(nil)

@@ -983,4 +983,346 @@ struct CursorClickAlignmentAndMultiMonitorTests {
             #expect(falseEvents.withLock { $0 }.isEmpty, "Live watcher emitted spurious events: \(falseEvents.withLock { $0 })")
         }
     }
+
+    // MARK: 6. Regression: 5,128-Level EventTap Stack-Overflow Crash & Zero-Alloc Border Checks
+
+    @Test("EventTapCallbackBox survives 60,000 consecutive callbacks on a 512KB thread stack with O(1) depth and zero-allocation RectEdges border checks")
+    func eventTapCallbackBox60kStressAndZeroAllocBorders() throws {
+        // 1. Verify RectEdges is a 1-byte stack OptionSet (zero heap allocations in CGEventTap hot path!).
+        #expect(MemoryLayout<RectEdges>.size == 1)
+
+        let sourceCG = CGRect(x: 100, y: 100, width: 600, height: 400)
+        let contentCG = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let config = CursorMappingConfiguration(
+            sourceCGRect: sourceCG,
+            destinationCGRect: contentCG,
+            overlayCGRect: contentCG,
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(
+                renderScaledCursor: true,
+                confineCursor: true,
+                adjustCursorSpeed: true,
+                respectGameMouseGrab: true
+            ),
+            threeDGameMode: false
+        )
+
+        let mapping = PointerMapping(configuration: config, displays: Self.triMonitorDisplays)
+        // Exercise border/confinement checks across corners, edges, interior, and multi-monitor L-shapes.
+        let topLeftBorders = mapping.touchedBorders(CGPoint(x: mapping.confinementRect.minX, y: mapping.confinementRect.minY))
+        #expect(topLeftBorders == [.left, .top])
+        #expect(topLeftBorders.contains(.left) && topLeftBorders.contains(.top))
+        #expect(!topLeftBorders.contains(.right) && !topLeftBorders.contains(.bottom))
+
+        let bottomRightBorders = mapping.touchedBorders(CGPoint(x: mapping.confinementRect.maxX, y: mapping.confinementRect.maxY))
+        #expect(bottomRightBorders == [.right, .bottom])
+        #expect(mapping.isDeltaPushingOutward(deltaX: 5, deltaY: 5, at: CGPoint(x: mapping.confinementRect.maxX, y: mapping.confinementRect.maxY)))
+        #expect(!mapping.isDeltaPushingOutward(deltaX: -5, deltaY: 0, at: CGPoint(x: mapping.confinementRect.maxX, y: mapping.confinementRect.maxY)))
+
+        // 2. Run 60,000 consecutive EventTapCallbackBox.invoke(...) calls on a 512 KB pthread stack
+        //    (matching the exact 544 KB stack of `com.metalpie.input.event-tap` that overflowed at 5,128
+        //    levels before eliminating `OSAllocatedUnfairLock<Closure?>`!).
+        let controller = CursorOverlayController(presentationMode: .externalCompositor)
+        defer { controller.stop() }
+        controller.activateForEventTapTesting(
+            configuration: config,
+            displays: Self.triMonitorDisplays,
+            initialPointer: CGPoint(x: sourceCG.midX, y: sourceCG.midY)
+        )
+
+        let box = EventTapCallbackBox(controller: controller)
+        let doneSem = DispatchSemaphore(value: 0)
+        let completedCount = OSAllocatedUnfairLock(initialState: 0)
+        let maxVisualOutOfBounds = OSAllocatedUnfairLock(initialState: 0)
+
+        let worker = Thread {
+            let dummyProxy = OpaquePointer(bitPattern: 0x1000)!
+            guard let ev = CGEvent(
+                mouseEventSource: nil,
+                mouseType: .mouseMoved,
+                mouseCursorPosition: CGPoint(x: sourceCG.midX, y: sourceCG.midY),
+                mouseButton: .left
+            ) else {
+                doneSem.signal()
+                return
+            }
+
+            var x = sourceCG.midX
+            var y = sourceCG.midY
+            var outOfBounds = 0
+
+            for i in 0..<60_000 {
+                // Alternate smooth interior moves AND border pushes (which directly invoke
+                // PointerTracker.recordEvent -> PointerMapping.isDeltaPushingOutward -> touchedBorders!).
+                if i % 100 < 80 {
+                    let stepX: CGFloat = (i % 40 < 20) ? 1.5 : -1.5
+                    let stepY: CGFloat = (i % 30 < 15) ? 1.0 : -1.0
+                    x = min(max(x + stepX, sourceCG.minX + 10), sourceCG.maxX - 10)
+                    y = min(max(y + stepY, sourceCG.minY + 10), sourceCG.maxY - 10)
+                    ev.location = CGPoint(x: x, y: y)
+                    ev.setIntegerValueField(.mouseEventDeltaX, value: Int64(stepX.rounded()))
+                    ev.setIntegerValueField(.mouseEventDeltaY, value: Int64(stepY.rounded()))
+                } else {
+                    // Push straight against right border so `touchedBorders` runs thousands of times!
+                    ev.location = CGPoint(x: mapping.confinementRect.maxX, y: sourceCG.midY)
+                    ev.setIntegerValueField(.mouseEventDeltaX, value: 4)
+                    ev.setIntegerValueField(.mouseEventDeltaY, value: 0)
+                }
+
+                _ = box.invoke(proxy: dummyProxy, type: .mouseMoved, event: ev)
+                let rewritten = ev.location
+                if !sourceCG.contains(rewritten) {
+                    outOfBounds += 1
+                }
+            }
+
+            // Also verify invalidate() safely drops controller reference and passes events through.
+            box.invalidate()
+            _ = box.invoke(proxy: dummyProxy, type: .mouseMoved, event: ev)
+
+            let finalOutOfBounds = outOfBounds
+            maxVisualOutOfBounds.withLock { $0 = finalOutOfBounds }
+            completedCount.withLock { $0 = 60_000 }
+            doneSem.signal()
+        }
+        worker.name = "com.metalpie.test.event-tap-512k-stack"
+        worker.stackSize = 512 * 1024
+        worker.start()
+
+        #expect(doneSem.wait(timeout: .now() + .seconds(30)) == .success, "60k event-tap stress thread timed out!")
+        #expect(completedCount.withLock { $0 } == 60_000)
+        #expect(maxVisualOutOfBounds.withLock { $0 } == 0, "Rewritten events must always remain strictly inside sourceCG")
+    }
+
+    // MARK: 7. Regression: Mouse Speed 1:1 Accuracy, Sub-Pixel Trackpad, Warp-Echo & Burst Immunity
+
+    @Test("adjustCursorSpeed delivers exact 1:1 visual speed across sub-pixel trackpad nudges, high-DPI delta inflation, warp-delta spikes, and 120Hz pre-warp queued bursts")
+    func cursorSpeedExact1to1AndWarpFeedbackImmunity() throws {
+        // Exact user geometry: 600x400 window scaled fullscreen to 1512x982 (scaleX = 2.52, scaleY = 2.455)
+        let sourceCG = CGRect(x: 100, y: 100, width: 600, height: 400)
+        let contentCG = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let mapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: contentCG,
+            overlayRect: contentCG,
+            displays: [Self.primaryRetina],
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(
+                renderScaledCursor: true,
+                confineCursor: true,
+                adjustCursorSpeed: true,
+                respectGameMouseGrab: true
+            ),
+            threeDGameMode: false
+        )
+
+        var processor = CursorEventTapProcessor()
+        let startSource = CGPoint(x: 400, y: 300) // exact center of 600x400
+        let outsideStart = CGPoint(x: 1180, y: 760) // simulated "Scale" button click outside window
+        processor.reset(initialSourcePosition: startSource, physicalLocation: outsideStart)
+        processor.recordExternalWarp(from: outsideStart, to: startSource, timestamp: 10.0)
+
+        let initialScaled = mapping.mapSourceToScaled(startSource, clampToContent: true)
+
+        // 1. Warp-contaminated startup echo: macOS reports landing at `startSource` WITH the full
+        //    `-780, -460` warp jump inside `mouseEventDeltaX`/`DeltaY`! MUST BE COMPLETELY IGNORED!
+        let contaminatedStartupEcho = processor.process(
+            input: CursorTapEventInput(
+                type: .mouseMoved,
+                location: startSource,
+                deltaX: Double(startSource.x - outsideStart.x),
+                deltaY: Double(startSource.y - outsideStart.y),
+                timestamp: 10.004
+            ),
+            mapping: mapping
+        )
+        #expect(contaminatedStartupEcho == nil, "Warp-contaminated startup echo must be dropped without moving virtualSourcePosition!")
+        #expect(processor.virtualSourcePosition == startSource)
+
+        // 2. Startup warp followed immediately by real `+4, +2` user move whose `deltaX/Y` ALSO
+        //    carries the `-780, -460` warp jump! Must move visual cursor by EXACTLY `(+4, +2)`!
+        processor.recordExternalWarp(from: outsideStart, to: startSource, timestamp: 10.10)
+        let firstRealRaw = processor.process(
+            input: CursorTapEventInput(
+                type: .mouseMoved,
+                location: CGPoint(x: startSource.x + 4.0, y: startSource.y + 2.0),
+                deltaX: Double(startSource.x - outsideStart.x) + 4.0,
+                deltaY: Double(startSource.y - outsideStart.y) + 2.0,
+                timestamp: 10.108
+            ),
+            mapping: mapping
+        )
+        let firstRealAfterWarp = try #require(firstRealRaw)
+        #expect(!firstRealAfterWarp.isMouseGrabbedByGame)
+        #expect(abs((firstRealAfterWarp.scaledCGPosition.x - initialScaled.x) - 4.0) < 0.05)
+        #expect(abs((firstRealAfterWarp.scaledCGPosition.y - initialScaled.y) - 2.0) < 0.05)
+
+        // 3. Sub-pixel MacBook Pro Trackpad nudges: 200 tiny `0.5 pt` horizontal + `0.3 pt` vertical moves
+        //    where integer `mouseEventDeltaX`/`DeltaY` truncates to `0` on every fractional step!
+        //    Total physical hand move: +100.0 pt X, +60.0 pt Y -> Visual scaled cursor MUST move
+        //    EXACTLY +100.0 pt X, +60.0 pt Y with ZERO warps during interior travel and ZERO FPS grab!
+        processor.reset(initialSourcePosition: startSource, physicalLocation: startSource)
+        var phys = startSource
+        var t = 20.0
+        var interiorWarpCount = 0
+        var lastDecision: CursorTapEventDecision?
+
+        for _ in 0..<200 {
+            phys.x += 0.5
+            phys.y += 0.3
+            let raw = processor.process(
+                input: CursorTapEventInput(
+                    type: .mouseMoved,
+                    location: phys,
+                    deltaX: 0, // integer truncation on slow trackpad!
+                    deltaY: 0,
+                    timestamp: t
+                ),
+                mapping: mapping
+            )
+            let dec = try #require(raw)
+            #expect(!dec.isMouseGrabbedByGame)
+            #expect(dec.isScaledSpriteVisible)
+            if dec.warpTarget != nil {
+                interiorWarpCount += 1
+            }
+            lastDecision = dec
+            t += 0.008
+        }
+
+        let afterTrackpad = try #require(lastDecision)
+        #expect(interiorWarpCount == 0, "Interior glides MUST NOT spam CGWarpMouseCursorPosition!")
+        #expect(abs((afterTrackpad.scaledCGPosition.x - initialScaled.x) - 100.0) < 0.05,
+                "Expected exact +100pt visual X travel, got \(afterTrackpad.scaledCGPosition.x - initialScaled.x)")
+        #expect(abs((afterTrackpad.scaledCGPosition.y - initialScaled.y) - 60.0) < 0.05,
+                "Expected exact +60pt visual Y travel, got \(afterTrackpad.scaledCGPosition.y - initialScaled.y)")
+
+        // 4. High-DPI mouse inflation immunity: `event.location` moves +2.0 pt per step while raw
+        //    `mouseEventDeltaX` reports 4x larger (+8.0)! Visual cursor MUST still track 1:1 (+40pt over 20 steps),
+        //    NOT 4x (+160pt)!
+        let beforeHighDPI = afterTrackpad.scaledCGPosition
+        for _ in 0..<20 {
+            phys.x += 2.0
+            let raw = processor.process(
+                input: CursorTapEventInput(
+                    type: .mouseMoved,
+                    location: phys,
+                    deltaX: 8.0, // 4x inflated raw device delta!
+                    deltaY: 0,
+                    timestamp: t
+                ),
+                mapping: mapping
+            )
+            let dec = try #require(raw)
+            #expect(!dec.isMouseGrabbedByGame)
+            lastDecision = dec
+            t += 0.008
+        }
+        let afterHighDPI = try #require(lastDecision)
+        #expect(abs((afterHighDPI.scaledCGPosition.x - beforeHighDPI.x) - 40.0) < 0.05,
+                "High-DPI delta inflation must NEVER make scaled cursor fly; expected +40pt, got \(afterHighDPI.scaledCGPosition.x - beforeHighDPI.x)")
+
+        // 5. Border recenter warp + 120Hz stale pre-warp queued Mach-port burst + post-warp contaminated echo!
+        //    Move right until physical cursor hits the right edge guard / border and triggers ONE recenter warp.
+        var recenterWarp: CGPoint?
+        var handTravelRight = 0.0
+        let beforeBurstScaledX = afterHighDPI.scaledCGPosition.x
+
+        while recenterWarp == nil && handTravelRight < 500.0 {
+            phys.x += 10.0
+            handTravelRight += 10.0
+            let raw = processor.process(
+                input: CursorTapEventInput(type: .mouseMoved, location: phys, deltaX: 10.0, deltaY: 0, timestamp: t),
+                mapping: mapping
+            )
+            let dec = try #require(raw)
+            #expect(!dec.isMouseGrabbedByGame)
+            if let wt = dec.warpTarget {
+                recenterWarp = wt
+            }
+            t += 0.008
+        }
+        let warpTo = try #require(recenterWarp, "Expected border recenter warp before physical cursor leaves confinementRect")
+        let warpFrom = phys
+
+        // Simulate 2 stale pre-warp events ALREADY queued in WindowServer Mach port BEFORE warp landed!
+        for _ in 0..<2 {
+            phys.x += 5.0
+            handTravelRight += 5.0
+            let raw = processor.process(
+                input: CursorTapEventInput(type: .mouseMoved, location: phys, deltaX: 5.0, deltaY: 0, timestamp: t),
+                mapping: mapping
+            )
+            let dec = try #require(raw)
+            #expect(!dec.isMouseGrabbedByGame)
+            #expect(dec.warpTarget == nil, "Must not stack redundant warps while a recenter warp is already in flight")
+            lastDecision = dec
+            t += 0.004
+        }
+
+        // Now warp lands -> WindowServer emits a warp echo with contaminated delta = (warpTo - phys)!
+        let midWarpEcho = processor.process(
+            input: CursorTapEventInput(
+                type: .mouseMoved,
+                location: warpTo,
+                deltaX: Double(warpTo.x - phys.x),
+                deltaY: Double(warpTo.y - phys.y),
+                timestamp: t
+            ),
+            mapping: mapping
+        )
+        #expect(midWarpEcho == nil, "Contaminated recenter-warp echo must be completely ignored!")
+        phys = warpTo
+        t += 0.004
+
+        // Next genuine post-warp move `+8.0 pt`!
+        phys.x += 8.0
+        handTravelRight += 8.0
+        let postWarpRaw = processor.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: phys, deltaX: 8.0, deltaY: 0, timestamp: t),
+            mapping: mapping
+        )
+        let postWarpReal = try #require(postWarpRaw)
+        #expect(!postWarpReal.isMouseGrabbedByGame)
+        #expect(warpTo.x < warpFrom.x - 50.0, "Recenter warp should jump cleanly back inside confinementRect")
+        #expect(abs((postWarpReal.scaledCGPosition.x - beforeBurstScaledX) - handTravelRight) < 0.15,
+                "Total visual travel across pre-warp burst + recenter warp + echo must equal exact hand travel (\(handTravelRight)pt), got \(postWarpReal.scaledCGPosition.x - beforeBurstScaledX)pt")
+
+        // 6. Click + Drag alignment right after burst (even if physical OS cursor drifted from virtualSourcePosition).
+        let expectedClickPos = try #require(processor.virtualSourcePosition)
+        let downRaw = processor.process(
+            input: CursorTapEventInput(type: .leftMouseDown, location: CGPoint(x: phys.x + 15, y: phys.y), deltaX: 0, deltaY: 0, timestamp: t + 0.01),
+            mapping: mapping
+        )
+        let downDec = try #require(downRaw)
+        #expect(downDec.rewrittenEventLocation == expectedClickPos)
+        #expect(downDec.warpTarget == expectedClickPos, "Click should sync OS cursor to exact virtualSourcePosition when drifted")
+
+        // 7. Verify `adjustCursorSpeed == false` moves proportionally to scale with ZERO interior warps and ZERO runaway!
+        let uncompensatedMapping = PointerMapping(
+            sourceRect: sourceCG,
+            contentRect: contentCG,
+            overlayRect: contentCG,
+            displays: [Self.primaryRetina],
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(
+                renderScaledCursor: true,
+                confineCursor: true,
+                adjustCursorSpeed: false,
+                respectGameMouseGrab: true
+            ),
+            threeDGameMode: false
+        )
+        var rawProc = CursorEventTapProcessor()
+        rawProc.reset(initialSourcePosition: startSource, physicalLocation: startSource)
+        let uncompRaw = rawProc.process(
+            input: CursorTapEventInput(type: .mouseMoved, location: CGPoint(x: 410, y: 300), deltaX: 10, deltaY: 0, timestamp: 30.0),
+            mapping: uncompensatedMapping
+        )
+        let uncompMove = try #require(uncompRaw)
+        #expect(uncompMove.warpTarget == nil, "Uncompensated interior movement must never warp")
+        #expect(uncompMove.effectiveSourcePoint == CGPoint(x: 410, y: 300))
+        let expectedUncompScaledDX = 10.0 * (1511.0 / 599.0)
+        #expect(abs((uncompMove.scaledCGPosition.x - initialScaled.x) - expectedUncompScaledDX) < 0.05)
+    }
 }
