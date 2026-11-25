@@ -451,4 +451,73 @@ struct ScalingLayoutTests {
             Issue.record("Expected 0.50x interval burst to coalesce until next display refresh slot")
         }
     }
+
+    @Test("Target-fitting fixed/discrete upscalers bypass redundant 5K/6K overscaling on native high-res sources while preserving genuine 2x upscaling")
+    func fixedUpscalerOverscalingGuard() throws {
+        let modeBB = try #require(ScalingMode.builtInPresets.first { $0.id == ScalingMode.anime4kModeBBID })
+        let modeCA = try #require(ScalingMode.builtInPresets.first { $0.id == ScalingMode.anime4kModeCAID })
+
+        // 1. Native 3K Retina window (3024x1898 -> 3024x1896) with Anime4K Mode B+B must NEVER blow up to 6048x3796!
+        let nativeRetinaBB = ScalingLayoutCalculator.calculate(
+            sourcePixelSize: PixelSize(width: 3024, height: 1898),
+            targetPixelSize: PixelSize(width: 3024, height: 1896),
+            effects: modeBB.effects
+        )
+        #expect(nativeRetinaBB.finalOutputPixelSize == PixelSize(width: 3021, height: 1896))
+        #expect(!nativeRetinaBB.effectPasses.contains { $0.effectID == .anime4kUpscaleDenoise })
+        #expect(nativeRetinaBB.effectPasses.filter { $0.effectID == .anime4kRestore }.count == 1)
+        #expect(nativeRetinaBB.effectPasses.allSatisfy { $0.outputSize.width <= 3024 && $0.outputSize.height <= 1898 })
+
+        // 2. Mode C+A on native 3K bypasses Upscale+Denoise but keeps its single Restore pass at 3K.
+        let nativeRetinaCA = ScalingLayoutCalculator.calculate(
+            sourcePixelSize: PixelSize(width: 3024, height: 1898),
+            targetPixelSize: PixelSize(width: 3024, height: 1898),
+            effects: modeCA.effects
+        )
+        #expect(!nativeRetinaCA.effectPasses.contains { $0.effectID == .anime4kUpscaleDenoise })
+        #expect(nativeRetinaCA.effectPasses.filter { $0.effectID == .anime4kRestore }.count == 1)
+        #expect(nativeRetinaCA.finalOutputPixelSize == PixelSize(width: 3024, height: 1898))
+        #expect(!nativeRetinaCA.needsAutoBicubicFallback)
+
+        // 3. Single fixed-2x upscaler (CuNNy / FSRCNNX) or discrete Apple ML SR on 1440p -> 3K (1.18x <= 1.2x)
+        //    bypasses 5K blowup and conforms cleanly via Auto Bicubic.
+        for effectID in [EffectID.cunny, .fsrcnnx, .vtSuperResolution] {
+            let nearNative = ScalingLayoutCalculator.calculate(
+                sourcePixelSize: PixelSize(width: 2560, height: 1440),
+                targetPixelSize: PixelSize(width: 3024, height: 1898),
+                effects: [EffectInstance(effectID: effectID, scalingType: .fit)]
+            )
+            #expect(nearNative.effectPasses.count == 1)
+            #expect(nearNative.effectPasses[0].isAutoInsertedFallback)
+            #expect(nearNative.effectPasses[0].outputSize == PixelSize(width: 3024, height: 1701))
+        }
+
+        // 4. Genuine 2x upscaling (fullscreen pre-scaled 1512x949 -> 3024x1898) runs the FULL Mode B+B chain!
+        let genuineVideoBB = ScalingLayoutCalculator.calculate(
+            sourcePixelSize: PixelSize(width: 1512, height: 949),
+            targetPixelSize: PixelSize(width: 3024, height: 1898),
+            effects: modeBB.effects
+        )
+        #expect(genuineVideoBB.effectPasses.count == 4)
+        #expect(genuineVideoBB.effectPasses[0].effectID == .anime4kRestore)
+        #expect(genuineVideoBB.effectPasses[0].outputSize == PixelSize(width: 1512, height: 949))
+        #expect(genuineVideoBB.effectPasses[1].effectID == .anime4kUpscaleDenoise)
+        #expect(genuineVideoBB.effectPasses[1].outputSize == PixelSize(width: 3024, height: 1898))
+        #expect(genuineVideoBB.effectPasses[2].effectID == .anime4kRestore)
+        #expect(genuineVideoBB.effectPasses[2].outputSize == PixelSize(width: 3024, height: 1898))
+        #expect(genuineVideoBB.effectPasses[3].effectID == .anime4kClampHighlights)
+        #expect(!genuineVideoBB.needsAutoBicubicFallback)
+
+        // 5. Genuine 1080p -> 1440p (1.33x > 1.2x, 4K = 8.3M px <= 12M) still runs full 2x Anime4K upscaling!
+        let hd1080To1440 = ScalingLayoutCalculator.calculate(
+            sourcePixelSize: PixelSize(width: 1920, height: 1080),
+            targetPixelSize: PixelSize(width: 2560, height: 1440),
+            effects: [EffectInstance(effectID: .anime4kUpscaleDenoise, scalingType: .fit)]
+        )
+        #expect(hd1080To1440.effectPasses.count == 2)
+        #expect(hd1080To1440.effectPasses[0].effectID == .anime4kUpscaleDenoise)
+        #expect(hd1080To1440.effectPasses[0].outputSize == PixelSize(width: 3840, height: 2160))
+        #expect(hd1080To1440.effectPasses[1].isAutoInsertedFallback)
+        #expect(hd1080To1440.effectPasses[1].outputSize == PixelSize(width: 2560, height: 1440))
+    }
 }

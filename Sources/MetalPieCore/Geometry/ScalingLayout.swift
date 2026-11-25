@@ -716,6 +716,8 @@ public enum ScalingLayoutCalculator: Sendable {
         // Bicubic Catmull-Rom final pass when their fixed output differs from desired target size.
         var desiredFinalSize: PixelSize? = nil
         var explicitFillOverflowAllowed = false
+        var ranRestoreAtCurrentSize = false
+        var bypassedUpscalerAfterRestore = false
 
         for instance in enabledEffects {
             let descriptor = EffectCatalog.descriptor(for: instance.effectID)
@@ -732,12 +734,44 @@ public enum ScalingLayoutCalculator: Sendable {
             let actualOutput: PixelSize
             switch descriptor.scaleCapability {
             case .sameSize:
+                if instance.effectID == .anime4kRestore,
+                   bypassedUpscalerAfterRestore,
+                   ranRestoreAtCurrentSize
+                {
+                    // Skip the post-upscale second Restore pass in double-restore presets (Mode A+A / B+B)
+                    // when the preceding 2x upscaler was bypassed at 1:1 native resolution.
+                    continue
+                }
                 actualOutput = clampAspectPreserving(currentSize)
+                if instance.effectID == .anime4kRestore {
+                    ranRestoreAtCurrentSize = true
+                }
             case .fixed(let factor):
                 let rawFixed = PixelSize(
                     width: max(1, Int((Double(currentSize.width) * factor).rounded())),
                     height: max(1, Int((Double(currentSize.height) * factor).rounded()))
                 )
+                let desiredScale = max(
+                    Double(desiredForThisPass.width) / Double(max(1, currentSize.width)),
+                    Double(desiredForThisPass.height) / Double(max(1, currentSize.height))
+                )
+                let rawFixedPixels = Double(rawFixed.width) * Double(rawFixed.height)
+                // Follow official Anime4K `//!WHEN OUTPUT/INPUT > 1.2` gating for target-fitting modes:
+                // when the source is already at or near target resolution (e.g. native 3K Retina
+                // 3024x1898 -> 3021x1896 or 1440p -> 3024x1898), bypass fixed-2x upscaling instead of
+                // blowing up to 5K/6K (15M-23M px) only for Auto Bicubic to immediately downscale back.
+                // Explicit `.normal` scaling still honors the user's fixed multiplier verbatim.
+                let bypassRedundantUpscale = instance.scalingType != .normal
+                    && factor > 1.0
+                    && (desiredScale <= 1.2 || (desiredScale < 1.35 && rawFixedPixels > 12_000_000.0))
+                if bypassRedundantUpscale {
+                    desiredFinalSize = desiredForThisPass
+                    explicitFillOverflowAllowed = (instance.scalingType == .fill)
+                    if ranRestoreAtCurrentSize {
+                        bypassedUpscalerAfterRestore = true
+                    }
+                    continue
+                }
                 actualOutput = clampAspectPreserving(rawFixed, maxDimension: intermediateFixedCap)
                 if instance.scalingType != .normal {
                     desiredFinalSize = clampAspectPreserving(computeDesiredSize(
@@ -764,6 +798,18 @@ public enum ScalingLayoutCalculator: Sendable {
                     width: max(1, Int((Double(currentSize.width) * chosenFactor).rounded())),
                     height: max(1, Int((Double(currentSize.height) * chosenFactor).rounded()))
                 )
+                let rawDiscretePixels = Double(rawDiscrete.width) * Double(rawDiscrete.height)
+                let bypassRedundantUpscale = instance.scalingType != .normal
+                    && chosenFactor > 1.0
+                    && (desiredScale <= 1.2 || (desiredScale < 1.35 && rawDiscretePixels > 12_000_000.0))
+                if bypassRedundantUpscale {
+                    desiredFinalSize = desiredForThisPass
+                    explicitFillOverflowAllowed = (instance.scalingType == .fill)
+                    if ranRestoreAtCurrentSize {
+                        bypassedUpscalerAfterRestore = true
+                    }
+                    continue
+                }
                 actualOutput = clampAspectPreserving(rawDiscrete, maxDimension: intermediateFixedCap)
                 if instance.scalingType != .normal {
                     desiredFinalSize = clampAspectPreserving(computeDesiredSize(
@@ -798,6 +844,10 @@ public enum ScalingLayoutCalculator: Sendable {
                 outputSize: actualOutput,
                 isAutoInsertedFallback: false
             ))
+            if actualOutput != currentSize {
+                ranRestoreAtCurrentSize = false
+                bypassedUpscalerAfterRestore = false
+            }
             currentSize = actualOutput
         }
 
@@ -805,10 +855,11 @@ public enum ScalingLayoutCalculator: Sendable {
         var fallbackTargetSize: PixelSize? = nil
 
         if passes.isEmpty {
-            // Empty chain: default to fitting inside target (or filling window).
+            // Empty chain (or every fixed/discrete upscaler was bypassed at 1:1 native resolution):
+            // honor the bypassed pass's desired target if set, otherwise fit inside target.
             let target = presentationMode.isWindowed
                 ? safeTargetSize
-                : computeFitSize(inputSize: currentSize, targetPixelSize: safeTargetSize)
+                : (desiredFinalSize ?? computeFitSize(inputSize: currentSize, targetPixelSize: safeTargetSize))
             if target != currentSize {
                 fallbackTargetSize = target
             }

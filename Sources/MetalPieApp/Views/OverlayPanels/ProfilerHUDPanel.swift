@@ -42,7 +42,7 @@ public final class ProfilerHUDPanel {
     /// Reused SwiftUI `ImageRenderer` for ultra-fast VRR Metal HUD compositing (MetalGoose pattern).
     private static var vrrRenderer: ImageRenderer<ProfilerHUDCardView>?
 
-    private static let hudWidth: CGFloat = 296
+    static let hudWidth: CGFloat = 316
     private static let edgeMargin: CGFloat = 16
     private static let notchSafeTopMargin: CGFloat = 6
     /// Transparent outer padding reserved for SwiftUI drop shadow bleed (prevents rectangular clipping).
@@ -393,24 +393,30 @@ public struct ProfilerHUDCardView: View {
             }
 
             // Pipeline & Resolution
-            HStack {
+            HStack(spacing: 6) {
                 Text(telemetry.backendName)
                     .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(Color.white.opacity(0.76))
                     .lineLimit(1)
+                    .truncationMode(.tail)
                 Spacer(minLength: 4)
                 Text(verbatim: "\(telemetry.inputSize.width)×\(telemetry.inputSize.height) → \(telemetry.outputSize.width)×\(telemetry.outputSize.height)")
                     .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                     .monospacedDigit()
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                     .foregroundStyle(Color.white.opacity(0.92))
             }
 
             // FPS & Frame Time Metrics Grid
-            HStack(spacing: 10) {
+            let formattedGpuMs = totalMs >= 100.0
+                ? String(format: "%.1f", totalMs)
+                : String(format: "%.2f", totalMs)
+            HStack(spacing: 8) {
                 metricCell(label: l10n.tr("SRC", "源"), value: String(format: "%.1f", telemetry.sourceFPS), unit: "fps", accent: .white)
                 metricCell(label: l10n.tr("OUT", "输出"), value: String(format: "%.1f", telemetry.outputFPS), unit: "fps", accent: .green)
                 metricCell(label: l10n.tr("DISP", "显示"), value: String(format: "%.1f", telemetry.presentedFPS), unit: "fps", accent: .cyan)
-                metricCell(label: "GPU", value: String(format: "%.2f", totalMs), unit: "ms", accent: totalMs > 8.0 ? .orange : .mint)
+                metricCell(label: "GPU", value: formattedGpuMs, unit: "ms", accent: totalMs > 8.0 ? .orange : .mint)
             }
             .padding(.vertical, 5)
             .padding(.horizontal, 8)
@@ -467,7 +473,7 @@ public struct ProfilerHUDCardView: View {
             }
         }
         .padding(11)
-        .frame(width: 296, alignment: .leading)
+        .frame(width: ProfilerHUDPanel.hudWidth, alignment: .leading)
         .background {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(Color(red: 0.07, green: 0.08, blue: 0.11).opacity(0.88))
@@ -484,14 +490,19 @@ public struct ProfilerHUDCardView: View {
             Text(label)
                 .font(.system(size: 8.5, weight: .bold))
                 .foregroundStyle(Color.white.opacity(0.55))
+                .lineLimit(1)
             HStack(alignment: .firstTextBaseline, spacing: 2) {
                 Text(value)
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .font(.system(size: 11.5, weight: .bold, design: .monospaced))
                     .monospacedDigit()
                     .foregroundStyle(accent)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                 Text(unit)
                     .font(.system(size: 8.5))
                     .foregroundStyle(Color.white.opacity(0.5))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
