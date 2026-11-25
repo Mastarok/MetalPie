@@ -171,6 +171,9 @@ public struct PointerMapping: Hashable, Sendable {
     /// Strict 1.0pt inward inset guarantees confined coordinates lie inside half-open `[min, max)` window bounds
     /// even after macOS WindowServer sub-pixel rounding (preventing accidental click-through onto Desktop/other apps).
     public static let defaultEdgeInset: CGFloat = 1.0
+    /// Inset from outer host-display edges for hidden physical cursor roaming in `adjustCursorSpeed`
+    /// mode so sweeping across the full scaled window triggers zero mid-glide `CGWarpMouseCursorPosition` calls.
+    public static let defaultPhysicalRoamingInset: CGFloat = 20.0
     public static let identityTolerance: CGFloat = 0.5
 
     /// Active (cropped/visible) source window rect in global CG (Y-down) logical points.
@@ -195,6 +198,9 @@ public struct PointerMapping: Hashable, Sendable {
     private let insetReachableSourceRects: [CGRect]
     /// Effective inset confinement bounds in global CG (Y-down) logical points.
     public let confinementRect: CGRect
+    /// Full host-display roaming bounds (inset 20pt from outer display bezel) for zero-warp glides
+    /// while the physical hardware cursor is hidden in `adjustCursorSpeed` mode.
+    public let physicalRoamingRect: CGRect
 
     public init(
         sourceRect: CGRect,
@@ -230,7 +236,14 @@ public struct PointerMapping: Hashable, Sendable {
         } else {
             baseConfinement = normalizedSource
         }
-        self.confinementRect = Self.insetConfinementRect(baseConfinement, edgeInset: clampedInset)
+        let resolvedConfinement = Self.insetConfinementRect(baseConfinement, edgeInset: clampedInset)
+        self.confinementRect = resolvedConfinement
+        self.physicalRoamingRect = Self.computePhysicalRoamingRect(
+            sourceRect: normalizedSource,
+            overlayRect: normalizedOverlay,
+            displays: displays,
+            fallback: resolvedConfinement
+        )
     }
 
     /// Initializes from `MetalPieCore`'s `CursorMappingConfiguration`.
@@ -722,6 +735,32 @@ public struct PointerMapping: Hashable, Sendable {
         return (hasX || hasY) && xBlockedOutward && yBlockedOutward
     }
 
+    /// Returns `true` if the raw mouse delta is pushing strictly outward against an outer physical
+    /// display bezel (zero heap allocations via stack `RectEdges`), preventing false FPS mouse-grab
+    /// detection when the physical cursor roams freely across display bounds.
+    public func isDeltaPushingOutwardAgainstDisplay(
+        deltaX: Double,
+        deltaY: Double,
+        at cgPoint: CGPoint,
+        tolerance: CGFloat = 2.0
+    ) -> Bool {
+        let edges = touchedDisplayEdges(cgPoint, tolerance: tolerance)
+        guard !edges.isEmpty else { return false }
+
+        let eps = 0.001
+        let hasX = abs(deltaX) > eps
+        let hasY = abs(deltaY) > eps
+
+        let xBlockedOutward = !hasX ||
+            (deltaX < -eps && edges.contains(.left)) ||
+            (deltaX > eps && edges.contains(.right))
+        let yBlockedOutward = !hasY ||
+            (deltaY < -eps && edges.contains(.top)) ||
+            (deltaY > eps && edges.contains(.bottom))
+
+        return (hasX || hasY) && xBlockedOutward && yBlockedOutward
+    }
+
     // MARK: - Hotspot-Adjusted Cursor Sprite Geometry
 
     /// Computes complete hotspot-adjusted cursor sprite placement from a source-window CG point.
@@ -877,6 +916,40 @@ public struct PointerMapping: Hashable, Sendable {
             }
         }
         return rects
+    }
+
+    private static func computePhysicalRoamingRect(
+        sourceRect: CGRect,
+        overlayRect: CGRect,
+        displays: [DisplayDescriptor],
+        fallback: CGRect
+    ) -> CGRect {
+        let hostBounds: CGRect
+        if !displays.isEmpty {
+            let overlayCenter = CGPoint(x: overlayRect.midX, y: overlayRect.midY)
+            let sourceCenter = CGPoint(x: sourceRect.midX, y: sourceRect.midY)
+            if let d = displays.first(where: { $0.cgBounds.standardized.contains(overlayCenter) }) {
+                hostBounds = d.cgBounds.standardized
+            } else if let d = displays.first(where: { $0.cgBounds.standardized.contains(sourceCenter) }) {
+                hostBounds = d.cgBounds.standardized
+            } else if let d = displays.max(by: { a, b in
+                let ia = a.cgBounds.standardized.intersection(overlayRect)
+                let ib = b.cgBounds.standardized.intersection(overlayRect)
+                let areaA = (ia.isNull || ia.isEmpty) ? 0.0 : Double(ia.width * ia.height)
+                let areaB = (ib.isNull || ib.isEmpty) ? 0.0 : Double(ib.width * ib.height)
+                return areaA < areaB
+            }) {
+                hostBounds = d.cgBounds.standardized
+            } else {
+                hostBounds = displays[0].cgBounds.standardized
+            }
+        } else {
+            hostBounds = overlayRect.union(sourceRect).standardized
+        }
+
+        guard !hostBounds.isEmpty else { return fallback }
+        let inset = insetConfinementRect(hostBounds, edgeInset: defaultPhysicalRoamingInset)
+        return inset.isEmpty ? fallback : inset
     }
 
     private static func insetConfinementRect(_ rect: CGRect, edgeInset: CGFloat) -> CGRect {

@@ -121,6 +121,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         var dynamicRange: DynamicRangeMode
         var colorSpaceName: String
         var frameRateLimit: Int?
+        var effectiveFrameRateCap: Int
         var showsCursor: Bool
         var ignoreShadows: Bool
         var queueDepth: Int
@@ -423,7 +424,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
 
             PipelineLog.shared.info(
                 .capture,
-                "Updated SCStream live: \(newApplied.pixelWidth)x\(newApplied.pixelHeight) @ \(newApplied.backingScaleFactor)x, fpsCap=\(newApplied.frameRateLimit.map(String.init) ?? "uncapped"), hdr=\(newApplied.dynamicRange == .hdr), showsCursor=\(newApplied.showsCursor)."
+                "Updated SCStream live: \(newApplied.pixelWidth)x\(newApplied.pixelHeight) @ \(newApplied.backingScaleFactor)x, fpsCap=\(newApplied.frameRateLimit.map(String.init) ?? "auto(\(newApplied.effectiveFrameRateCap)Hz)"), hdr=\(newApplied.dynamicRange == .hdr), showsCursor=\(newApplied.showsCursor)."
             )
         }
     }
@@ -565,11 +566,30 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
         let queueDepth = min(8, max(3, pipelineDepth + 4))
         config.queueDepth = queueDepth
 
-        // Frame rate interval: explicit cap when configured, `.zero` (uncapped native cadence) otherwise.
+        // Frame rate interval:
+        // - Explicit user FPS cap is honored directly.
+        // - When uncapped (`nil` / Auto), cap sensibly to the host display refresh rate (+5% jitter
+        //   headroom so 60fps/120fps sources never miss a beat due to sub-ms clock phase jitter, while
+        //   preventing 120–240fps SCK bursts from flooding a 60Hz display mailbox!).
+        let hostRefreshHz: Double = {
+            switch profile.multiMonitorMode {
+            case .closest:
+                return targetDisplayDescriptor?.refreshRateHz ?? 60.0
+            case .intersected:
+                let intersecting = displays.filter { $0.cgBounds.intersects(window.cgBounds) }
+                return intersecting.map(\.refreshRateHz).max() ?? targetDisplayDescriptor?.refreshRateHz ?? 60.0
+            case .all:
+                return displays.map(\.refreshRateHz).max() ?? targetDisplayDescriptor?.refreshRateHz ?? 60.0
+            }
+        }()
+        let effectiveFrameRateCap: Int
         if let limit = profile.capture.frameRateLimit, limit > 0 {
+            effectiveFrameRateCap = limit
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(limit))
         } else {
-            config.minimumFrameInterval = .zero
+            let autoCap = min(240, max(60, Int((max(60.0, hostRefreshHz) * 1.05).rounded())))
+            effectiveFrameRateCap = autoCap
+            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(autoCap))
         }
 
         // Pixel format, dynamic range, and explicit color space propagation.
@@ -623,6 +643,7 @@ public final class ScreenCaptureEngine: NSObject, FrameCaptureSession, @unchecke
             dynamicRange: isHDR ? .hdr : .sdr,
             colorSpaceName: resolvedColorSpaceName as String,
             frameRateLimit: profile.capture.frameRateLimit,
+            effectiveFrameRateCap: effectiveFrameRateCap,
             showsCursor: config.showsCursor,
             ignoreShadows: config.ignoreShadowsSingleWindow,
             queueDepth: queueDepth

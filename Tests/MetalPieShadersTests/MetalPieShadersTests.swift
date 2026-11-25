@@ -1,5 +1,7 @@
 import CoreGraphics
+import CoreVideo
 import Foundation
+import IOSurface
 import Metal
 import MetalFX
 import MetalPieCore
@@ -1168,15 +1170,47 @@ struct MetalPieShadersGPUValidationTests {
         #expect(meanAbsRGBDiff(xbrzTight, xbrzLoose) > 0.0001, "xBRZ thresholds should alter corner blending")
     }
 
-    // 5. GPU Duplicate Frame Detection (zero CPU IOSurface lock)
-    @Test("GPU duplicate frame detector skips identical frames and re-renders changed frames")
+    // 5. Zero-Stall Duplicate Frame Detection (IOSurface seed fast-skip + non-blocking GPU check)
+    @Test("Zero-stall duplicate frame detector skips unchanged IOSurface frames and runs non-blocking GPU diff without stalling")
     func verifyDuplicateFrameDetection() throws {
         let (device, queue) = try Self.requireDeviceAndQueue()
         let renderer = try EffectChainRenderer(device: device)
 
-        let frameA1 = TestPatterns.diagonalEdges(device: device, width: 256, height: 144)
-        let frameA2 = TestPatterns.diagonalEdges(device: device, width: 256, height: 144)
-        let frameB = TestPatterns.animeLineArt(device: device, width: 256, height: 144)
+        // Helper to build an IOSurface-backed BGRA8 Metal texture (matching ScreenCaptureKit zero-copy path).
+        func makeIOSurfaceTexture(from src: any MTLTexture) throws -> any MTLTexture {
+            let props: [IOSurfacePropertyKey: Int] = [
+                .width: src.width,
+                .height: src.height,
+                .bytesPerElement: 4,
+                .bytesPerRow: src.width * 4,
+                .allocSize: src.width * src.height * 4,
+                .pixelFormat: Int(kCVPixelFormatType_32BGRA)
+            ]
+            let rawSurface = IOSurface(properties: props)
+            let surface = try #require(rawSurface)
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: src.width,
+                height: src.height,
+                mipmapped: false
+            )
+            desc.usage = [.shaderRead, .shaderWrite]
+            desc.storageMode = .shared
+            let tex = try #require(device.makeTexture(descriptor: desc, iosurface: surface, plane: 0))
+            var bytes = [UInt8](repeating: 0, count: src.width * src.height * 4)
+            src.getBytes(&bytes, bytesPerRow: src.width * 4, from: MTLRegionMake2D(0, 0, src.width, src.height), mipmapLevel: 0)
+            surface.lock(options: [], seed: nil)
+            memcpy(surface.baseAddress, bytes, bytes.count)
+            surface.unlock(options: [], seed: nil)
+            return tex
+        }
+
+        let frameA1Raw = TestPatterns.diagonalEdges(device: device, width: 256, height: 144)
+        let frameA2Raw = TestPatterns.diagonalEdges(device: device, width: 256, height: 144)
+        let frameBRaw = TestPatterns.animeLineArt(device: device, width: 256, height: 144)
+        let surfaceFrameA = try makeIOSurfaceTexture(from: frameA1Raw)
+        let surfaceFrameB = try makeIOSurfaceTexture(from: frameBRaw)
+
         let mode = ScalingMode.builtInPresets[1] // FSR 1.0 (EASU + RCAS)
         let layout = ScalingLayoutCalculator.calculate(
             sourcePixelSize: PixelSize(width: 256, height: 144),
@@ -1187,23 +1221,26 @@ struct MetalPieShadersGPUValidationTests {
         let out1 = TestPatterns.makeOutputTexture(device: device, width: 512, height: 288)
         let out2 = TestPatterns.makeOutputTexture(device: device, width: 512, height: 288)
         let out3 = TestPatterns.makeOutputTexture(device: device, width: 512, height: 288)
+        let out4 = TestPatterns.makeOutputTexture(device: device, width: 512, height: 288)
 
-        // Frame 1: fresh frame -> not skipped
+        // Frame 1: fresh IOSurface -> not skipped, zero stall during encode
         let cb1 = try #require(queue.makeCommandBuffer())
         let rep1 = try renderer.encode(
             scalingMode: mode,
-            context: EffectRenderContext(device: device, commandBuffer: cb1, sourceTexture: frameA1, destinationTexture: out1, layout: layout, frameIndex: 1, duplicateFrameMode: .always)
+            context: EffectRenderContext(device: device, commandBuffer: cb1, sourceTexture: surfaceFrameA, destinationTexture: out1, layout: layout, frameIndex: 1, duplicateFrameMode: .always)
         )
+        #expect(cb1.status == .notEnqueued, "encode() must never synchronously commit/wait on caller commandBuffer")
         cb1.commit()
         cb1.waitUntilCompleted()
         #expect(rep1.wasDuplicateFrameSkipped == false)
 
-        // Frame 2: identical pixels -> skipped on GPU, cached upscaled frame presented!
+        // Frame 2: same unchanged IOSurface (matching ID & seed) -> zero-stall instant skip!
         let cb2 = try #require(queue.makeCommandBuffer())
         let rep2 = try renderer.encode(
             scalingMode: mode,
-            context: EffectRenderContext(device: device, commandBuffer: cb2, sourceTexture: frameA2, destinationTexture: out2, layout: layout, frameIndex: 2, duplicateFrameMode: .always)
+            context: EffectRenderContext(device: device, commandBuffer: cb2, sourceTexture: surfaceFrameA, destinationTexture: out2, layout: layout, frameIndex: 2, duplicateFrameMode: .always)
         )
+        #expect(cb2.status == .notEnqueued)
         cb2.commit()
         cb2.waitUntilCompleted()
         #expect(rep2.wasDuplicateFrameSkipped == true)
@@ -1212,17 +1249,30 @@ struct MetalPieShadersGPUValidationTests {
         let stats2 = readbackStats(texture: out2)
         #expect(abs(stats1.meanLuma - stats2.meanLuma) < 0.002, "Skipped frame output must match Frame 1")
 
-        // Frame 3: changed content -> NOT skipped, re-rendered cleanly!
+        // Frame 3: different texture with identical pixels -> non-blocking async GPU pixel check detects match!
         let cb3 = try #require(queue.makeCommandBuffer())
         let rep3 = try renderer.encode(
             scalingMode: mode,
-            context: EffectRenderContext(device: device, commandBuffer: cb3, sourceTexture: frameB, destinationTexture: out3, layout: layout, frameIndex: 3, duplicateFrameMode: .always)
+            context: EffectRenderContext(device: device, commandBuffer: cb3, sourceTexture: frameA2Raw, destinationTexture: out3, layout: layout, frameIndex: 3, duplicateFrameMode: .always)
         )
+        #expect(cb3.status == .notEnqueued)
         cb3.commit()
         cb3.waitUntilCompleted()
         #expect(rep3.wasDuplicateFrameSkipped == false)
-        let stats3 = readbackStats(texture: out3)
-        #expect(abs(stats3.meanLuma - stats1.meanLuma) > 0.02, "Changed frame must reflect new content")
+        #expect(renderer.lastAsyncDuplicateFrameDetected == true, "Non-blocking GPU diff kernel should confirm identical pixels")
+
+        // Frame 4: changed content -> NOT skipped, async diff reports changed, output reflects new content!
+        let cb4 = try #require(queue.makeCommandBuffer())
+        let rep4 = try renderer.encode(
+            scalingMode: mode,
+            context: EffectRenderContext(device: device, commandBuffer: cb4, sourceTexture: surfaceFrameB, destinationTexture: out4, layout: layout, frameIndex: 4, duplicateFrameMode: .always)
+        )
+        cb4.commit()
+        cb4.waitUntilCompleted()
+        #expect(rep4.wasDuplicateFrameSkipped == false)
+        #expect(renderer.lastAsyncDuplicateFrameDetected == false, "Changed content must report non-duplicate")
+        let stats4 = readbackStats(texture: out4)
+        #expect(abs(stats4.meanLuma - stats1.meanLuma) > 0.02, "Changed frame must reflect new content")
     }
 
     // 6. 1x Non-Retina Demagnify, Crop, 9-Point Letterbox, VRR Cursor Overlay & Cursor-Free PNG Export
@@ -1436,12 +1486,12 @@ struct MetalPieShadersGPUValidationTests {
         #expect(ofMidX > 122.0 && ofMidX < 134.0, "Expected OpticalFlow interpolated centroid near 128, got \(ofMidX)")
         print(String(format: "[OpticalFlowFallback] prevX=120 currX=136 -> interpolated centroidX=%.2f", ofMidX))
 
-        // 8d. Artifact Guard scene-cut detection (hard dark -> bright cut MUST return false!)
+        // 8d. GPU-only Artifact Guard scene-cut detection (hard dark -> bright cut outputs clean nearer real frame with zero CPU stalls!)
         let darkFrame = TestPatterns.solidColor(device: device, width: 320, height: 180, r: 0.04, g: 0.04, b: 0.04)
         let brightFrame = TestPatterns.solidColor(device: device, width: 320, height: 180, r: 0.96, g: 0.96, b: 0.96)
         let cutOut = TestPatterns.makeOutputTexture(device: device, width: 320, height: 180)
         let cbCut = try #require(queue.makeCommandBuffer())
-        let cutSynthesized = try vtML.opticalFlowFallback.encode(request: FrameGenRequest(
+        let cutEncoded = try vtML.opticalFlowFallback.encode(request: FrameGenRequest(
             previousTexture: darkFrame,
             currentTexture: brightFrame,
             outputTexture: cutOut,
@@ -1449,9 +1499,13 @@ struct MetalPieShadersGPUValidationTests {
             commandBuffer: cbCut,
             settings: ofSettings
         ))
+        #expect(cbCut.status == .notEnqueued, "GPU-only Artifact Guard must NOT synchronously commit/wait during encode()")
         cbCut.commit()
         cbCut.waitUntilCompleted()
-        #expect(cutSynthesized == false, "Artifact Guard must reject hard scene cuts and fall back cleanly")
+        #expect(cutEncoded == true)
+        let cutStats = readbackStats(texture: cutOut)
+        // At t=0.5, nearerReal selects currFrame (bright 0.96) cleanly instead of a ghosted ~0.50 mid-gray blend!
+        #expect(cutStats.meanLuma > 0.90, "GPU Artifact Guard must cleanly snap hard cut to nearer real frame (got meanLuma=\(cutStats.meanLuma))")
 
         vtML.reset()
     }
@@ -1523,7 +1577,35 @@ struct MetalPieShadersGPUValidationTests {
 
         for (label, srcSize, targetSize, scalingType) in cases {
             renderer.reset()
-            let greenSrc = TestPatterns.solidColor(device: device, width: srcSize.width, height: srcSize.height, r: 0.05, g: 0.90, b: 0.10)
+            // Build IOSurface-backed source matching live ScreenCaptureKit path so zero-stall duplicate skip triggers on frame 2.
+            let surfProps: [IOSurfacePropertyKey: Int] = [
+                .width: srcSize.width,
+                .height: srcSize.height,
+                .bytesPerElement: 4,
+                .bytesPerRow: srcSize.width * 4,
+                .allocSize: srcSize.width * srcSize.height * 4,
+                .pixelFormat: Int(kCVPixelFormatType_32BGRA)
+            ]
+            let rawSurf = IOSurface(properties: surfProps)
+            let surf = try #require(rawSurf)
+            let surfDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: srcSize.width,
+                height: srcSize.height,
+                mipmapped: false
+            )
+            surfDesc.usage = [.shaderRead]
+            surfDesc.storageMode = .shared
+            let greenSrc = try #require(device.makeTexture(descriptor: surfDesc, iosurface: surf, plane: 0))
+            surf.lock(options: [], seed: nil)
+            let ptr = surf.baseAddress.assumingMemoryBound(to: UInt8.self)
+            for i in 0..<(srcSize.width * srcSize.height) {
+                ptr[i * 4 + 0] = 26  // B (~0.10)
+                ptr[i * 4 + 1] = 230 // G (~0.90)
+                ptr[i * 4 + 2] = 13  // R (~0.05)
+                ptr[i * 4 + 3] = 255 // A
+            }
+            surf.unlock(options: [], seed: nil)
             let mode = ScalingMode(name: label, effects: [EffectInstance(effectID: .bicubic, scalingType: scalingType)])
             let layout = ScalingLayoutCalculator.calculate(
                 sourcePixelSize: srcSize,
@@ -1626,7 +1708,7 @@ struct MetalPieShadersGPUValidationTests {
             try await group.waitForAll()
         }
 
-        // 10c-2. Same-queue GPU FIFO synchronization for measureSceneDiff (back-to-back GPU write -> scene-cut check)
+        // 10c-2. Same-queue GPU FIFO synchronization for GPU-only scene-cut Artifact Guard (zero CPU waitUntilCompleted!)
         let darkSrc = TestPatterns.solidColor(device: device, width: 320, height: 180, r: 0.03, g: 0.03, b: 0.03)
         let brightSrc = TestPatterns.solidColor(device: device, width: 320, height: 180, r: 0.96, g: 0.96, b: 0.96)
         let gpuPrev = TestPatterns.makeOutputTexture(device: device, width: 320, height: 180)
@@ -1642,7 +1724,7 @@ struct MetalPieShadersGPUValidationTests {
         cbWrite.commit() // intentionally NOT waiting before invoking encode!
         let cbFG = try #require(queue.makeCommandBuffer())
         let fgSettings = FrameGenSettings(enabled: true, multiplier: .x2, backend: .metalOpticalFlow, artifactGuardSensitivity: .balanced)
-        let cutResult = try renderer.videoToolboxML.encode(request: FrameGenRequest(
+        let cutEncoded = try renderer.videoToolboxML.encode(request: FrameGenRequest(
             previousTexture: gpuPrev,
             currentTexture: gpuCurr,
             outputTexture: gpuCutOut,
@@ -1650,8 +1732,11 @@ struct MetalPieShadersGPUValidationTests {
             commandBuffer: cbFG,
             settings: fgSettings
         ))
+        #expect(cbFG.status == .notEnqueued, "FrameGen encode must be 100% asynchronous with zero CPU waitUntilCompleted!")
         commitSync(cbFG)
-        #expect(cutResult == false, "Same-queue measureSceneDiff must observe prior in-flight GPU writes and detect hard cut")
+        #expect(cutEncoded == true)
+        let gpuCutStats = readbackStats(texture: gpuCutOut)
+        #expect(gpuCutStats.meanLuma > 0.90, "Same-queue GPU Artifact Guard must observe prior in-flight GPU writes and snap hard cut cleanly to bright frame (got \(gpuCutStats.meanLuma))")
 
         // 10d. DemagnifyMode != .none + CropInsets(enabled: true) coordinate scaling!
         renderer.reset()

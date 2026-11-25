@@ -177,6 +177,10 @@ private struct CadenceTracker: Sendable {
         guard sampleCount >= 2, smoothedInterval > 0 else { return 0 }
         return 1.0 / smoothedInterval
     }
+
+    var hasReliableEstimate: Bool {
+        sampleCount >= 3 && smoothedInterval > 0
+    }
 }
 
 // MARK: - Telemetry EMA Accumulator
@@ -192,6 +196,8 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         var lastOutputTime: Double = 0
         var lastPresentTime: Double = 0
         var lastPublishTime: Double = 0
+        var lastRenderConsumeTime: Double = 0
+        var displayIntervalSeconds: Double = 1.0 / 60.0
         var sourceFPS: Double = 0
         var outputFPS: Double = 0
         var presentedFPS: Double = 0
@@ -200,15 +206,22 @@ private final class TelemetryAccumulator: @unchecked Sendable {
 
     private let lock = OSAllocatedUnfairLock(initialState: State())
 
-    func reset(state: SessionState, gpuName: String, backendName: String, targetWindowName: String) {
+    func reset(state: SessionState, gpuName: String, backendName: String, targetWindowName: String, displayRefreshHz: Double = 60.0) {
         lock.withLock { s in
             s = State()
+            s.displayIntervalSeconds = 1.0 / max(30.0, displayRefreshHz)
             s.telemetry = SessionTelemetry(
                 state: state,
                 targetWindowName: targetWindowName,
                 backendName: backendName,
                 gpuName: gpuName
             )
+        }
+    }
+
+    func setDisplayRefreshRate(_ hz: Double) {
+        lock.withLock { s in
+            s.displayIntervalSeconds = 1.0 / max(30.0, hz)
         }
     }
 
@@ -234,12 +247,31 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         }
     }
 
-    func recordSourceFrame(now: Double, droppedDelta: UInt64) {
+    func recordRenderConsumed(now: Double) {
         lock.withLock { s in
-            s.telemetry.droppedFrames &+= droppedDelta
+            s.lastRenderConsumeTime = now
+        }
+    }
+
+    func recordDroppedPresent(count: UInt64 = 1) {
+        lock.withLock { s in
+            s.telemetry.droppedFrames &+= count
+        }
+    }
+
+    func recordSourceFrame(now: Double, mailboxSuperseded: Bool) {
+        lock.withLock { s in
+            // Distinguish true render-deadline-miss drops from harmless sub-vsync mailbox coalescing
+            // (e.g. slight clock phase beat between capture stream and 60/120Hz display vsync).
+            if mailboxSuperseded,
+               s.lastRenderConsumeTime > 0,
+               (now - s.lastRenderConsumeTime) > s.displayIntervalSeconds * 1.45
+            {
+                s.telemetry.droppedFrames &+= 1
+            }
             if s.lastSourceTime > 0 {
                 let dt = now - s.lastSourceTime
-                if dt > 0.0005 && dt < 2.0 {
+                if dt >= 0.002 && dt < 2.0 {
                     let instantFPS = 1.0 / dt
                     let alpha = 1.0 - exp(-dt / Self.emaTimeConstantSeconds)
                     s.sourceFPS = s.sourceFPS == 0 ? instantFPS : (s.sourceFPS + alpha * (instantFPS - s.sourceFPS))
@@ -876,16 +908,20 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private var lastRawSourceIsHDR: Bool = false
     private var frameIndex: UInt64 = 0
 
-    // Frame Generation history ring (private GPU copies so SCK IOSurface slots are NEVER hoarded).
+    // Frame Generation history ring (4-slot private GPU ring so in-flight frames NEVER alias or stall!).
+    private static let fgHistoryRingCapacity = 4
     private var fgHistoryTextures: [any MTLTexture] = []
     private var fgHistoryCursor: Int = 0
     private var fgPreviousIndex: Int?
     private var fgCurrentIndex: Int?
-    private var fgInterpolatedTexture: (any MTLTexture)?
+    /// Triple-buffered private GPU ring for FG interpolated outputs (prevents write-after-read GPU hazards!).
+    private var fgInterpolatedRing: [any MTLTexture] = []
+    private var fgInterpolatedRingIndex: Int = 0
     private var fgPreparedSize: PixelSize = .zero
     private var fgPreparedSettings: FrameGenSettings?
     private var fgPendingBeats: [ScheduledFGBeat] = []
     private var fgHysteresisSuppressedByHighFPS = false
+    private var fgLastNewFrameArrivalTime: Double = 0
     private var fgLastPassTiming: PassTiming?
     private var cadenceTracker = CadenceTracker()
 
@@ -974,7 +1010,8 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             state: .starting,
             gpuName: device.name,
             backendName: backendLabel,
-            targetWindowName: configuration.targetWindowName
+            targetWindowName: configuration.targetWindowName,
+            displayRefreshHz: configuration.overlayMetrics.screenMaxFPS
         )
 
         control.withLock { s in
@@ -1014,6 +1051,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             s.needsGraphicsRedraw = true
             s.configDirty = true
         }
+        telemetry.setDisplayRefreshRate(configuration.overlayMetrics.screenMaxFPS)
         telemetry.updateSessionMetadata(
             targetWindowName: configuration.targetWindowName,
             backendName: configuration.scalingMode.name,
@@ -1110,7 +1148,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         let dropped = mailbox.deposit(frame)
         telemetry.recordSourceFrame(
             now: CACurrentMediaTime(),
-            droppedDelta: dropped ? 1 : 0
+            mailboxSuperseded: dropped
         )
 
         // Wake the render thread immediately if running in low-latency direct-present or VRR mode.
@@ -1318,6 +1356,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         executeRenderStepOnRenderThread(
             now: now,
+            vsyncPeriod: nil,
             acquireDrawable: { layer.nextDrawable() },
             presentDrawable: { cmdBuf, drawable, scheduledPresentationTime in
                 if self.driverMode == .vrrDirectScanout,
@@ -1341,6 +1380,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     /// Returns BEFORE invoking `acquireDrawable()` on unchanged static frames (zero drawable/GPU waste).
     private func executeRenderStepOnRenderThread(
         now: Double,
+        vsyncPeriod: Double?,
         acquireDrawable: () -> (any CAMetalDrawable)?,
         presentDrawable: (any MTLCommandBuffer, any CAMetalDrawable, Double?) -> Void
     ) {
@@ -1375,13 +1415,19 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         }
 
         // Check if we have a new captured frame, a due FG beat, a config/graphics redraw, or a pending screenshot.
-        // Note: `droppedFrames` and `sourceFPS` are already recorded in `ingest(frame:)` so we never double-count here.
         let taken = mailbox.take()
         let newFrame = taken.frame
 
-        let fgActive = evaluateFrameGenActive(config: config)
+        let displayInterval = 1.0 / max(30.0, config.overlayMetrics.screenMaxFPS)
+        let fgPlan = evaluateFrameGenPlan(config: config)
+        let fgActive = fgPlan.active
+
+        // In DisplayLink mode, fire queued FG beats on the closest vsync tick (half-vsync tolerance)
+        // so minor capture cadence jitter never causes a beat to miss a vsync and get wiped by the next real frame!
+        // In timer-driven VRR mode, keep a tight 2 ms tolerance.
+        let beatTolerance = vsyncPeriod.map { $0 * 0.45 } ?? 0.002
         var dueBeat: ScheduledFGBeat?
-        if newFrame == nil && fgActive, let head = fgPendingBeats.first, now >= head.targetTime - 0.002 {
+        if newFrame == nil && fgActive, let head = fgPendingBeats.first, now >= head.targetTime - beatTolerance {
             dueBeat = fgPendingBeats.removeFirst()
         }
 
@@ -1417,6 +1463,9 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         }
 
         guard let drawable = acquireDrawable() else {
+            if newFrame != nil || dueBeat != nil {
+                telemetry.recordDroppedPresent()
+            }
             if let newFrame {
                 // Put frame back if drawable temporarily unavailable.
                 mailbox.deposit(newFrame)
@@ -1487,24 +1536,37 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                 commandBuffer: commandBuffer
             )
 
-            // Update 2-frame private GPU history ring for Frame Generation (zero IOSurface hoarding!).
-            if fgActive {
+            // Re-evaluate FG plan after recording the latest cadence sample so 60fps on 60Hz bypasses immediately.
+            let postPlan = evaluateFrameGenPlan(config: config)
+            let postFGActive = postPlan.active
+            let postMultiplier = postPlan.effectiveMultiplier
+
+            // Update 4-slot private GPU history ring for Frame Generation (zero IOSurface hoarding & zero GPU hazards!).
+            if postFGActive {
+                let hadUnrenderedRealBeat = fgPendingBeats.contains { $0.factor >= 0.999 }
+                let arrivalDelta = fgLastNewFrameArrivalTime > 0 ? (now - fgLastNewFrameArrivalTime) : 1.0
+                fgLastNewFrameArrivalTime = now
+
                 stageFrameIntoFGHistory(
                     sourceTexture: frame.texture,
                     commandBuffer: commandBuffer
                 )
-                // Strictly monotonic forward temporal pacing:
-                // Pass `frame.texture` (already populated on GPU!) as `currTex` on the immediate arrival beat
-                // instead of the just-blitted uncommitted `fgHistoryTextures[currIdx]` so synchronous scene-cut
-                // checks inside `FrameInterpolating.encode` never read uninitialized/stale history pixels!
-                if let prevIdx = fgPreviousIndex,
+
+                // Burst safeguard: if a brand-new real frame arrived within ~1 display refresh while
+                // the previous real-frame beat wasn't even presented yet, present this real frame
+                // directly so we NEVER starve real frames or lower FPS below FG-OFF!
+                let isBurstAtDisplayRate = hadUnrenderedRealBeat && arrivalDelta < displayInterval * 1.15
+
+                if !isBurstAtDisplayRate,
+                   let prevIdx = fgPreviousIndex,
                    prevIdx < fgHistoryTextures.count,
                    fgHistoryTextures[prevIdx].width == frame.texture.width,
                    fgHistoryTextures[prevIdx].height == frame.texture.height
                 {
                     let firstFactor = scheduleFGBeatsForNextInterval(
                         arrivalTime: now,
-                        config: config
+                        multiplier: postMultiplier,
+                        displayInterval: displayInterval
                     )
                     let (tex, synth, timing) = encodeInterpolatedOrRealFrame(
                         factor: firstFactor,
@@ -1522,6 +1584,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                 }
             } else {
                 fgPendingBeats.removeAll(keepingCapacity: true)
+                fgLastNewFrameArrivalTime = now
                 sourceTextureForEffects = frame.texture
             }
         } else if let beat = dueBeat,
@@ -1699,6 +1762,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         presentDrawable(commandBuffer, drawable, scheduledPresentationTime)
         commandBuffer.commit()
+        telemetry.recordRenderConsumed(now: now)
 
         // Reveal overlay after the first upscaled frame is committed/presented (zero startup black flash!).
         emitFirstFrameIfNeeded()
@@ -1707,8 +1771,10 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         // Preserve the most recent `"frame-gen"` PassTiming across real source frames while Frame Gen
         // stays active so the 5 Hz telemetry snapshots & Profiler HUD never flicker `"frame-gen"` off
         // when a publish tick lands on a real source beat; clear immediately when `!fgActive`.
+        let finalFGPlan = evaluateFrameGenPlan(config: config)
+        let finalFGActive = finalFGPlan.active
         var combinedTimings = extraPassTimings
-        if fgActive {
+        if finalFGActive {
             if let freshFG = extraPassTimings.first(where: { $0.id == "frame-gen" }) {
                 fgLastPassTiming = freshFG
             } else if let cachedFG = fgLastPassTiming {
@@ -1722,8 +1788,8 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             state: .running,
             inputSize: finalLayout.croppedSourceRect.size,
             outputSize: finalLayout.finalOutputPixelSize,
-            frameGenActive: fgActive,
-            frameGenMultiplier: fgActive ? config.profile.frameGen.multiplier.rawValue : 1,
+            frameGenActive: finalFGActive,
+            frameGenMultiplier: finalFGActive ? finalFGPlan.effectiveMultiplier : 1,
             hdrActive: sourceIsHDR
         )
         telemetry.recordOutputFrame(
@@ -1736,25 +1802,34 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
     // MARK: - Frame Generation Helpers (Render Thread Only)
 
-    private func evaluateFrameGenActive(config: RenderSessionConfiguration) -> Bool {
+    private func evaluateFrameGenPlan(config: RenderSessionConfiguration) -> (active: Bool, effectiveMultiplier: Int) {
         guard isFrameGenAllowedByConfig(config) else {
             fgHysteresisSuppressedByHighFPS = false
-            return false
+            return (false, 1)
         }
         let displayHz = max(30.0, config.overlayMetrics.screenMaxFPS)
         let sourceFPS = cadenceTracker.estimatedFPS
+        let requestedM = max(2, config.profile.frameGen.multiplier.rawValue)
 
-        // Auto-disable FG with hysteresis if source FPS already meets display refresh rate.
-        if sourceFPS > 0 {
+        // Auto-bypass FG cleanly with hysteresis whenever source FPS already fills the display
+        // refresh rate (zero spare vsync slots — e.g. 60fps source on 60Hz monitor or 120fps on 120Hz).
+        if cadenceTracker.hasReliableEstimate && sourceFPS > 0 {
+            let headroomRatio = displayHz / sourceFPS
+            let maxUsefulM = max(1, Int((headroomRatio + 0.20).rounded(.down)))
             if fgHysteresisSuppressedByHighFPS {
-                if sourceFPS < displayHz * 0.80 {
+                if sourceFPS < displayHz * 0.78 && headroomRatio >= 1.80 {
                     fgHysteresisSuppressedByHighFPS = false
                 }
-            } else if sourceFPS >= displayHz * 0.92 {
+            } else if sourceFPS >= displayHz * 0.88 || maxUsefulM < 2 {
                 fgHysteresisSuppressedByHighFPS = true
             }
+            if fgHysteresisSuppressedByHighFPS {
+                return (false, 1)
+            }
+            return (true, min(requestedM, max(2, maxUsefulM)))
         }
-        return !fgHysteresisSuppressedByHighFPS
+
+        return (!fgHysteresisSuppressedByHighFPS, requestedM)
     }
 
     private func stageLastRawSourceTexture(
@@ -1813,7 +1888,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         let fmt = sourceTexture.pixelFormat
         guard w > 0 && h > 0 else { return }
 
-        let needsRebuild = fgHistoryTextures.count != 2
+        let needsRebuild = fgHistoryTextures.count != Self.fgHistoryRingCapacity
             || fgHistoryTextures[0].width != w
             || fgHistoryTextures[0].height != h
             || fgHistoryTextures[0].pixelFormat != fmt
@@ -1828,17 +1903,22 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             )
             desc.storageMode = .private
             desc.usage = [.shaderRead, .shaderWrite, .renderTarget]
-            if let t0 = device.makeTexture(descriptor: desc),
-               let t1 = device.makeTexture(descriptor: desc)
-            {
-                fgHistoryTextures = [t0, t1]
+            var ring: [any MTLTexture] = []
+            ring.reserveCapacity(Self.fgHistoryRingCapacity)
+            for _ in 0..<Self.fgHistoryRingCapacity {
+                if let tex = device.makeTexture(descriptor: desc) {
+                    ring.append(tex)
+                }
+            }
+            if ring.count == Self.fgHistoryRingCapacity {
+                fgHistoryTextures = ring
             }
             fgHistoryCursor = 0
             fgPreviousIndex = nil
             fgCurrentIndex = nil
         }
 
-        guard fgHistoryTextures.count == 2,
+        guard fgHistoryTextures.count == Self.fgHistoryRingCapacity,
               let blit = commandBuffer.makeBlitCommandEncoder()
         else {
             return
@@ -1860,7 +1940,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         fgPreviousIndex = fgCurrentIndex
         fgCurrentIndex = targetIdx
-        fgHistoryCursor = (targetIdx + 1) % 2
+        fgHistoryCursor = (targetIdx + 1) % Self.fgHistoryRingCapacity
     }
 
     /// Schedules strictly monotonic forward beats for the `(prev, curr)` interval.
@@ -1868,12 +1948,14 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     /// `[2/M, ..., (M-1)/M, 1.0]` spaced evenly across the measured source cadence interval.
     private func scheduleFGBeatsForNextInterval(
         arrivalTime: Double,
-        config: RenderSessionConfiguration
+        multiplier: Int,
+        displayInterval: Double
     ) -> Float {
         fgPendingBeats.removeAll(keepingCapacity: true)
-        let m = max(2, config.profile.frameGen.multiplier.rawValue)
+        let m = max(2, multiplier)
         let interval = cadenceTracker.estimatedIntervalSeconds
-        let step = interval / Double(m)
+        // Never bunch beats tighter than one display refresh period.
+        let step = max(displayInterval * 0.92, interval / Double(m))
 
         // Immediate beat rendered right now: factor = 1 / m
         let immediateFactor = 1.0 / Float(m)
@@ -1946,24 +2028,33 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     }
 
     private func ensureFGOutputTexture(matching template: any MTLTexture) -> (any MTLTexture)? {
-        if let existing = fgInterpolatedTexture,
-           existing.width == template.width,
-           existing.height == template.height,
-           existing.pixelFormat == template.pixelFormat
-        {
-            return existing
+        let needsRebuild = fgInterpolatedRing.count != 3
+            || fgInterpolatedRing[0].width != template.width
+            || fgInterpolatedRing[0].height != template.height
+            || fgInterpolatedRing[0].pixelFormat != template.pixelFormat
+
+        if needsRebuild {
+            fgInterpolatedRing.removeAll(keepingCapacity: true)
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: template.pixelFormat,
+                width: template.width,
+                height: template.height,
+                mipmapped: false
+            )
+            desc.storageMode = .private
+            desc.usage = [.shaderRead, .shaderWrite, .renderTarget]
+            for _ in 0..<3 {
+                if let tex = device.makeTexture(descriptor: desc) {
+                    fgInterpolatedRing.append(tex)
+                }
+            }
+            fgInterpolatedRingIndex = 0
         }
 
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: template.pixelFormat,
-            width: template.width,
-            height: template.height,
-            mipmapped: false
-        )
-        desc.storageMode = .private
-        desc.usage = [.shaderRead, .shaderWrite, .renderTarget]
-        fgInterpolatedTexture = device.makeTexture(descriptor: desc)
-        return fgInterpolatedTexture
+        guard !fgInterpolatedRing.isEmpty else { return nil }
+        let tex = fgInterpolatedRing[fgInterpolatedRingIndex]
+        fgInterpolatedRingIndex = (fgInterpolatedRingIndex + 1) % fgInterpolatedRing.count
+        return tex
     }
 
     private func resetFrameGenStateOnRenderThread() {
@@ -1971,11 +2062,13 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         fgHistoryCursor = 0
         fgPreviousIndex = nil
         fgCurrentIndex = nil
-        fgInterpolatedTexture = nil
+        fgInterpolatedRing.removeAll()
+        fgInterpolatedRingIndex = 0
         fgPreparedSize = .zero
         fgPreparedSettings = nil
         fgPendingBeats.removeAll()
         fgHysteresisSuppressedByHighFPS = false
+        fgLastNewFrameArrivalTime = 0
         fgLastPassTiming = nil
         cadenceTracker.reset()
         frameInterpolator?.reset()
@@ -2103,8 +2196,11 @@ extension RenderLoopController: CAMetalDisplayLinkDelegate {
         needsUpdate update: CAMetalDisplayLink.Update
     ) {
         let now = CACurrentMediaTime()
+        let maxFPS = control.withLock { $0.configuration?.overlayMetrics.screenMaxFPS ?? 60.0 }
+        let vsyncPeriod = 1.0 / max(30.0, maxFPS)
         executeRenderStepOnRenderThread(
             now: now,
+            vsyncPeriod: vsyncPeriod,
             acquireDrawable: { update.drawable },
             presentDrawable: { cmdBuf, drawable, _ in
                 cmdBuf.present(drawable)

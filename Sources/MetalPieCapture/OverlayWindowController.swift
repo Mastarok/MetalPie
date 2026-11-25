@@ -111,6 +111,7 @@ public final class OverlayPanel: NSPanel {
         hasShadow = false
         isOpaque = true
         backgroundColor = .black
+        alphaValue = OverlayWindowController.antiOcclusionAlphaValue
         ignoresMouseEvents = true
         isMovable = false
         isMovableByWindowBackground = false
@@ -187,6 +188,12 @@ public final class MetalOverlayView: NSView {
     /// Callback fired when interactive windowed drag/resize finishes or updates the window frame.
     public var onInteractiveFrameUpdate: ((CGRect) -> Void)?
 
+    /// Callback fired when an interactive windowed drag/resize gesture starts.
+    public var onInteractiveDragStarted: ((CGRect) -> Void)?
+
+    /// Callback fired when an interactive windowed drag/resize gesture ends.
+    public var onInteractiveDragEnded: ((CGRect) -> Void)?
+
     /// Interactive windowed-mode state.
     public var isInteractiveWindowedMode: Bool = false {
         didSet {
@@ -199,6 +206,9 @@ public final class MetalOverlayView: NSView {
 
     /// Minimum allowed windowed overlay width in logical points.
     public var minimumWindowedWidth: CGFloat = 320.0
+
+    /// Minimum allowed windowed overlay height in logical points.
+    public var minimumWindowedHeight: CGFloat = 180.0
 
     private enum DragOperation {
         case move
@@ -406,6 +416,7 @@ public final class MetalOverlayView: NSView {
         } else {
             activeDrag = .move
         }
+        onInteractiveDragStarted?(win.frame)
     }
 
     public override func mouseDragged(with event: NSEvent) {
@@ -426,8 +437,10 @@ public final class MetalOverlayView: NSView {
 
         case .resize(let edges):
             let aspect = max(0.1, lockedAspectRatio)
-            let minW = max(160.0, minimumWindowedWidth)
-            let minH = max(90.0, minW / aspect)
+            let baseMinW = max(160.0, minimumWindowedWidth)
+            let baseMinH = max(90.0, minimumWindowedHeight)
+            let minW = max(baseMinW, baseMinH * aspect)
+            let minH = max(baseMinH, minW / aspect)
 
             var proposedW = dragStartWindowFrame.width
             var proposedH = dragStartWindowFrame.height
@@ -465,6 +478,10 @@ public final class MetalOverlayView: NSView {
                 proposedW = max(minW, proposedH * aspect)
             }
 
+            // Never allow resizing smaller than the underlying source window on either axis.
+            proposedW = max(baseMinW, proposedW)
+            proposedH = max(baseMinH, proposedH)
+
             if edges.contains(.left) {
                 newFrame.origin.x = dragStartWindowFrame.maxX - proposedW
             }
@@ -480,7 +497,11 @@ public final class MetalOverlayView: NSView {
     }
 
     public override func mouseUp(with event: NSEvent) {
+        let wasDragging = activeDrag != nil
         activeDrag = nil
+        if wasDragging, let win = window {
+            onInteractiveDragEnded?(win.frame)
+        }
         super.mouseUp(with: event)
     }
 
@@ -509,6 +530,13 @@ public final class OverlayWindowController {
     /// Native macOS Full-Screen Space overlay level: level 19 (above full-screen app, below auto-hiding Dock/Menu Bar).
     public static let nativeFullscreenOverlayLevel = NSWindow.Level(rawValue: 19)
 
+    /// Empirically verified on macOS 27.0.1 (Apple M4 Pro): keeping `panel.isOpaque = true` and
+    /// `metalLayer.isOpaque = true` while setting `panel.alphaValue = 0.999` prevents macOS
+    /// WindowServer from marking underlying browser/app windows as occluded (`occlusionState = []`),
+    /// keeping `<video>` playback & Blink/WebKit compositing running at full 60/120 Hz with
+    /// zero visual bleed (< 0.26 LSB in 8-bit SDR) and zero `CAMetalDisplayLink` stalls (250+ frames).
+    public static let antiOcclusionAlphaValue: CGFloat = 0.999
+
     public let device: any MTLDevice
     public private(set) var panel: OverlayPanel?
     public private(set) var overlayView: MetalOverlayView?
@@ -531,9 +559,18 @@ public final class OverlayWindowController {
     /// True when covering a native macOS Full-Screen Space using level 19 + `.accessory` policy.
     public private(set) var isCoveringNativeFullscreenSpace: Bool = false
 
-    /// Applies 1-pt anti-occlusion inset in normal (non-VRR) mode so macOS WindowServer / App Nap
-    /// never pauses Chromium/Firefox/Electron windows underneath.
-    public var antiOcclusionEnabled: Bool = true
+    /// Prevents macOS WindowServer / App Nap from marking underlying browser/Electron windows as
+    /// occluded in normal (non-VRR) mode (`panel.alphaValue = 0.999` + 1-pt bottom inset in fullscreen).
+    public var antiOcclusionEnabled: Bool = true {
+        didSet {
+            if antiOcclusionEnabled != oldValue {
+                applyOcclusionAndShadowState()
+                if isSessionOpen && currentPresentationMode.isFullscreen && currentSourceCGRect.width > 0 {
+                    updateSourceWindowGeometry(currentSourceCGRect)
+                }
+            }
+        }
+    }
 
     /// Enables ProMotion VRR Direct-Scanout mode (full-display opaque coverage with zero sub-windows
     /// or moving `CALayer` sublayers; cursor and HUD are composited directly inside Metal).
@@ -557,6 +594,9 @@ public final class OverlayWindowController {
 
     /// Fired when the user interactively drags or resizes the overlay in Windowed Scaling mode.
     public var onWindowedFrameChanged: ((CGRect, PixelSize, Double) -> Void)?
+
+    /// Fired when an interactive windowed drag/resize gesture starts (`true`) or ends (`false`).
+    public var onWindowedDragStateChanged: ((Bool, CGRect) -> Void)?
 
     // Configuration state
     private var currentPresentationMode: PresentationMode = .fullscreen
@@ -664,6 +704,17 @@ public final class OverlayWindowController {
                 self.onWindowedFrameChanged?(newCocoaFrame, metrics.drawablePixelSize, metrics.backingScaleFactor)
                 self.onDrawableMetricsChanged?(metrics)
             }
+            view.onInteractiveDragStarted = { [weak self] startCocoaFrame in
+                self?.onWindowedDragStateChanged?(true, startCocoaFrame)
+            }
+            view.onInteractiveDragEnded = { [weak self] endCocoaFrame in
+                guard let self else { return }
+                self.lastWindowedWidth = endCocoaFrame.width
+                self.refreshScreenCapabilitiesAndColorSpace()
+                self.onWindowedDragStateChanged?(false, endCocoaFrame)
+                let metrics = self.currentDrawableMetrics()
+                self.onDrawableMetricsChanged?(metrics)
+            }
 
             self.panel = overlayPanel
             self.overlayView = view
@@ -677,8 +728,10 @@ public final class OverlayWindowController {
         isSuspended = false
 
         view.lockedAspectRatio = currentAspectRatio
+        syncMinimumWindowedBounds(for: sourceRect, displays: displays)
         applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: nativeFS)
         applyWindowedInteractivity()
+        applyOcclusionAndShadowState()
         applyVRRModeState()
         refreshScreenCapabilitiesAndColorSpace()
 
@@ -721,6 +774,7 @@ public final class OverlayWindowController {
         guard isSessionOpen, isSuspended else { return }
         isSuspended = false
         applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: isCoveringNativeFullscreenSpace)
+        applyOcclusionAndShadowState()
         refreshScreenCapabilitiesAndColorSpace()
         if revealImmediately {
             revealAfterFirstFrame()
@@ -745,40 +799,105 @@ public final class OverlayWindowController {
     // MARK: - Live Updates (Display Move, Source Resize, Mode Toggle, HDR/Format)
 
     /// Updates overlay placement when the source window moves, resizes, or switches displays.
+    ///
+    /// - Parameters:
+    ///   - newSourceCGRect: Updated source window frame in CoreGraphics global coordinates (Y-down).
+    ///   - windowID: Optional source window ID used for native Full-Screen Space detection.
+    ///   - repositionWindowedOverlay: When `true` (default), repositions/expands a windowed overlay
+    ///     to track external source window moves/resizes so two separate windows never appear.
+    ///     Pass `false` when recording a self-initiated AX reposition underneath the overlay.
     public func updateSourceWindowGeometry(
         _ newSourceCGRect: CGRect,
-        windowID: CGWindowID? = nil
+        windowID: CGWindowID? = nil,
+        repositionWindowedOverlay: Bool = true
     ) {
         guard isSessionOpen, let panel else { return }
+        let previousSourceCGRect = currentSourceCGRect
         currentSourceCGRect = newSourceCGRect.standardized
         if currentSourceCGRect.height > 0 {
             currentAspectRatio = max(0.1, currentSourceCGRect.width / currentSourceCGRect.height)
             overlayView?.lockedAspectRatio = currentAspectRatio
         }
 
-        // In Fullscreen mode, retarget screen(s) seamlessly if source window moved across monitors.
-        guard currentPresentationMode.isFullscreen else { return }
-
         let displays = WindowEnumerator.enumerateDisplaysOnMain()
-        let nativeFS: Bool
-        if let windowID {
-            nativeFS = WindowEnumerator.isLikelyNativeFullscreenWindow(
-                windowID: windowID,
-                bounds: currentSourceCGRect,
-                displays: displays
+        syncMinimumWindowedBounds(for: currentSourceCGRect, displays: displays)
+
+        if currentPresentationMode.isFullscreen {
+            let nativeFS: Bool
+            if let windowID {
+                nativeFS = WindowEnumerator.isLikelyNativeFullscreenWindow(
+                    windowID: windowID,
+                    bounds: currentSourceCGRect,
+                    displays: displays
+                )
+            } else {
+                nativeFS = isCoveringNativeFullscreenSpace
+            }
+
+            let targetCocoaRect = computeOverlayCocoaFrame(
+                sourceCGRect: currentSourceCGRect,
+                presentationMode: currentPresentationMode,
+                multiMonitorMode: currentMultiMonitorMode,
+                displays: displays,
+                aspectRatio: currentAspectRatio,
+                applyAntiOcclusion: shouldApplyAntiOcclusion(mode: currentPresentationMode, nativeFullscreenSpace: nativeFS)
             )
-        } else {
-            nativeFS = isCoveringNativeFullscreenSpace
+
+            let targetDisplay = ScreenGeometry.bestDisplay(forCocoaRect: targetCocoaRect, in: displays)
+            let frameChanged = abs(panel.frame.origin.x - targetCocoaRect.origin.x) >= 0.5
+                || abs(panel.frame.origin.y - targetCocoaRect.origin.y) >= 0.5
+                || abs(panel.frame.size.width - targetCocoaRect.size.width) >= 0.5
+                || abs(panel.frame.size.height - targetCocoaRect.size.height) >= 0.5
+            let displayChanged = targetDisplay != nil && targetDisplay?.id != activeDisplayID
+
+            if frameChanged || displayChanged {
+                panel.setFrame(targetCocoaRect, display: isRevealed && !isSuspended, animate: false)
+                applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: nativeFS)
+                applyOcclusionAndShadowState()
+                refreshScreenCapabilitiesAndColorSpace()
+                emitCurrentMetrics()
+            }
+            return
         }
 
-        let targetCocoaRect = computeOverlayCocoaFrame(
-            sourceCGRect: currentSourceCGRect,
-            presentationMode: currentPresentationMode,
-            multiMonitorMode: currentMultiMonitorMode,
-            displays: displays,
-            aspectRatio: currentAspectRatio,
-            applyAntiOcclusion: shouldApplyAntiOcclusion(mode: currentPresentationMode, nativeFullscreenSpace: nativeFS)
-        )
+        // Windowed mode: keep the overlay locked over the source window on external move/resize so
+        // the source window never drifts out from behind the scaled overlay.
+        guard repositionWindowedOverlay else { return }
+
+        let sizeChanged = abs(previousSourceCGRect.width - currentSourceCGRect.width) >= 1.0
+            || abs(previousSourceCGRect.height - currentSourceCGRect.height) >= 1.0
+        let targetCocoaRect: CGRect
+        if sizeChanged {
+            targetCocoaRect = computeOverlayCocoaFrame(
+                sourceCGRect: currentSourceCGRect,
+                presentationMode: currentPresentationMode,
+                multiMonitorMode: currentMultiMonitorMode,
+                displays: displays,
+                aspectRatio: currentAspectRatio,
+                applyAntiOcclusion: false
+            )
+        } else {
+            let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: currentSourceCGRect, in: displays)
+                ?? ScreenGeometry.primaryDisplay(in: displays)
+            let screenCocoa = hostDisplay?.cocoaFrame
+                ?? NSScreen.main?.visibleFrame
+                ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+            let sourceCocoa = ScreenGeometry.cgToCocoa(rect: currentSourceCGRect, displays: displays).standardized
+            let currentSize = panel.frame.size
+            let width = min(screenCocoa.width, max(currentSize.width, ceil(sourceCocoa.width)))
+            let height = min(screenCocoa.height, max(currentSize.height, ceil(sourceCocoa.height)))
+            let centered = CGRect(
+                x: (sourceCocoa.midX - width * 0.5).rounded(),
+                y: (sourceCocoa.midY - height * 0.5).rounded(),
+                width: width.rounded(),
+                height: height.rounded()
+            )
+            targetCocoaRect = Self.ensureOverlayCoversSource(
+                overlayCocoaRect: centered,
+                sourceCocoaRect: sourceCocoa,
+                hostScreenCocoa: screenCocoa
+            )
+        }
 
         let targetDisplay = ScreenGeometry.bestDisplay(forCocoaRect: targetCocoaRect, in: displays)
         let frameChanged = abs(panel.frame.origin.x - targetCocoaRect.origin.x) >= 0.5
@@ -789,10 +908,26 @@ public final class OverlayWindowController {
 
         if frameChanged || displayChanged {
             panel.setFrame(targetCocoaRect, display: isRevealed && !isSuspended, animate: false)
-            applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: nativeFS)
+            applyOcclusionAndShadowState()
             refreshScreenCapabilitiesAndColorSpace()
-            emitCurrentMetrics()
+            let metrics = currentDrawableMetrics()
+            onDrawableMetricsChanged?(metrics)
         }
+    }
+
+    /// Programmatically adjusts the windowed overlay frame (for example, to remain flush over a
+    /// menu-bar-clamped or immovable source window) and synchronizes Metal drawable metrics.
+    public func setWindowedOverlayCocoaFrame(_ newCocoaFrame: CGRect) {
+        guard isSessionOpen, currentPresentationMode.isWindowed, let panel else { return }
+        let frameChanged = abs(panel.frame.origin.x - newCocoaFrame.origin.x) >= 0.5
+            || abs(panel.frame.origin.y - newCocoaFrame.origin.y) >= 0.5
+            || abs(panel.frame.size.width - newCocoaFrame.size.width) >= 0.5
+            || abs(panel.frame.size.height - newCocoaFrame.size.height) >= 0.5
+        guard frameChanged else { return }
+        panel.setFrame(newCocoaFrame, display: isRevealed && !isSuspended, animate: false)
+        lastWindowedWidth = newCocoaFrame.width
+        refreshScreenCapabilitiesAndColorSpace()
+        emitCurrentMetrics()
     }
 
     /// Switches live between Fullscreen and Windowed scaling modes while preserving `lastWindowedWidth`.
@@ -832,8 +967,10 @@ public final class OverlayWindowController {
         )
 
         panel.setFrame(targetCocoaRect, display: true, animate: false)
+        syncMinimumWindowedBounds(for: currentSourceCGRect, displays: displays)
         applyWindowLevelAndActivationPolicy(nativeFullscreenSpace: nativeFS)
         applyWindowedInteractivity()
+        applyOcclusionAndShadowState()
         applyVRRModeState()
         refreshScreenCapabilitiesAndColorSpace()
 
@@ -989,7 +1126,14 @@ public final class OverlayWindowController {
             let screenCocoa = hostDisplay?.cocoaFrame
                 ?? NSScreen.main?.visibleFrame
                 ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
-            let sourceCocoa = ScreenGeometry.cgToCocoa(rect: sourceCGRect, displays: displays)
+            let sourceCocoa = ScreenGeometry.cgToCocoa(rect: sourceCGRect, displays: displays).standardized
+            let safeAspect = max(0.1, aspectRatio)
+
+            // Always guarantee the windowed overlay is at least as large as `sourceCocoa`
+            // (clamped only to `screenCocoa.size`) so stale `lastWindowedWidth` or arbitrary
+            // 0.95/0.75 screen height caps can NEVER shrink the overlay smaller than the source window!
+            let minCoverW = min(screenCocoa.width, max(320.0, ceil(sourceCocoa.width)))
+            let minCoverH = min(screenCocoa.height, max(180.0, ceil(sourceCocoa.height)))
 
             let targetWidth: CGFloat
             if let explicitWidth, explicitWidth >= 200 {
@@ -1002,36 +1146,182 @@ public final class OverlayWindowController {
                 // Magpie Auto heuristic: 3/4 of screen area, at least 4/3x source width.
                 let threeQuarterScreenW = screenCocoa.width * 0.75
                 let threeQuarterScreenH = screenCocoa.height * 0.75
-                let maxFitW = min(threeQuarterScreenW, threeQuarterScreenH * aspectRatio)
+                let maxFitW = min(threeQuarterScreenW, threeQuarterScreenH * safeAspect)
                 let minAutoW = sourceCocoa.width * (4.0 / 3.0)
-                targetWidth = max(320.0, min(screenCocoa.width * 0.95, max(maxFitW, minAutoW)))
+                targetWidth = max(320.0, min(screenCocoa.width, max(maxFitW, minAutoW)))
             }
 
-            let clampedW = min(screenCocoa.width, max(320.0, targetWidth))
-            var clampedH = clampedW / max(0.1, aspectRatio)
-            var finalW = clampedW
-            if clampedH > screenCocoa.height * 0.95 {
-                clampedH = screenCocoa.height * 0.95
-                finalW = clampedH * max(0.1, aspectRatio)
-            }
+            let maxAspectFitW = min(screenCocoa.width, screenCocoa.height * safeAspect)
+            let minAspectCoverW = min(maxAspectFitW, max(minCoverW, minCoverH * safeAspect))
+            var finalW = min(maxAspectFitW, max(minAspectCoverW, targetWidth))
+            var finalH = finalW / safeAspect
 
-            // Center over source window, clamped within host display bounds.
-            var originX = sourceCocoa.midX - finalW * 0.5
-            var originY = sourceCocoa.midY - clampedH * 0.5
-            originX = min(max(originX, screenCocoa.minX), screenCocoa.maxX - finalW)
-            originY = min(max(originY, screenCocoa.minY), screenCocoa.maxY - clampedH)
+            // Enforce full coverage on both axes after rounding (and if aspectRatio slightly differs).
+            finalW = min(screenCocoa.width, max(finalW.rounded(), minCoverW))
+            finalH = min(screenCocoa.height, max(finalH.rounded(), minCoverH))
 
-            var rect = CGRect(
-                x: originX.rounded(),
-                y: originY.rounded(),
-                width: finalW.rounded(),
-                height: clampedH.rounded()
+            // Center over source window, then enforce full containment inside `screenCocoa`.
+            let centered = CGRect(
+                x: (sourceCocoa.midX - finalW * 0.5).rounded(),
+                y: (sourceCocoa.midY - finalH * 0.5).rounded(),
+                width: finalW,
+                height: finalH
             )
-            if applyAntiOcclusion {
-                rect = ScreenGeometry.antiOcclusionInset(cocoaRect: rect, insetPoints: 1.0)
-            }
-            return rect
+            // Windowed mode prevents WindowServer occlusion via `panel.alphaValue = antiOcclusionAlphaValue`
+            // (0.999) rather than a 1-pt bottom inset, so the bottom edge of `sourceCocoa` never peeks out.
+            return ensureOverlayCoversSource(
+                overlayCocoaRect: centered,
+                sourceCocoaRect: sourceCocoa,
+                hostScreenCocoa: screenCocoa
+            )
         }
+    }
+
+    /// Returns `true` when `overlayRect` completely covers `sourceRect` (within `tolerance` points).
+    public static func overlayCoversSource(
+        overlayRect: CGRect,
+        sourceRect: CGRect,
+        tolerance: CGFloat = 0.5
+    ) -> Bool {
+        let ov = overlayRect.standardized
+        let src = sourceRect.standardized
+        guard !ov.isEmpty, !src.isEmpty else { return false }
+        return ov.minX <= src.minX + tolerance
+            && ov.minY <= src.minY + tolerance
+            && ov.maxX >= src.maxX - tolerance
+            && ov.maxY >= src.maxY - tolerance
+    }
+
+    /// Adjusts `overlayCocoaRect` minimally (shifting and, if necessary, expanding within `hostScreenCocoa`)
+    /// so it stays strictly inside `hostScreenCocoa` and completely covers `sourceCocoaRect` whenever
+    /// `sourceCocoaRect` fits inside `hostScreenCocoa`.
+    public static func ensureOverlayCoversSource(
+        overlayCocoaRect: CGRect,
+        sourceCocoaRect: CGRect,
+        hostScreenCocoa: CGRect
+    ) -> CGRect {
+        let screen = hostScreenCocoa.standardized
+        let src = sourceCocoaRect.standardized
+        var w = min(screen.width, max(overlayCocoaRect.standardized.width.rounded(), min(screen.width, ceil(src.width))))
+        var h = min(screen.height, max(overlayCocoaRect.standardized.height.rounded(), min(screen.height, ceil(src.height))))
+
+        let maxOriginX = max(screen.minX, screen.maxX - w)
+        let maxOriginY = max(screen.minY, screen.maxY - h)
+        var originX = min(max(overlayCocoaRect.standardized.origin.x.rounded(), screen.minX), maxOriginX)
+        var originY = min(max(overlayCocoaRect.standardized.origin.y.rounded(), screen.minY), maxOriginY)
+
+        if src.width > 0 && src.minX >= screen.minX - 0.5 && src.maxX <= screen.maxX + 0.5 {
+            let containMinX = max(screen.minX, ceil(src.maxX - w))
+            let containMaxX = min(maxOriginX, floor(src.minX))
+            if containMinX <= containMaxX {
+                originX = min(max(originX, containMinX), containMaxX)
+            } else {
+                originX = max(screen.minX, floor(src.minX))
+                w = min(screen.maxX - originX, max(w, ceil(src.maxX - originX)))
+            }
+        }
+
+        if src.height > 0 && src.minY >= screen.minY - 0.5 && src.maxY <= screen.maxY + 0.5 {
+            let containMinY = max(screen.minY, ceil(src.maxY - h))
+            let containMaxY = min(maxOriginY, floor(src.minY))
+            if containMinY <= containMaxY {
+                originY = min(max(originY, containMinY), containMaxY)
+            } else {
+                originY = max(screen.minY, floor(src.minY))
+                h = min(screen.maxY - originY, max(h, ceil(src.maxY - originY)))
+            }
+        }
+
+        return CGRect(x: originX, y: originY, width: w, height: h)
+    }
+
+    /// Computes the CoreGraphics (Y-down) origin to reposition an underlying source window via AX
+    /// so it stays centered directly underneath `overlayCGRect` without peeking out, while staying
+    /// inside the host display's visible/reachable frame (respecting macOS menu bar clamping and
+    /// multi-monitor negative-CG-Y displays).
+    public static func computeHiddenSourceWindowCGOrigin(
+        sourceSize: CGSize,
+        overlayCGRect: CGRect,
+        hostDisplayCGBounds: CGRect,
+        hostVisibleCGBounds: CGRect? = nil
+    ) -> CGPoint {
+        let ov = overlayCGRect.standardized
+        let full = hostDisplayCGBounds.standardized
+        let visible = (hostVisibleCGBounds ?? full).standardized
+        let srcW = max(1.0, sourceSize.width)
+        let srcH = max(1.0, sourceSize.height)
+
+        func solveAxis(
+            ideal: CGFloat,
+            ovMin: CGFloat,
+            ovMax: CGFloat,
+            visMin: CGFloat,
+            visMax: CGFloat,
+            fullMin: CGFloat,
+            fullMax: CGFloat
+        ) -> CGFloat {
+            let safeFullMax = max(fullMin, fullMax)
+            let safeVisMax = max(visMin, visMax)
+            // 1. Prefer keeping source strictly inside BOTH overlay and visible frame (below menu bar, above Dock).
+            if ovMin <= ovMax {
+                let loVis = max(ovMin, visMin)
+                let hiVis = min(ovMax, safeVisMax)
+                if loVis <= hiVis {
+                    return min(max(ideal, loVis), hiVis)
+                }
+                // 2. Fallback: keep strictly inside overlay and below menu bar (allowing Dock overlap).
+                let loFull = max(ovMin, visMin)
+                let hiFull = min(ovMax, safeFullMax)
+                if loFull <= hiFull {
+                    return min(max(ideal, loFull), hiFull)
+                }
+                // 3. Fallback: keep strictly inside overlay and full display bounds.
+                let loAny = max(ovMin, fullMin)
+                let hiAny = min(ovMax, safeFullMax)
+                if loAny <= hiAny {
+                    return min(max(ideal, loAny), hiAny)
+                }
+            }
+            // 4. Overlay is smaller than source or above menu bar: stay safely inside visible/display bounds.
+            return min(max(ideal, visMin), safeVisMax)
+        }
+
+        let idealX = ov.midX - srcW * 0.5
+        let idealY = ov.midY - srcH * 0.5
+
+        let solvedX = solveAxis(
+            ideal: idealX,
+            ovMin: ov.minX,
+            ovMax: ov.maxX - srcW,
+            visMin: visible.minX,
+            visMax: visible.maxX - srcW,
+            fullMin: full.minX,
+            fullMax: full.maxX - srcW
+        )
+        let solvedY = solveAxis(
+            ideal: idealY,
+            ovMin: ov.minY,
+            ovMax: ov.maxY - srcH,
+            visMin: visible.minY,
+            visMax: visible.maxY - srcH,
+            fullMin: full.minY,
+            fullMax: full.maxY - srcH
+        )
+
+        var x = solvedX.rounded()
+        var y = solvedY.rounded()
+        // Prevent 0.5pt rounding from stepping outside overlay when interior room exists.
+        if ov.minX <= ov.maxX - srcW {
+            x = min(max(x, ceil(ov.minX)), floor(ov.maxX - srcW))
+        }
+        if ov.minY <= ov.maxY - srcH {
+            let minYAllowed = max(ceil(ov.minY), ceil(visible.minY))
+            let maxYAllowed = floor(ov.maxY - srcH)
+            if minYAllowed <= maxYAllowed {
+                y = min(max(y, minYAllowed), maxYAllowed)
+            }
+        }
+        return CGPoint(x: x, y: y)
     }
 
     // MARK: - Private Layout & Display Synchronization
@@ -1112,9 +1402,30 @@ public final class OverlayWindowController {
         }
     }
 
+    private func applyOcclusionAndShadowState() {
+        guard let panel else { return }
+        let useAntiOcclusionAlpha = antiOcclusionEnabled && !isEffectiveVRRDirectScanout()
+        panel.isOpaque = true
+        panel.backgroundColor = .black
+        panel.alphaValue = useAntiOcclusionAlpha ? Self.antiOcclusionAlphaValue : 1.0
+        panel.hasShadow = currentPresentationMode.isWindowed
+    }
+
+    private func syncMinimumWindowedBounds(for sourceCGRect: CGRect, displays: [DisplayDescriptor]) {
+        guard let view = overlayView else { return }
+        let normalized = sourceCGRect.standardized
+        let hostDisplay = ScreenGeometry.bestDisplay(forCGRect: normalized, in: displays)
+            ?? ScreenGeometry.primaryDisplay(in: displays)
+        let maxW = hostDisplay?.cocoaFrame.width ?? max(320.0, normalized.width)
+        let maxH = hostDisplay?.cocoaFrame.height ?? max(180.0, normalized.height)
+        view.minimumWindowedWidth = min(maxW, max(320.0, ceil(normalized.width)))
+        view.minimumWindowedHeight = min(maxH, max(180.0, ceil(normalized.height)))
+    }
+
     private func applyVRRModeState() {
         guard let view = overlayView else { return }
         let vrrActive = isEffectiveVRRDirectScanout()
+        applyOcclusionAndShadowState()
         if vrrActive {
             view.hideCursorSprite()
             for child in childOverlayWindows {

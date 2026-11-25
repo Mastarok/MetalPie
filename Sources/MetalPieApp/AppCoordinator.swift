@@ -1,5 +1,7 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
 import Metal
 import MetalFX
@@ -8,6 +10,7 @@ import MetalPieCore
 import MetalPieInput
 import MetalPieShaders
 import Observation
+import os
 
 /// Primary sidebar navigation tabs for MetalPie's native macOS window.
 public enum AppTab: String, CaseIterable, Identifiable, Sendable {
@@ -169,6 +172,23 @@ public final class AppCoordinator {
 
     // MARK: - Internal Coordination State
 
+    private struct SavedSourceWindowOrigin {
+        var windowID: CGWindowID
+        var pid: Int32
+        var cgOrigin: CGPoint
+    }
+
+    private struct SelfRepositionGuard {
+        var windowID: CGWindowID
+        var expectedCGRect: CGRect
+        var expiresAtUptime: TimeInterval
+    }
+
+    private struct CursorCallbackFastPathState: Sendable {
+        var isVRRDirectScanoutActive: Bool = false
+        var registeredCursorOverlayWindowID: CGWindowID? = nil
+    }
+
     private var watchdogToken: RunGuardWatchdog.RecoveryToken?
     private var countdownTask: Task<Void, Never>?
     private var logRefreshTimer: Timer?
@@ -181,6 +201,16 @@ public final class AppCoordinator {
     private var vrrCursorRetryPending: Bool = false
     private var isStartingSession = false
     private var didWarnAccessibilityForCurrentSession = false
+
+    private var savedSourceWindowOrigin: SavedSourceWindowOrigin?
+    private var didUserManuallyMoveWindowedOverlay: Bool = false
+    private var isInteractiveWindowedDragActive: Bool = false
+    private var selfRepositionGuard: SelfRepositionGuard?
+    private var cachedAXWindowRef: (windowID: CGWindowID, pid: Int32, element: AXUIElement)?
+    private var lastAXRepositionTime: CFAbsoluteTime = 0
+    private var isSyncingWindowedSourcePosition: Bool = false
+    private var lastIgnoredOverlayWindowIDs: Set<CGWindowID> = []
+    private let cursorCallbackFastPath = OSAllocatedUnfairLock(initialState: CursorCallbackFastPathState())
 
     private static let vrrDefaultsKey = "com.metalpie.vrrDirectScanoutEnabled"
     private static let nonRetinaDefaultsKey = "com.metalpie.nonRetinaMode"
@@ -357,7 +387,7 @@ public final class AppCoordinator {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.cursorAlignmentMode = mode
-                self.windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(self.collectIgnoredOverlayWindowIDs())
+                self.syncIgnoredOverlayWindowIDsIfNeeded()
                 if mode == .accessibilityRequired,
                    self.isScalingSessionOpen,
                    !self.didWarnAccessibilityForCurrentSession
@@ -395,11 +425,33 @@ public final class AppCoordinator {
         overlayWindowController?.onDrawableMetricsChanged = { [weak self] metrics in
             guard let self else { return }
             self.lastOverlayMetrics = metrics
+            self.cursorCallbackFastPath.withLock { $0.isVRRDirectScanoutActive = metrics.isVRRDirectScanoutActive }
             self.handleOverlayMetricsChanged(metrics)
         }
         overlayWindowController?.onWindowedFrameChanged = { [weak self] cocoaFrame, _, _ in
             guard let self else { return }
             self.updateChromePanelFrames(for: cocoaFrame)
+            if self.isScalingSessionOpen && self.activePresentationMode.isWindowed {
+                if self.isInteractiveWindowedDragActive {
+                    self.didUserManuallyMoveWindowedOverlay = true
+                }
+                self.syncSourceWindowUnderWindowedOverlay(
+                    overlayCocoaFrame: cocoaFrame,
+                    forceImmediate: !self.isInteractiveWindowedDragActive,
+                    onlyIfUncovered: false
+                )
+            }
+        }
+        overlayWindowController?.onWindowedDragStateChanged = { [weak self] isDragging, cocoaFrame in
+            guard let self else { return }
+            self.isInteractiveWindowedDragActive = isDragging
+            if !isDragging && self.isScalingSessionOpen && self.activePresentationMode.isWindowed {
+                self.syncSourceWindowUnderWindowedOverlay(
+                    overlayCocoaFrame: cocoaFrame,
+                    forceImmediate: true,
+                    onlyIfUncovered: false
+                )
+            }
         }
 
         // 5. RenderLoop callbacks (first-frame reveal, 5 Hz telemetry, layout updates)
@@ -968,6 +1020,14 @@ public final class AppCoordinator {
         isProfilerHUDActive = resolvedProfile.showProfilerHUD
         isToolbarVisibleOverride = nil
         didWarnAccessibilityForCurrentSession = false
+        savedSourceWindowOrigin = nil
+        didUserManuallyMoveWindowedOverlay = false
+        isInteractiveWindowedDragActive = false
+        selfRepositionGuard = nil
+        cachedAXWindowRef = nil
+        lastAXRepositionTime = 0
+        lastIgnoredOverlayWindowIDs.removeAll()
+        cursorCallbackFastPath.withLock { $0 = CursorCallbackFastPathState() }
         telemetry.state = .starting
         telemetry.targetWindowName = window.displayName
 
@@ -988,12 +1048,27 @@ public final class AppCoordinator {
         // Prepare overlay panel (hidden until first upscaled frame presents — zero black flash!).
         overlayController.isVRRDirectScanoutEnabled = vrrDirectScanoutEnabled
         overlayController.isWindowedClickThrough = isWindowedClickThrough
-        let metrics = overlayController.prepareOverlay(
+        var metrics = overlayController.prepareOverlay(
             sourceWindow: window,
             profile: resolvedProfile,
             presentationOverride: resolvedPresentation
         )
         lastOverlayMetrics = metrics
+        let initialVRR = metrics.isVRRDirectScanoutActive
+        cursorCallbackFastPath.withLock { $0.isVRRDirectScanoutActive = initialVRR }
+
+        // In windowed mode, if the source window pokes outside the overlay (e.g., near a display
+        // edge or straddling monitors), reposition it cleanly underneath the scaled overlay.
+        if resolvedPresentation.isWindowed {
+            syncSourceWindowUnderWindowedOverlay(
+                overlayCocoaFrame: metrics.cocoaFrame,
+                forceImmediate: true,
+                onlyIfUncovered: true
+            )
+            metrics = overlayController.currentDrawableMetrics()
+            lastOverlayMetrics = metrics
+        }
+        let sessionWindow = activeWindow ?? window
 
         guard let metalLayer = overlayController.metalLayer else {
             overlayController.close()
@@ -1002,7 +1077,7 @@ public final class AppCoordinator {
 
         let effectiveProfile = effectiveProfileForSession(resolvedProfile)
         let renderConfig = RenderSessionConfiguration(
-            targetWindowName: window.displayName,
+            targetWindowName: sessionWindow.displayName,
             profile: effectiveProfile,
             scalingMode: resolvedMode,
             overlayMetrics: metrics,
@@ -1021,7 +1096,7 @@ public final class AppCoordinator {
         do {
             captureEngine.nonRetinaMode = nonRetinaMode
             try await captureEngine.start(
-                window: window,
+                window: sessionWindow,
                 profile: resolvedProfile,
                 scalingMode: resolvedMode,
                 onFrame: { [weak renderLoop] frame in
@@ -1036,6 +1111,7 @@ public final class AppCoordinator {
         } catch {
             renderLoop.stop()
             overlayController.close()
+            restoreSavedSourceWindowOriginIfNeeded()
             activeWindow = nil
             activeProfile = nil
             activeScalingMode = nil
@@ -1044,16 +1120,18 @@ public final class AppCoordinator {
         }
 
         // Wire cursor alignment + VRR external compositor mode
-        configureCursorForActiveSession(window: window, profile: resolvedProfile, metrics: metrics, layout: nil)
+        configureCursorForActiveSession(window: sessionWindow, profile: resolvedProfile, metrics: metrics, layout: nil)
 
         // Start WindowLifecycleWatcher tracking + 3D Game Mode overlap exclusion
+        let initialIgnoredIDs = collectIgnoredOverlayWindowIDs()
+        lastIgnoredOverlayWindowIDs = initialIgnoredIDs
         windowLifecycleWatcher.setThreeDGameMode(
             resolvedProfile.threeDGameMode,
-            ignoredOverlayWindowIDs: collectIgnoredOverlayWindowIDs()
+            ignoredOverlayWindowIDs: initialIgnoredIDs
         )
-        windowLifecycleWatcher.startObserving(trackedWindowID: window.windowID) { _ in }
+        windowLifecycleWatcher.startObserving(trackedWindowID: sessionWindow.windowID) { _ in }
 
-        autoScaleController.setCurrentlyScaling(window: window)
+        autoScaleController.setCurrentlyScaling(window: sessionWindow)
         watchdog.setScalingActive(true)
 
         if cursorAlignmentMode == .accessibilityRequired && !didWarnAccessibilityForCurrentSession {
@@ -1085,6 +1163,18 @@ public final class AppCoordinator {
         await screenCaptureEngine?.stop()
         renderLoopController?.stop()
         overlayWindowController?.close()
+
+        // If we shifted the source window for edge-coverage without the user manually moving
+        // the windowed overlay, restore its original position cleanly on stop.
+        restoreSavedSourceWindowOriginIfNeeded()
+        savedSourceWindowOrigin = nil
+        didUserManuallyMoveWindowedOverlay = false
+        isInteractiveWindowedDragActive = false
+        selfRepositionGuard = nil
+        cachedAXWindowRef = nil
+        lastAXRepositionTime = 0
+        lastIgnoredOverlayWindowIDs.removeAll()
+        cursorCallbackFastPath.withLock { $0 = CursorCallbackFastPathState() }
 
         autoScaleController.setCurrentlyScaling(window: nil)
         if isManual, let wid = stoppedWindowID {
@@ -1138,19 +1228,32 @@ public final class AppCoordinator {
             : .fullscreen
 
         activePresentationMode = nextMode
-        let metrics = overlayController.setPresentationMode(nextMode, multiMonitorMode: profile.multiMonitorMode)
+        var metrics = overlayController.setPresentationMode(nextMode, multiMonitorMode: profile.multiMonitorMode)
         lastOverlayMetrics = metrics
+        let isVRRActive = metrics.isVRRDirectScanoutActive
+        cursorCallbackFastPath.withLock { $0.isVRRDirectScanoutActive = isVRRActive }
+
+        if nextMode.isWindowed {
+            syncSourceWindowUnderWindowedOverlay(
+                overlayCocoaFrame: metrics.cocoaFrame,
+                forceImmediate: true,
+                onlyIfUncovered: true
+            )
+            metrics = overlayController.currentDrawableMetrics()
+            lastOverlayMetrics = metrics
+        }
+        let syncedWindow = activeWindow ?? window
 
         let effectiveProfile = effectiveProfileForSession(profile)
         renderLoopController?.updateConfiguration(RenderSessionConfiguration(
-            targetWindowName: window.displayName,
+            targetWindowName: syncedWindow.displayName,
             profile: effectiveProfile,
             scalingMode: mode,
             overlayMetrics: metrics,
             vrrDirectScanout: metrics.isVRRDirectScanoutActive
         ))
 
-        configureCursorForActiveSession(window: window, profile: effectiveProfile, metrics: metrics, layout: lastLayout)
+        configureCursorForActiveSession(window: syncedWindow, profile: effectiveProfile, metrics: metrics, layout: lastLayout)
         syncOverlayChromeVisibility(profile: effectiveProfile, metrics: metrics)
 
         showToast(
@@ -1261,29 +1364,44 @@ public final class AppCoordinator {
             displaySyncEnabled: !updatedProfile.capture.lowLatencyPresent || updatedProfile.frameGen.enabled
         )
 
-        let metrics = overlayController.currentDrawableMetrics()
+        var metrics = overlayController.currentDrawableMetrics()
         lastOverlayMetrics = metrics
+        let isVRRActive = metrics.isVRRDirectScanoutActive
+        cursorCallbackFastPath.withLock { $0.isVRRDirectScanoutActive = isVRRActive }
+
+        if activePresentationMode.isWindowed {
+            syncSourceWindowUnderWindowedOverlay(
+                overlayCocoaFrame: metrics.cocoaFrame,
+                forceImmediate: true,
+                onlyIfUncovered: true
+            )
+            metrics = overlayController.currentDrawableMetrics()
+            lastOverlayMetrics = metrics
+        }
+        let syncedWindow = activeWindow ?? window
 
         let effectiveProfile = effectiveProfileForSession(updatedProfile)
 
         try? await captureEngine.updateConfiguration(
-            window: window,
+            window: syncedWindow,
             profile: effectiveProfile,
             scalingMode: updatedMode
         )
 
         renderLoop.updateConfiguration(RenderSessionConfiguration(
-            targetWindowName: window.displayName,
+            targetWindowName: syncedWindow.displayName,
             profile: effectiveProfile,
             scalingMode: updatedMode,
             overlayMetrics: metrics,
             vrrDirectScanout: metrics.isVRRDirectScanoutActive
         ))
 
-        configureCursorForActiveSession(window: window, profile: effectiveProfile, metrics: metrics, layout: lastLayout)
+        configureCursorForActiveSession(window: syncedWindow, profile: effectiveProfile, metrics: metrics, layout: lastLayout)
+        let ignoredIDs = collectIgnoredOverlayWindowIDs()
+        lastIgnoredOverlayWindowIDs = ignoredIDs
         windowLifecycleWatcher.setThreeDGameMode(
             effectiveProfile.threeDGameMode,
-            ignoredOverlayWindowIDs: collectIgnoredOverlayWindowIDs()
+            ignoredOverlayWindowIDs: ignoredIDs
         )
         syncOverlayChromeVisibility(profile: effectiveProfile, metrics: metrics)
     }
@@ -1477,6 +1595,9 @@ public final class AppCoordinator {
             durationSeconds: durationSeconds,
             anchorScreenFrame: anchorScreenFrame ?? lastOverlayMetrics?.cocoaFrame
         )
+        if isScalingSessionOpen {
+            syncIgnoredOverlayWindowIDsIfNeeded()
+        }
     }
 
     private func presentAccessibilityRequiredToast(anchorScreenFrame: CGRect?) {
@@ -1538,9 +1659,10 @@ public final class AppCoordinator {
         overlayController.revealAfterFirstFrame()
         let metrics = overlayController.currentDrawableMetrics()
         lastOverlayMetrics = metrics
+        cursorCallbackFastPath.withLock { $0.isVRRDirectScanoutActive = metrics.isVRRDirectScanoutActive }
         telemetry.state = .running
         syncOverlayChromeVisibility(profile: profile, metrics: metrics)
-        windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(collectIgnoredOverlayWindowIDs())
+        syncIgnoredOverlayWindowIDsIfNeeded()
     }
 
     private func handleTelemetryUpdate(_ snapshot: SessionTelemetry) {
@@ -1591,7 +1713,7 @@ public final class AppCoordinator {
         )
         cursorController.update(configuration: cursorConfig)
         cursorAlignmentMode = cursorController.alignmentMode
-        windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(collectIgnoredOverlayWindowIDs())
+        syncIgnoredOverlayWindowIDsIfNeeded()
     }
 
     private func handleOverlayMetricsChanged(_ metrics: OverlayDrawableMetrics) {
@@ -1626,9 +1748,17 @@ public final class AppCoordinator {
         switch event {
         case .windowBoundsChanged(let newBounds):
             guard isScalingSessionOpen, var window = activeWindow else { return }
+            let suppressWindowedOverlayMove = shouldSuppressOverlayUpdateForSelfReposition(
+                windowID: window.windowID,
+                newBounds: newBounds
+            )
             window.cgBounds = newBounds
             activeWindow = window
-            overlayWindowController?.updateSourceWindowGeometry(newBounds, windowID: window.windowID)
+            overlayWindowController?.updateSourceWindowGeometry(
+                newBounds,
+                windowID: window.windowID,
+                repositionWindowedOverlay: !suppressWindowedOverlayMove
+            )
             if let profile = activeProfile, let metrics = lastOverlayMetrics {
                 cursorController.update(configuration: buildCursorConfiguration(
                     window: window,
@@ -1735,22 +1865,42 @@ public final class AppCoordinator {
             telemetry.state = .running
 
         case .targetFrameChanged(let updatedWindow, let newBounds, _):
+            let previousBounds = activeWindow?.cgBounds
+            let suppressWindowedOverlayMove = shouldSuppressOverlayUpdateForSelfReposition(
+                windowID: updatedWindow.windowID,
+                newBounds: newBounds
+            )
+            let sizeUnchanged: Bool
+            if let prev = previousBounds {
+                sizeUnchanged = abs(prev.width - newBounds.width) < 1.0 && abs(prev.height - newBounds.height) < 1.0
+            } else {
+                sizeUnchanged = false
+            }
             activeWindow = updatedWindow
-            overlayWindowController?.updateSourceWindowGeometry(newBounds, windowID: updatedWindow.windowID)
+            overlayWindowController?.updateSourceWindowGeometry(
+                newBounds,
+                windowID: updatedWindow.windowID,
+                repositionWindowedOverlay: !suppressWindowedOverlayMove
+            )
             if let profile = activeProfile, let mode = activeScalingMode {
-                try? await screenCaptureEngine?.updateConfiguration(
-                    window: updatedWindow,
-                    profile: profile,
-                    scalingMode: mode
-                )
+                let effectiveProfile = effectiveProfileForSession(profile)
+                // Avoid unnecessary SCShareableContent IPC churn during our own pure-translation AX drag moves.
+                if !(suppressWindowedOverlayMove && sizeUnchanged) {
+                    try? await screenCaptureEngine?.updateConfiguration(
+                        window: updatedWindow,
+                        profile: effectiveProfile,
+                        scalingMode: mode
+                    )
+                }
                 if let metrics = lastOverlayMetrics {
                     let cursorConfig = buildCursorConfiguration(
                         window: updatedWindow,
-                        profile: profile,
+                        profile: effectiveProfile,
                         metrics: metrics,
                         layout: lastLayout
                     )
                     cursorController.update(configuration: cursorConfig)
+                    syncVRRCursorSnapshotIfNeeded()
                 }
             }
 
@@ -1809,6 +1959,7 @@ public final class AppCoordinator {
         layout: ScalingLayoutResult?
     ) {
         let isVRR = metrics.isVRRDirectScanoutActive
+        cursorCallbackFastPath.withLock { $0.isVRRDirectScanoutActive = isVRR }
         cursorController.setPresentationMode(isVRR ? .externalCompositor : .overlayLayer)
 
         let baseLevel = overlayWindowController?.panel?.level ?? OverlayWindowController.normalOverlayLevel
@@ -1826,16 +1977,26 @@ public final class AppCoordinator {
             cursorController.update(configuration: cursorConfig)
         } else {
             try? cursorController.start(configuration: cursorConfig) { [weak self] _ in
+                guard let self else { return }
+                let currentCursorWID = self.cursorController.cursorOverlayWindowID
+                let needsMainActorWork = self.cursorCallbackFastPath.withLock { fast -> Bool in
+                    let cursorWIDChanged = (currentCursorWID != nil && currentCursorWID != fast.registeredCursorOverlayWindowID)
+                    if cursorWIDChanged {
+                        fast.registeredCursorOverlayWindowID = currentCursorWID
+                    }
+                    return fast.isVRRDirectScanoutActive || cursorWIDChanged
+                }
+                guard needsMainActorWork else { return }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.syncVRRCursorSnapshotIfNeeded()
-                    self.windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(self.collectIgnoredOverlayWindowIDs())
+                    self.syncIgnoredOverlayWindowIDsIfNeeded()
                 }
             }
         }
 
         cursorAlignmentMode = cursorController.alignmentMode
-        windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(collectIgnoredOverlayWindowIDs())
+        syncIgnoredOverlayWindowIDsIfNeeded()
 
         if !isVRR {
             renderLoopController?.updateGPUCursorSprite(nil)
@@ -2019,7 +2180,268 @@ public final class AppCoordinator {
             profilerHUDPanel.hide()
         }
 
-        windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(collectIgnoredOverlayWindowIDs())
+        syncIgnoredOverlayWindowIDsIfNeeded()
+    }
+
+    // MARK: - Windowed Mode Single-Window AX Synchronization
+
+    private func syncSourceWindowUnderWindowedOverlay(
+        overlayCocoaFrame: CGRect,
+        forceImmediate: Bool,
+        onlyIfUncovered: Bool
+    ) {
+        guard !isSyncingWindowedSourcePosition,
+              isScalingSessionOpen,
+              activePresentationMode.isWindowed,
+              var window = activeWindow,
+              let overlayController = overlayWindowController
+        else {
+            return
+        }
+
+        isSyncingWindowedSourcePosition = true
+        defer { isSyncingWindowedSourcePosition = false }
+
+        if displays.isEmpty {
+            refreshDisplays()
+        }
+        let currentDisplays = displays.isEmpty ? WindowEnumerator.enumerateDisplaysOnMain() : displays
+        let overlayCG = ScreenGeometry.cocoaToCG(rect: overlayCocoaFrame, displays: currentDisplays).standardized
+        let isCurrentlyCovered = OverlayWindowController.overlayCoversSource(
+            overlayRect: overlayCG,
+            sourceRect: window.cgBounds
+        )
+        if onlyIfUncovered && isCurrentlyCovered {
+            return
+        }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        // Throttle live drag AX IPC to ~60 Hz while always allowing immediate moves when source would peek out.
+        if !forceImmediate && isCurrentlyCovered && (now - lastAXRepositionTime) < 0.016 {
+            return
+        }
+
+        let hostDisplay = ScreenGeometry.bestDisplay(forCocoaRect: overlayCocoaFrame, in: currentDisplays)
+            ?? ScreenGeometry.primaryDisplay(in: currentDisplays)
+        let hostCGBounds = hostDisplay?.cgBounds ?? overlayCG
+        let hostScreenCocoa = hostDisplay?.cocoaFrame
+            ?? NSScreen.main?.frame
+            ?? overlayCocoaFrame
+        let visibleCGBounds: CGRect? = hostDisplay.flatMap { descriptor in
+            WindowEnumerator.nsScreen(for: descriptor.id).map { screen in
+                ScreenGeometry.cocoaToCG(rect: screen.visibleFrame, displays: currentDisplays)
+            }
+        }
+
+        let targetOrigin = OverlayWindowController.computeHiddenSourceWindowCGOrigin(
+            sourceSize: window.cgBounds.size,
+            overlayCGRect: overlayCG,
+            hostDisplayCGBounds: hostCGBounds,
+            hostVisibleCGBounds: visibleCGBounds
+        )
+
+        if AXIsProcessTrusted() {
+            let needsMove = abs(targetOrigin.x - window.cgBounds.origin.x) >= 1.0
+                || abs(targetOrigin.y - window.cgBounds.origin.y) >= 1.0
+            if needsMove {
+                if savedSourceWindowOrigin == nil {
+                    savedSourceWindowOrigin = SavedSourceWindowOrigin(
+                        windowID: window.windowID,
+                        pid: window.pid,
+                        cgOrigin: window.cgBounds.origin
+                    )
+                }
+
+                let expectedRect = CGRect(origin: targetOrigin, size: window.cgBounds.size)
+                selfRepositionGuard = SelfRepositionGuard(
+                    windowID: window.windowID,
+                    expectedCGRect: expectedRect,
+                    expiresAtUptime: ProcessInfo.processInfo.systemUptime + 0.35
+                )
+
+                if let actualOrigin = setAXWindowOrigin(
+                    windowID: window.windowID,
+                    pid: window.pid,
+                    cgOrigin: targetOrigin
+                ) {
+                    lastAXRepositionTime = now
+                    let actualRect = CGRect(origin: actualOrigin, size: window.cgBounds.size)
+                    selfRepositionGuard = SelfRepositionGuard(
+                        windowID: window.windowID,
+                        expectedCGRect: actualRect,
+                        expiresAtUptime: ProcessInfo.processInfo.systemUptime + 0.35
+                    )
+                    window.cgBounds = actualRect
+                    activeWindow = window
+
+                    // Sync OverlayWindowController's stored source bounds WITHOUT triggering a feedback move.
+                    overlayController.updateSourceWindowGeometry(
+                        actualRect,
+                        windowID: window.windowID,
+                        repositionWindowedOverlay: false
+                    )
+
+                    // Update cursor mapping immediately so clicks & hover stay 100% aligned with moved source!
+                    if let profile = activeProfile {
+                        let metrics = overlayController.currentDrawableMetrics()
+                        lastOverlayMetrics = metrics
+                        cursorController.update(configuration: buildCursorConfiguration(
+                            window: window,
+                            profile: effectiveProfileForSession(profile),
+                            metrics: metrics,
+                            layout: lastLayout
+                        ))
+                        syncVRRCursorSnapshotIfNeeded()
+                    }
+                }
+            }
+        }
+
+        // If macOS clamped the source window (e.g. menu bar) OR Accessibility permission is unavailable
+        // and the source window still peeks outside the overlay, keep the overlay covering the source cleanly.
+        if forceImmediate && !isInteractiveWindowedDragActive {
+            let latestSourceCG = activeWindow?.cgBounds ?? window.cgBounds
+            let latestOverlayCocoa = overlayController.panel?.frame ?? overlayCocoaFrame
+            let latestOverlayCG = ScreenGeometry.cocoaToCG(rect: latestOverlayCocoa, displays: currentDisplays)
+            if !OverlayWindowController.overlayCoversSource(overlayRect: latestOverlayCG, sourceRect: latestSourceCG) {
+                let sourceCocoa = ScreenGeometry.cgToCocoa(rect: latestSourceCG, displays: currentDisplays)
+                let adjustedCocoa = OverlayWindowController.ensureOverlayCoversSource(
+                    overlayCocoaRect: latestOverlayCocoa,
+                    sourceCocoaRect: sourceCocoa,
+                    hostScreenCocoa: hostScreenCocoa
+                )
+                overlayController.setWindowedOverlayCocoaFrame(adjustedCocoa)
+                updateChromePanelFrames(for: adjustedCocoa)
+            }
+        }
+    }
+
+    private func shouldSuppressOverlayUpdateForSelfReposition(
+        windowID: CGWindowID,
+        newBounds: CGRect
+    ) -> Bool {
+        guard activePresentationMode.isWindowed else { return false }
+        if isInteractiveWindowedDragActive {
+            return true
+        }
+        guard let activeGuard = selfRepositionGuard else { return false }
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        if nowUptime >= activeGuard.expiresAtUptime {
+            selfRepositionGuard = nil
+            return false
+        }
+        guard activeGuard.windowID == windowID else { return false }
+        let sizeUnchanged = abs(newBounds.width - activeGuard.expectedCGRect.width) < 1.5
+            && abs(newBounds.height - activeGuard.expectedCGRect.height) < 1.5
+        guard sizeUnchanged else {
+            // Genuine external resize must immediately update the windowed overlay!
+            return false
+        }
+        let originDelta = hypot(
+            newBounds.origin.x - activeGuard.expectedCGRect.origin.x,
+            newBounds.origin.y - activeGuard.expectedCGRect.origin.y
+        )
+        if originDelta <= 12.0 {
+            return true
+        }
+        if let overlayCG = lastOverlayMetrics?.cgFrame,
+           OverlayWindowController.overlayCoversSource(overlayRect: overlayCG, sourceRect: newBounds)
+        {
+            return true
+        }
+        return false
+    }
+
+    private func restoreSavedSourceWindowOriginIfNeeded() {
+        guard let saved = savedSourceWindowOrigin,
+              !didUserManuallyMoveWindowedOverlay,
+              AXIsProcessTrusted()
+        else {
+            return
+        }
+        _ = setAXWindowOrigin(windowID: saved.windowID, pid: saved.pid, cgOrigin: saved.cgOrigin)
+    }
+
+    @discardableResult
+    private func setAXWindowOrigin(
+        windowID: CGWindowID,
+        pid: Int32,
+        cgOrigin: CGPoint
+    ) -> CGPoint? {
+        guard let axWin = resolveAXWindowElement(windowID: windowID, pid: pid) else {
+            return nil
+        }
+
+        var point = cgOrigin
+        guard let axPoint = AXValueCreate(.cgPoint, &point) else {
+            return nil
+        }
+
+        var err = AXUIElementSetAttributeValue(axWin, kAXPositionAttribute as CFString, axPoint)
+        if err != .success {
+            // Cached AXUIElement may be stale; re-resolve once and retry.
+            cachedAXWindowRef = nil
+            guard let refreshed = resolveAXWindowElement(windowID: windowID, pid: pid) else {
+                return nil
+            }
+            err = AXUIElementSetAttributeValue(refreshed, kAXPositionAttribute as CFString, axPoint)
+            guard err == .success else { return nil }
+            return readAXWindowOrigin(refreshed) ?? cgOrigin
+        }
+
+        return readAXWindowOrigin(axWin) ?? cgOrigin
+    }
+
+    private func resolveAXWindowElement(windowID: CGWindowID, pid: Int32) -> AXUIElement? {
+        if let cached = cachedAXWindowRef, cached.windowID == windowID, cached.pid == pid {
+            return cached.element
+        }
+
+        typealias AXGetWindowFn = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+        let rtldDefault = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let sym = dlsym(rtldDefault, "_AXUIElementGetWindow") else { return nil }
+        let getWindowID = unsafeBitCast(sym, to: AXGetWindowFn.self)
+
+        let appElem = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let axWindows = windowsRef as? [AXUIElement]
+        else {
+            return nil
+        }
+
+        for axWin in axWindows {
+            var candidateID: CGWindowID = 0
+            if getWindowID(axWin, &candidateID) == .success && candidateID == windowID {
+                cachedAXWindowRef = (windowID, pid, axWin)
+                return axWin
+            }
+        }
+        return nil
+    }
+
+    private func readAXWindowOrigin(_ axWin: AXUIElement) -> CGPoint? {
+        var posRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axWin, kAXPositionAttribute as CFString, &posRef) == .success,
+              let posRef,
+              CFGetTypeID(posRef) == AXValueGetTypeID()
+        else {
+            return nil
+        }
+        let axVal = unsafeDowncast(posRef, to: AXValue.self)
+        var pt = CGPoint.zero
+        guard AXValueGetValue(axVal, .cgPoint, &pt) else {
+            return nil
+        }
+        return pt
+    }
+
+    private func syncIgnoredOverlayWindowIDsIfNeeded(force: Bool = false) {
+        let current = collectIgnoredOverlayWindowIDs()
+        if force || current != lastIgnoredOverlayWindowIDs {
+            lastIgnoredOverlayWindowIDs = current
+            windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(current)
+        }
     }
 
     private func syncToolbarState() {

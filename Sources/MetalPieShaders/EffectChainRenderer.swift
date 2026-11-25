@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import IOSurface
 import Metal
 import MetalFX
 import MetalPieCore
@@ -110,7 +111,7 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
     public let videoToolboxML: VideoToolboxMLProcessor
 
     private let utilityQueue: any MTLCommandQueue
-    private let duplicateFlagBuffer: any MTLBuffer
+    private let duplicateFlagRing: [any MTLBuffer]
     private let dummyOverlayTexture: any MTLTexture
 
     // MARK: - Thread-Safe Mutable State
@@ -120,10 +121,15 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         var cachedFinalOutputTexture: (any MTLTexture)?
         var cachedOutputSize: PixelSize = .zero
         var cachedSignature: String = ""
-        // Magpie Dynamic cadence state machine
-        var checkRemaining: Int = 16
-        var nextSkipCount: Int = 1
-        var skipRemaining: Int = 0
+        /// Zero-stall IOSurface identity + kernel modification seed from the last rendered source frame.
+        var lastSourceSurfaceID: IOSurfaceID = 0
+        var lastSourceSurfaceSeed: UInt32 = 0
+        var lastSourceWidth: Int = 0
+        var lastSourceHeight: Int = 0
+        var lastSourcePixelFormatRaw: UInt = 0
+        /// Non-blocking async GPU pixel-diff result from the most recently completed `.always` check.
+        var lastAsyncDuplicateDetected: Bool = false
+        var asyncFlagRingIndex: Int = 0
     }
 
     private struct RendererState {
@@ -164,11 +170,16 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             texturePool: resolvedPool
         )
 
-        guard let flagBuf = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
-            throw EngineError.metalDeviceUnavailable
+        var flagRing: [any MTLBuffer] = []
+        flagRing.reserveCapacity(4)
+        for i in 0..<4 {
+            guard let flagBuf = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared) else {
+                throw EngineError.metalDeviceUnavailable
+            }
+            flagBuf.label = "MetalPie_DuplicateFrameFlag_\(i)"
+            flagRing.append(flagBuf)
         }
-        flagBuf.label = "MetalPie_DuplicateFrameFlag"
-        self.duplicateFlagBuffer = flagBuf
+        self.duplicateFlagRing = flagRing
 
         // 1x1 transparent RGBA8 texture bound to unused cursor/HUD slots during present.
         let dummyDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 1, height: 1, mipmapped: false)
@@ -213,6 +224,12 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
     /// Most recent pass timings measured after actual GPU command buffer completion.
     public var lastCompletedPassTimings: [PassTiming] {
         state.withLockUnchecked { $0.lastCompletedPassTimings }
+    }
+
+    /// Result of the most recently completed non-blocking async GPU duplicate-frame comparison
+    /// (updated inside `commandBuffer.addCompletedHandler` with zero CPU stalls).
+    public var lastAsyncDuplicateFrameDetected: Bool {
+        state.withLockUnchecked { $0.duplicate.lastAsyncDuplicateDetected }
     }
 
     // MARK: - EffectRendering Conformance
@@ -265,15 +282,17 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
 
         var passRecords: [(id: String, name: String, colorHex: String, weight: Double)] = []
 
-        // 0. GPU Duplicate Frame Detection (zero CPU readback, works with crop & demagnify too!)
+        // 0. Zero-Stall Duplicate Frame Detection (NEVER calls waitUntilCompleted() on live render path!)
+        // - Fast O(1) IOSurface (ID, seed) check skips unchanged surfaces instantaneously with zero GPU stalls.
+        // - ScreenCaptureKit already drops `.idle` frames via `SCFrameStatus != .complete`, so `.dynamic`
+        //   never performs blocking GPU readbacks or redundant per-frame source blits.
+        // - Explicit `.always` additionally schedules a non-blocking GPU `duplicateFrameCheck` inside `cb`.
         let activeDemag: DemagnifyMode = allowLiveStateMutation ? state.withLockUnchecked { $0.demagnifyMode } : .none
         let modeSignature = makeModeSignature(scalingMode: scalingMode, layout: layout, isHDR: context.isHDR, demagnify: activeDemag)
         if allowLiveStateMutation,
            context.duplicateFrameMode != .never,
-           let cachedOutput = try checkDuplicateFrameOnGPU(
+           let cachedOutput = checkDuplicateFrameZeroStall(
                currentSource: context.sourceTexture,
-               queue: cb.commandQueue,
-               mode: context.duplicateFrameMode,
                signature: modeSignature
            )
         {
@@ -300,9 +319,18 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
             )
         }
 
-        // Record current source texture for next frame's GPU duplicate check.
-        if allowLiveStateMutation, context.duplicateFrameMode != .never {
-            updatePreviousSourceCache(from: context.sourceTexture, commandBuffer: cb)
+        // For explicit `.always` mode on non-identical surfaces, run non-blocking GPU duplicate check inside `cb`
+        // (zero `waitUntilCompleted()`) and update previous source cache for next comparison.
+        if allowLiveStateMutation {
+            recordSourceSurfaceFingerprint(context.sourceTexture)
+            if context.duplicateFrameMode == .always {
+                try encodeAsyncDuplicateCheckInCommandBuffer(
+                    currentSource: context.sourceTexture,
+                    signature: modeSignature,
+                    commandBuffer: cb
+                )
+                updatePreviousSourceCache(from: context.sourceTexture, commandBuffer: cb)
+            }
         }
 
         // 1. Optional 1x Non-Retina Demagnification
@@ -2847,37 +2875,79 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         }
     }
 
-    // MARK: - GPU Duplicate Frame Detection & Output Cache
+    // MARK: - Zero-Stall Duplicate Frame Detection & Output Cache
 
-    private func checkDuplicateFrameOnGPU(
+    /// Instant O(1) duplicate check using kernel-tracked IOSurface `(ID, seed)` + layout signature.
+    /// Zero GPU stalls, zero `waitUntilCompleted()`, zero extra command buffers.
+    private func checkDuplicateFrameZeroStall(
         currentSource: any MTLTexture,
-        queue: any MTLCommandQueue,
-        mode: DuplicateFrameMode,
         signature: String
-    ) throws -> (texture: any MTLTexture, size: PixelSize)? {
-        let candidate: (prev: any MTLTexture, cachedOut: any MTLTexture, cachedSize: PixelSize, shouldCheck: Bool)? = state.withLockUnchecked { s in
+    ) -> (texture: any MTLTexture, size: PixelSize)? {
+        guard let surface = currentSource.iosurface else {
+            return nil
+        }
+        let surfaceID = IOSurfaceGetID(surface)
+        let surfaceSeed = IOSurfaceGetSeed(surface)
+        guard surfaceID != 0 else { return nil }
+
+        return state.withLockUnchecked { s in
             guard s.duplicate.cachedSignature == signature,
-                  let prev = s.duplicate.prevCroppedTexture,
                   let cachedOut = s.duplicate.cachedFinalOutputTexture,
-                  prev.width == currentSource.width,
-                  prev.height == currentSource.height,
-                  prev.pixelFormat == currentSource.pixelFormat
+                  s.duplicate.lastSourceSurfaceID == surfaceID,
+                  s.duplicate.lastSourceSurfaceSeed == surfaceSeed,
+                  s.duplicate.lastSourceWidth == currentSource.width,
+                  s.duplicate.lastSourceHeight == currentSource.height,
+                  s.duplicate.lastSourcePixelFormatRaw == currentSource.pixelFormat.rawValue
             else {
                 return nil
             }
+            s.duplicate.lastAsyncDuplicateDetected = true
+            return (cachedOut, s.duplicate.cachedOutputSize)
+        }
+    }
 
-            if mode == .dynamic {
-                if s.duplicate.skipRemaining > 0 {
-                    s.duplicate.skipRemaining -= 1
-                    return (prev, cachedOut, s.duplicate.cachedOutputSize, false)
-                }
+    private func recordSourceSurfaceFingerprint(_ source: any MTLTexture) {
+        let surfaceID: IOSurfaceID
+        let surfaceSeed: UInt32
+        if let surface = source.iosurface {
+            surfaceID = IOSurfaceGetID(surface)
+            surfaceSeed = IOSurfaceGetSeed(surface)
+        } else {
+            surfaceID = 0
+            surfaceSeed = 0
+        }
+        state.withLockUnchecked { s in
+            s.duplicate.lastSourceSurfaceID = surfaceID
+            s.duplicate.lastSourceSurfaceSeed = surfaceSeed
+            s.duplicate.lastSourceWidth = source.width
+            s.duplicate.lastSourceHeight = source.height
+            s.duplicate.lastSourcePixelFormatRaw = source.pixelFormat.rawValue
+        }
+    }
+
+    /// Non-blocking in-command-buffer GPU pixel diff for `.always` mode (zero `waitUntilCompleted()`).
+    private func encodeAsyncDuplicateCheckInCommandBuffer(
+        currentSource: any MTLTexture,
+        signature: String,
+        commandBuffer: any MTLCommandBuffer
+    ) throws {
+        let candidate: (prev: any MTLTexture, flagBuf: any MTLBuffer)? = state.withLockUnchecked { s in
+            guard s.duplicate.cachedSignature == signature,
+                  let prev = s.duplicate.prevCroppedTexture,
+                  prev.width == currentSource.width,
+                  prev.height == currentSource.height,
+                  prev.pixelFormat == currentSource.pixelFormat,
+                  !duplicateFlagRing.isEmpty
+            else {
+                s.duplicate.lastAsyncDuplicateDetected = false
+                return nil
             }
-            return (prev, cachedOut, s.duplicate.cachedOutputSize, true)
+            let idx = s.duplicate.asyncFlagRingIndex % duplicateFlagRing.count
+            s.duplicate.asyncFlagRingIndex = (idx + 1) % duplicateFlagRing.count
+            return (prev, duplicateFlagRing[idx])
         }
 
-        guard let candidate, candidate.shouldCheck else {
-            return nil
-        }
+        guard let candidate else { return }
 
         struct DuplicateCheckUniforms {
             var tolerance: Float
@@ -2887,44 +2957,38 @@ public final class EffectChainRenderer: EffectRendering, @unchecked Sendable {
         }
         var u = DuplicateCheckUniforms(tolerance: 1.0 / 512.0)
 
-        duplicateFlagBuffer.contents().storeBytes(of: UInt32(0), as: UInt32.self)
-        let pipe = try shaderManager.computePipeline(library: "Common", function: "duplicateFrameCheck")
-        guard let checkCB = queue.makeCommandBuffer(),
-              let enc = checkCB.makeComputeCommandEncoder()
-        else {
-            return nil
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.label = "ClearDuplicateFlag"
+            blit.fill(buffer: candidate.flagBuf, range: 0..<MemoryLayout<UInt32>.stride, value: 0)
+            blit.endEncoding()
         }
-        checkCB.label = "MetalPie_DuplicateFrameCheck"
-        enc.setComputePipelineState(pipe)
-        enc.setTexture(currentSource, index: 0)
-        enc.setTexture(candidate.prev, index: 1)
-        enc.setBuffer(duplicateFlagBuffer, offset: 0, index: 0)
-        enc.setBytes(&u, length: MemoryLayout<DuplicateCheckUniforms>.stride, index: 1)
-        let quadW = max(1, (currentSource.width + 1) / 2)
-        let quadH = max(1, (currentSource.height + 1) / 2)
-        dispatch2D(encoder: enc, pipeline: pipe, width: quadW, height: quadH)
-        enc.endEncoding()
-        checkCB.commit()
-        checkCB.waitUntilCompleted()
 
-        let changed = duplicateFlagBuffer.contents().load(as: UInt32.self) != 0
-        state.withLockUnchecked { s in
-            if !changed {
-                // Identical frame: immediately reset Dynamic cadence to tight checking.
-                s.duplicate.checkRemaining = 16
-                s.duplicate.nextSkipCount = 1
-                s.duplicate.skipRemaining = 0
-            } else if mode == .dynamic {
-                s.duplicate.checkRemaining -= 1
-                if s.duplicate.checkRemaining <= 0 {
-                    s.duplicate.skipRemaining = s.duplicate.nextSkipCount
-                    s.duplicate.nextSkipCount = min(16, s.duplicate.nextSkipCount * 2)
-                    s.duplicate.checkRemaining = max(2, (-4 * s.duplicate.nextSkipCount + 78) / 7)
-                }
+        let pipe = try shaderManager.computePipeline(library: "Common", function: "duplicateFrameCheck")
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.label = "MetalPie_AsyncDuplicateCheck"
+            enc.setComputePipelineState(pipe)
+            enc.setTexture(currentSource, index: 0)
+            enc.setTexture(candidate.prev, index: 1)
+            enc.setBuffer(candidate.flagBuf, offset: 0, index: 0)
+            enc.setBytes(&u, length: MemoryLayout<DuplicateCheckUniforms>.stride, index: 1)
+            let quadW = max(1, (currentSource.width + 1) / 2)
+            let quadH = max(1, (currentSource.height + 1) / 2)
+            dispatch2D(encoder: enc, pipeline: pipe, width: quadW, height: quadH)
+            enc.endEncoding()
+        }
+
+        final class FlagBox: @unchecked Sendable {
+            let buffer: any MTLBuffer
+            init(_ buffer: any MTLBuffer) { self.buffer = buffer }
+        }
+        let flagBox = FlagBox(candidate.flagBuf)
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            guard let self else { return }
+            let changed = flagBox.buffer.contents().load(as: UInt32.self) != 0
+            self.state.withLockUnchecked { s in
+                s.duplicate.lastAsyncDuplicateDetected = !changed
             }
         }
-
-        return changed ? nil : (candidate.cachedOut, candidate.cachedSize)
     }
 
     private func updatePreviousSourceCache(from source: any MTLTexture, commandBuffer: any MTLCommandBuffer) {
