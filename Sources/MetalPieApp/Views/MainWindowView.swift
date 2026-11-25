@@ -1,3 +1,4 @@
+import AppKit
 import MetalPieCore
 import SwiftUI
 
@@ -14,51 +15,37 @@ public struct MainWindowView: View {
         let l10n = coordinator.l10n
 
         NavigationSplitView {
-            VStack(spacing: 0) {
-                // Brand Header
-                HStack(spacing: 9) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color.cyan, Color.blue, Color.indigo],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                        Image(systemName: "sparkles")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                    .frame(width: 24, height: 24)
-
+            List(AppTab.allCases, selection: $coordinator.selectedTab) { tab in
+                Label {
+                    Text(tab.title(l10n))
+                        .font(.system(size: 13, weight: .medium))
+                } icon: {
+                    Image(systemName: tab.symbolName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 18, alignment: .center)
+                }
+                .tag(tab)
+                .padding(.vertical, 2)
+            }
+            .listStyle(.sidebar)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                HStack(spacing: 8) {
+                    sidebarAppIcon
                     Text("MetalPie")
-                        .font(.system(size: 14, weight: .bold))
+                        .font(.system(size: 14, weight: .semibold))
                     Spacer()
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 12)
-                .padding(.bottom, 10)
-
-                List(AppTab.allCases, selection: $coordinator.selectedTab) { tab in
-                    Label {
-                        Text(tab.title(l10n))
-                            .font(.system(size: 13, weight: .medium))
-                    } icon: {
-                        Image(systemName: tab.symbolName)
-                            .font(.system(size: 13, weight: .semibold))
-                            .frame(width: 18, alignment: .center)
-                    }
-                    .tag(tab)
-                    .padding(.vertical, 2)
+                .padding(.leading, 16)
+                .padding(.trailing, 14)
+                .padding(.top, 6)
+                .padding(.bottom, 8)
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    Divider()
+                    engineStatusPill(l10n: l10n)
+                        .padding(10)
                 }
-                .listStyle(.sidebar)
-
-                Divider()
-
-                // Persistent Live Engine Status Pill
-                engineStatusPill(l10n: l10n)
-                    .padding(10)
             }
             .navigationSplitViewColumnWidth(min: 196, ideal: 214, max: 245)
         } detail: {
@@ -77,9 +64,51 @@ public struct MainWindowView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle("")
         }
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 960, minHeight: 640)
+    }
+
+    @ViewBuilder
+    private var sidebarAppIcon: some View {
+        if let icnsURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let appIcon = NSImage(contentsOf: icnsURL),
+           appIcon.size.width > 0
+        {
+            Image(nsImage: appIcon)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 24, height: 24)
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.05, green: 0.08, blue: 0.17),
+                                Color(red: 0.13, green: 0.09, blue: 0.26)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.75)
+                    )
+                Text("M")
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [Color.cyan, Color.indigo],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+            }
+            .frame(width: 22, height: 22)
+        }
     }
 
     private func engineStatusPill(l10n: L10n) -> some View {

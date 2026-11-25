@@ -4,20 +4,49 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-// Generates MetalPie's native macOS squircle AppIcon.icns using pure CoreGraphics + iconutil
-// (zero Xcode / actool dependency).
+// Generates MetalPie's native macOS squircle AppIcon.icns (and optional PNG via `--png <path> [size]`)
+// using pure CoreGraphics + iconutil (zero Xcode / actool dependency).
 
-let outputPath = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "dist/AppIcon.icns"
-let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+var outputPath = "dist/AppIcon.icns"
+var pngOutputPath: String? = nil
+var pngPixelSize = 512
+
+var argIdx = 1
+while argIdx < CommandLine.arguments.count {
+    let arg = CommandLine.arguments[argIdx]
+    if arg == "--png", argIdx + 1 < CommandLine.arguments.count {
+        pngOutputPath = CommandLine.arguments[argIdx + 1]
+        argIdx += 2
+        if argIdx < CommandLine.arguments.count, let sz = Int(CommandLine.arguments[argIdx]), sz >= 32, sz <= 2048 {
+            pngPixelSize = sz
+            argIdx += 1
+        }
+    } else if arg == "--png-only", argIdx + 1 < CommandLine.arguments.count {
+        pngOutputPath = CommandLine.arguments[argIdx + 1]
+        outputPath = ""
+        argIdx += 2
+        if argIdx < CommandLine.arguments.count, let sz = Int(CommandLine.arguments[argIdx]), sz >= 32, sz <= 2048 {
+            pngPixelSize = sz
+            argIdx += 1
+        }
+    } else {
+        outputPath = arg
+        argIdx += 1
+    }
+}
+
 let tempDir = FileManager.default.temporaryDirectory
     .appendingPathComponent("MetalPieIcon-\(UUID().uuidString)", isDirectory: true)
 let iconsetURL = tempDir.appendingPathComponent("AppIcon.iconset", isDirectory: true)
 
-try FileManager.default.createDirectory(at: iconsetURL, withIntermediateDirectories: true)
-try FileManager.default.createDirectory(
-    at: outputURL.deletingLastPathComponent(),
-    withIntermediateDirectories: true
-)
+if !outputPath.isEmpty {
+    let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+    try FileManager.default.createDirectory(at: iconsetURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(
+        at: outputURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+}
 
 defer {
     try? FileManager.default.removeItem(at: tempDir)
@@ -270,20 +299,33 @@ let iconSpecs: [(name: String, pixels: Int)] = [
     ("icon_512x512@2x.png", 1024)
 ]
 
-for spec in iconSpecs {
-    let img = renderIcon(size: spec.pixels)
-    try savePNG(img, to: iconsetURL.appendingPathComponent(spec.name))
+if let pngPath = pngOutputPath {
+    let pngURL = URL(fileURLWithPath: pngPath).standardizedFileURL
+    try FileManager.default.createDirectory(
+        at: pngURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try savePNG(renderIcon(size: pngPixelSize), to: pngURL)
+    print("Generated AppIcon PNG (\(pngPixelSize)x\(pngPixelSize)) -> \(pngURL.path)")
 }
 
-let proc = Process()
-proc.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
-proc.arguments = ["-c", "icns", iconsetURL.path, "-o", outputURL.path]
-try proc.run()
-proc.waitUntilExit()
+if !outputPath.isEmpty {
+    let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+    for spec in iconSpecs {
+        let img = renderIcon(size: spec.pixels)
+        try savePNG(img, to: iconsetURL.appendingPathComponent(spec.name))
+    }
 
-guard proc.terminationStatus == 0 else {
-    fputs("error: iconutil failed with exit status \(proc.terminationStatus)\n", stderr)
-    exit(proc.terminationStatus)
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+    proc.arguments = ["-c", "icns", iconsetURL.path, "-o", outputURL.path]
+    try proc.run()
+    proc.waitUntilExit()
+
+    guard proc.terminationStatus == 0 else {
+        fputs("error: iconutil failed with exit status \(proc.terminationStatus)\n", stderr)
+        exit(proc.terminationStatus)
+    }
+
+    print("Generated AppIcon.icns -> \(outputURL.path)")
 }
-
-print("Generated AppIcon.icns -> \(outputURL.path)")

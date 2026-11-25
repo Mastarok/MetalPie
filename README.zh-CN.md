@@ -1,8 +1,16 @@
-# MetalPie
+<p align="center">
+  <img src="assets/AppIcon.png" width="112" height="112" alt="MetalPie">
+</p>
 
-适用于 Apple Silicon 与 macOS 的实时窗口超分与补帧工具。
+<h1 align="center">MetalPie</h1>
 
-[English](README.md) | 简体中文
+<p align="center">
+  适用于 Apple Silicon 与 macOS 的实时窗口超分与补帧工具。
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> · 简体中文
+</p>
 
 ---
 

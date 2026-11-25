@@ -50,6 +50,7 @@ struct MetalPieApp: App {
                     }
                 }
         }
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1040, height: 720)
         .windowResizability(.contentMinSize)
         .commands {

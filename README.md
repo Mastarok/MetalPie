@@ -1,8 +1,16 @@
-# MetalPie
+<p align="center">
+  <img src="assets/AppIcon.png" width="112" height="112" alt="MetalPie">
+</p>
 
-Real-time window upscaling and frame generation for macOS on Apple Silicon.
+<h1 align="center">MetalPie</h1>
 
-English | [简体中文](README.zh-CN.md)
+<p align="center">
+  Real-time window upscaling and frame generation for macOS on Apple Silicon.
+</p>
+
+<p align="center">
+  English · <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 ---
 
