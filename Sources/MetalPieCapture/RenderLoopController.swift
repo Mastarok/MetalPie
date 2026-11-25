@@ -268,7 +268,11 @@ private final class TelemetryAccumulator: @unchecked Sendable {
         var lastPublishTime: Double = 0
         var lastRenderConsumeTime: Double = 0
         var lastDisplayTickTime: Double = 0
+        var lastSourceArrivalTime: Double = 0
         var displayIntervalSeconds: Double = 1.0 / 60.0
+        var liveDisplayIntervalSeconds: Double = 1.0 / 60.0
+        var startupGraceUntil: Double = 0
+        var idleWakeupGraceUntil: Double = 0
         var resizeGraceUntil: Double = 0
         var lastSourceSize: PixelSize = .zero
         var lastDrawableSize: PixelSize = .zero
@@ -280,9 +284,13 @@ private final class TelemetryAccumulator: @unchecked Sendable {
     private let lock = OSAllocatedUnfairLock(initialState: State())
 
     func reset(state: SessionState, gpuName: String, backendName: String, targetWindowName: String, displayRefreshHz: Double = 60.0) {
+        let now = CACurrentMediaTime()
+        let baseInterval = 1.0 / max(30.0, displayRefreshHz)
         lock.withLock { s in
             s = State()
-            s.displayIntervalSeconds = 1.0 / max(30.0, displayRefreshHz)
+            s.displayIntervalSeconds = baseInterval
+            s.liveDisplayIntervalSeconds = baseInterval
+            s.startupGraceUntil = now + 0.40
             s.telemetry = SessionTelemetry(
                 state: state,
                 targetWindowName: targetWindowName,
@@ -293,8 +301,16 @@ private final class TelemetryAccumulator: @unchecked Sendable {
     }
 
     func setDisplayRefreshRate(_ hz: Double) {
+        let baseInterval = 1.0 / max(30.0, hz)
         lock.withLock { s in
-            s.displayIntervalSeconds = 1.0 / max(30.0, hz)
+            s.displayIntervalSeconds = baseInterval
+            s.liveDisplayIntervalSeconds = max(baseInterval, min(s.liveDisplayIntervalSeconds, 0.05))
+        }
+    }
+
+    func extendReconfigurationGrace(now: Double = CACurrentMediaTime(), duration: Double = 0.35) {
+        lock.withLock { s in
+            s.resizeGraceUntil = max(s.resizeGraceUntil, now + duration)
         }
     }
 
@@ -348,27 +364,46 @@ private final class TelemetryAccumulator: @unchecked Sendable {
 
     func recordDroppedPresent(now: Double = CACurrentMediaTime(), count: UInt64 = 1) {
         lock.withLock { s in
-            // Do not falsely count transient swapchain/drawable transitions during live window resize as drops.
-            guard now >= s.resizeGraceUntil else { return }
+            // Do not falsely count transient startup / live resize swapchain transitions as drops.
+            guard now >= s.resizeGraceUntil, now >= s.startupGraceUntil else { return }
             s.telemetry.droppedFrames &+= count
         }
     }
 
-    func recordDisplayLinkTick(now: Double) {
+    func recordDisplayLinkTick(now: Double, tickInterval: Double? = nil) {
         lock.withLock { s in
+            let prev = s.lastDisplayTickTime
             s.lastDisplayTickTime = now
+            let measured = tickInterval ?? (prev > 0 ? (now - prev) : 0)
+            // Track active ProMotion / steady render cadence (clamped to [base, 50 ms] = [20..120Hz])
+            // while ignoring long static-idle gaps (> 60 ms).
+            if measured >= s.displayIntervalSeconds * 0.8 && measured <= 0.06 {
+                let clamped = min(max(measured, s.displayIntervalSeconds), 0.05)
+                s.liveDisplayIntervalSeconds = s.liveDisplayIntervalSeconds * 0.8 + clamped * 0.2
+            }
         }
     }
 
     func recordSourceFrame(now: Double, mailboxSuperseded: Bool) {
         lock.withLock { s in
+            // Detect static-screen -> active-motion wakeup (no capture frames arrived for >= 100 ms):
+            // ProMotion steps DisplayLink down to 10-60 Hz while static and takes ~100-150 ms to ramp
+            // back to 120 Hz on the first motion burst. Never misclassify those 1-2 ramp-up frames as drops!
+            if s.lastSourceArrivalTime > 0 && (now - s.lastSourceArrivalTime) >= 0.10 {
+                s.idleWakeupGraceUntil = max(s.idleWakeupGraceUntil, now + 0.15)
+            }
+            s.lastSourceArrivalTime = now
+
             // Distinguish true render-deadline-miss drops from harmless sub-vsync mailbox coalescing,
-            // irregular-FPS source bursts waking from idle, and transient live window resize transitions.
+            // ProMotion static-to-motion wakeup ramp, startup warm-up, and live resize/reconfig transitions.
             let lastActiveRender = max(s.lastRenderConsumeTime, s.lastDisplayTickTime)
+            let activeCadence = max(s.displayIntervalSeconds, s.liveDisplayIntervalSeconds)
             if mailboxSuperseded,
+               now >= s.startupGraceUntil,
                now >= s.resizeGraceUntil,
+               now >= s.idleWakeupGraceUntil,
                lastActiveRender > 0,
-               (now - lastActiveRender) > s.displayIntervalSeconds * 1.45
+               (now - lastActiveRender) > activeCadence * 1.45
             {
                 s.telemetry.droppedFrames &+= 1
             }
@@ -1152,7 +1187,9 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             s.needsGraphicsRedraw = true
             s.configDirty = true
         }
-        telemetry.recordDrawableSize(configuration.overlayMetrics.drawablePixelSize, now: CACurrentMediaTime())
+        let now = CACurrentMediaTime()
+        telemetry.recordDrawableSize(configuration.overlayMetrics.drawablePixelSize, now: now)
+        telemetry.extendReconfigurationGrace(now: now, duration: 0.35)
         telemetry.setDisplayRefreshRate(configuration.overlayMetrics.screenMaxFPS)
         telemetry.updateSessionMetadata(
             targetWindowName: configuration.targetWindowName,
@@ -1176,6 +1213,9 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
             }
         }
         telemetry.updateSessionMetadata(state: paused ? .suspended : .running)
+        if !paused {
+            telemetry.extendReconfigurationGrace(now: CACurrentMediaTime(), duration: 0.35)
+        }
 
         renderThread.perform { [weak self] in
             guard let self else { return }
@@ -1399,11 +1439,12 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                 displayLink = link
             }
             if let link = displayLink {
-                // Prefer full display refresh rate (e.g. 120Hz ProMotion) while allowing smooth
-                // stepping down to 60Hz when heavy shaders exceed 8.33ms (avoiding both 30Hz lag
-                // and hard 120Hz deadline judder).
+                // Lock requested frame rate to full display refresh (e.g. 120Hz ProMotion) while using
+                // `preferredFrameLatency = 2.0` triple-buffered headroom: lightweight presets hold a rock-solid
+                // 120 fps (zero ProMotion 60-90Hz under-clocking), while heavier shaders still pipeline smoothly
+                // across two display refreshes without 8.33ms hard-deadline judder.
                 link.preferredFrameRateRange = CAFrameRateRange(
-                    minimum: min(60.0, maxFPS),
+                    minimum: maxFPS,
                     maximum: maxFPS,
                     preferred: maxFPS
                 )

@@ -1188,8 +1188,9 @@ struct CaptureToRenderPipelineIntegrationTests {
         )
         #expect(dellLocal == CGRect(x: 100, y: 100, width: 800, height: 500))
 
-        // 3. Policy selects display-scoped capture for fullscreen windows OR after child-window shrink detection,
-        //    and keeps desktopIndependentWindow for normal desktop windows.
+        // 3. Policy selects display-scoped capture for fullscreen windows, fully on-display desktop windows
+        //    (preventing Chrome StatusBubbleMac / tooltip sub-pixel bilinear blur!), and shrink-detected windows,
+        //    while keeping desktopIndependentWindow for partially off-screen desktop windows (or when shadows are captured).
         #expect(ScreenCaptureEngine.shouldUseDisplayScopedWindowCapture(
             windowBounds: CGRect(x: 0, y: 33, width: 1512, height: 949),
             displays: displays,
@@ -1210,6 +1211,23 @@ struct CaptureToRenderPipelineIntegrationTests {
             isFullscreenWindow: false,
             didDetectChildWindowShrink: false,
             captureMode: .window
+        ) == true)
+        // Partially off-screen window (left edge at -150) falls back to desktopIndependentWindow unless shrink detected.
+        #expect(ScreenCaptureEngine.shouldUseDisplayScopedWindowCapture(
+            windowBounds: CGRect(x: -150, y: 120, width: 900, height: 600),
+            displays: displays,
+            isFullscreenWindow: false,
+            didDetectChildWindowShrink: false,
+            captureMode: .window
+        ) == false)
+        // Explicit shadow capture (`ignoreShadows == false`) keeps desktopIndependentWindow for desktop windows.
+        #expect(ScreenCaptureEngine.shouldUseDisplayScopedWindowCapture(
+            windowBounds: CGRect(x: 100, y: 120, width: 900, height: 600),
+            displays: displays,
+            isFullscreenWindow: false,
+            didDetectChildWindowShrink: false,
+            captureMode: .window,
+            ignoreShadows: false
         ) == false)
 
         // 4. Live SCStream hardware test: reproduce Chrome's exact (0, 33, 1512, 949) window with attached
@@ -1307,5 +1325,62 @@ struct CaptureToRenderPipelineIntegrationTests {
             settled,
             "ScreenCaptureEngine did not recover 100% full-bleed contentRect after offscreen child-window shrink: pixelSize=\(finalFrame.pixelSize), contentRect=\(finalFrame.contentRect)"
         )
+    }
+
+    @Test("RenderLoopController reports zero false droppedFrames on static-to-motion ProMotion wakeup bursts")
+    func zeroFalseDropsOnStaticToMotionWakeup() async throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("Metal device unavailable on test host")
+            return
+        }
+
+        let factory = try IOSurfaceFrameFactory(device: device)
+        let renderer = try EffectChainRenderer(device: device)
+        let loop = try RenderLoopController(device: device, effectRenderer: renderer)
+        defer { loop.stop() }
+
+        let layer = makeOffscreenMetalLayer(device: device, width: 320, height: 180)
+        let metrics = OverlayDrawableMetrics(
+            cocoaFrame: CGRect(x: 0, y: 0, width: 160, height: 90),
+            cgFrame: CGRect(x: 0, y: 0, width: 160, height: 90),
+            drawablePixelSize: PixelSize(width: 320, height: 180),
+            backingScaleFactor: 2.0,
+            screenMaxFPS: 120.0,
+            displayID: CGMainDisplayID(),
+            supportsEDR: false,
+            isVRRDirectScanoutActive: false
+        )
+
+        var profile = Profile.defaultProfile
+        profile.capture.lowLatencyPresent = false
+        profile.capture.duplicateFrameMode = .never
+
+        loop.start(
+            metalLayer: layer,
+            configuration: RenderSessionConfiguration(
+                targetWindowName: "WakeupGraceTest",
+                profile: profile,
+                scalingMode: .defaultMode,
+                overlayMetrics: metrics
+            )
+        )
+
+        let frame = try factory.makeBGRA8Frame(width: 160, height: 90) { _, _ in (120, 180, 220, 255) }
+        // 1) Initial startup frames
+        loop.ingest(frame: frame)
+        try await Task.sleep(for: .milliseconds(460))
+
+        // 2) Simulate static desktop idle (> 150ms) followed by 3 rapid hover bursts (2 frames 8ms apart each)
+        for _ in 0..<3 {
+            try await Task.sleep(for: .milliseconds(160))
+            loop.ingest(frame: frame)
+            try await Task.sleep(for: .milliseconds(8))
+            loop.ingest(frame: frame)
+            try await Task.sleep(for: .milliseconds(8))
+            loop.ingest(frame: frame)
+        }
+
+        let drops = loop.currentTelemetry.droppedFrames
+        #expect(drops == 0, "Static-to-motion ProMotion wakeup bursts must not falsely increment droppedFrames (got \(drops))")
     }
 }

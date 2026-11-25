@@ -964,9 +964,17 @@ struct MetalPieShadersGPUValidationTests {
         }
         #expect(meanAbsRGBDiff(updenOutputs["S"]!, updenOutputs["M"]!) > 0.002, "Anime4K Upscale+Denoise S vs M should differ")
         #expect(meanAbsRGBDiff(updenOutputs["S"]!, updenOutputs["VL"]!) > 0.002, "Anime4K Upscale+Denoise S vs VL should differ")
+        let updenDefault = try runSingle(
+            source: animeHalo, targetSize: s2x, effectID: .anime4kUpscaleDenoise, scalingType: .fit,
+            parameters: ["variant": .choice("L"), "clampHighlights": .bool(true)]
+        )
         let updenNoDenoise = try runSingle(
             source: animeHalo, targetSize: s2x, effectID: .anime4kUpscaleDenoise, scalingType: .fit,
             parameters: ["variant": .choice("L"), "denoiseStrength": .float(0.0), "lineSharpness": .float(1.0), "clampHighlights": .bool(true)]
+        )
+        #expect(
+            meanAbsRGBDiff(updenDefault, updenNoDenoise) < 0.0005,
+            "Anime4K Upscale+Denoise default parameters must NOT apply extra bilateral blur pre-pass"
         )
         let updenHeavyDenoise = try runSingle(
             source: animeHalo, targetSize: s2x, effectID: .anime4kUpscaleDenoise, scalingType: .fit,

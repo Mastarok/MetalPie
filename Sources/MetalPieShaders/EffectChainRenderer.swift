@@ -1350,7 +1350,9 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
 
         case .anime4kUpscaleDenoise:
             let variant = parameters.choice("variant", default: "L")
-            let denoiseStrength = parameters.float32("denoiseStrength", default: 1.0)
+            // `a4k_upden_*` CNN weights already integrate denoising; only apply the legacy bilateral-mode
+            // pre-denoise pass when explicitly requested (> 0.01) so official Anime4K Mode B/C/B+B/C+A stay crisp and fast.
+            let denoiseStrength = parameters.float32("denoiseStrength", default: 0.0)
             let lineSharpness = parameters.float32("lineSharpness", default: 1.0)
             let clampHighlights = parameters.bool("clampHighlights", default: true)
             let legacyThinning = parameters.float32("lineThinning", default: 0.0)
