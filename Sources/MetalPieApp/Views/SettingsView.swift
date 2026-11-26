@@ -48,6 +48,7 @@ struct SettingsView: View {
                 cursorCard(profileID: targetID, l10n: l10n)
                 frameGenerationCard(profileID: targetID, l10n: l10n)
                 generalCard(l10n: l10n)
+                updatesCard(l10n: l10n)
                 advancedSection(profileID: targetID, l10n: l10n)
             }
             .padding(20)
@@ -504,6 +505,258 @@ struct SettingsView: View {
                     ))
                 }
             }
+        }
+    }
+
+    // MARK: - Software Update
+
+    private func updatesCard(l10n: L10n) -> some View {
+        let updater = coordinator.updateManager
+        let state = updater.state
+
+        return SectionCard {
+            HStack(alignment: .center, spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(l10n.tr("Software Update", "软件更新"))
+                        .font(.system(size: 13.5, weight: .semibold))
+                    HStack(spacing: 6) {
+                        Text("MetalPie \(updater.currentVersion.displayString)")
+                            .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        if let checkedAt = updater.lastCheckedAt, case .idle = state {
+                            Text("· \(l10n.tr("Checked", "上次检查")) \(checkedAt.formatted(date: .omitted, time: .shortened))")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
+                        } else if case .upToDate(_, let checkedAt) = state {
+                            Text("· \(checkedAt.formatted(date: .omitted, time: .shortened))")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                updateStatusBadge(for: state, l10n: l10n)
+            }
+
+            switch state {
+            case .downloading(_, let progress, let received, let total):
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                    HStack {
+                        let recStr = ByteCountFormatter.string(fromByteCount: received, countStyle: .file)
+                        let totStr = total > 0
+                            ? ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+                            : "…"
+                        Text("\(recStr) / \(totStr)")
+                            .font(.system(size: 11.5, design: .monospaced))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button(l10n.tr("Cancel", "取消")) {
+                            updater.cancelDownload()
+                        }
+                        .controlSize(.small)
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+            case .verifying:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(l10n.tr(
+                        "Verifying SHA-256 checksum & code signature…",
+                        "正在校验 SHA-256 哈希与代码签名…"
+                    ))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                }
+
+            case .installing:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(l10n.tr(
+                        "Replacing MetalPie.app and relaunching…",
+                        "正在更新 MetalPie.app 并重启…"
+                    ))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                }
+
+            case .available(let release):
+                releaseNotesBox(release: release, l10n: l10n)
+
+            case .readyToInstall(let release, _, _):
+                releaseNotesBox(release: release, l10n: l10n)
+
+            case .failed(let message):
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.orange)
+                    Text(message)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color.orange.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            case .idle, .checking, .upToDate:
+                EmptyView()
+            }
+
+            HStack(spacing: 8) {
+                switch state {
+                case .idle, .upToDate, .failed:
+                    Button(l10n.tr("Check for Updates", "检查更新")) {
+                        Task { await coordinator.checkForUpdates(userInitiated: true) }
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+
+                case .checking:
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(l10n.tr("Checking GitHub Releases…", "正在检查 GitHub Releases…"))
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+
+                case .available(let release):
+                    Button {
+                        updater.downloadAndPrepareUpdate(release)
+                    } label: {
+                        Label(
+                            l10n.tr("Download \(release.version.displayString)", "下载 \(release.version.displayString)"),
+                            systemImage: "arrow.down.circle.fill"
+                        )
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+
+                    Button(l10n.tr("Check Again", "重新检查")) {
+                        Task { await coordinator.checkForUpdates(userInitiated: true) }
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.bordered)
+
+                case .readyToInstall(let release, let stagedAppURL, _):
+                    let inPlace = updater.canInstallInPlace && stagedAppURL != nil
+                    Button {
+                        coordinator.installPreparedUpdate()
+                    } label: {
+                        Label(
+                            inPlace
+                                ? l10n.tr("Install \(release.version.displayString) & Relaunch", "安装 \(release.version.displayString) 并重启")
+                                : l10n.tr("Open Installer DMG", "打开安装包 (DMG)"),
+                            systemImage: inPlace ? "arrow.triangle.2.circlepath.circle.fill" : "shippingbox.fill"
+                        )
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+
+                case .downloading, .verifying, .installing:
+                    EmptyView()
+                }
+
+                Spacer()
+
+                Button {
+                    updater.openReleasePage(state.availableRelease)
+                } label: {
+                    Label(l10n.tr("Release Notes", "发行说明"), systemImage: "arrow.up.right.square")
+                        .font(.system(size: 11.5))
+                }
+                .controlSize(.small)
+                .buttonStyle(.link)
+            }
+
+            Divider()
+
+            Toggle(
+                l10n.tr("Automatically check for updates", "启动时自动检查更新"),
+                isOn: Binding(
+                    get: { coordinator.config.automaticallyCheckForUpdates },
+                    set: { enabled in
+                        coordinator.config.automaticallyCheckForUpdates = enabled
+                        coordinator.persistConfig(reconfigureSession: false)
+                    }
+                )
+            )
+            .font(.system(size: 12.5))
+            .help(l10n.tr(
+                "Checks GitHub Releases quietly in the background at most once every 12 hours.",
+                "启动时静默检查 GitHub Releases 最新稳定版（每 12 小时最多一次）"
+            ))
+        }
+    }
+
+    @ViewBuilder
+    private func updateStatusBadge(for state: AppUpdateState, l10n: L10n) -> some View {
+        switch state {
+        case .idle:
+            EmptyView()
+        case .checking:
+            StatusBadge(l10n.tr("Checking…", "检查中…"), color: .cyan)
+        case .upToDate:
+            StatusBadge(l10n.tr("Up to Date", "已是最新"), color: .green, symbol: "checkmark.circle.fill")
+        case .available(let release):
+            StatusBadge(
+                l10n.tr("New \(release.version.displayString)", "新版本 \(release.version.displayString)"),
+                color: .green,
+                symbol: "arrow.down.circle.fill"
+            )
+        case .downloading(_, let progress, _, _):
+            StatusBadge("\(Int((progress * 100).rounded()))%", color: .blue)
+        case .verifying:
+            StatusBadge(l10n.tr("Verifying…", "校验中…"), color: .orange)
+        case .readyToInstall(let release, _, _):
+            StatusBadge(
+                l10n.tr("Ready \(release.version.displayString)", "可安装 \(release.version.displayString)"),
+                color: .green,
+                symbol: "checkmark.seal.fill"
+            )
+        case .installing:
+            StatusBadge(l10n.tr("Updating…", "更新中…"), color: .blue)
+        case .failed:
+            StatusBadge(l10n.tr("Error", "出错"), color: .red, symbol: "exclamationmark.triangle.fill")
+        }
+    }
+
+    @ViewBuilder
+    private func releaseNotesBox(release: AppUpdateRelease, l10n: L10n) -> some View {
+        if !release.releaseNotes.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(release.title)
+                        .font(.system(size: 12, weight: .semibold))
+                    Spacer()
+                    if let pub = release.publishedAt {
+                        Text(pub.formatted(date: .abbreviated, time: .omitted))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                ScrollView {
+                    Text(release.releaseNotes)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxHeight: 110)
+            }
+            .padding(10)
+            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
     }
 

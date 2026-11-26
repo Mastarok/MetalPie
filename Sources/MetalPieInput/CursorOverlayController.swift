@@ -2419,8 +2419,13 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     private struct ControllerState: Sendable {
         var isActive: Bool = false
         var isSuspended: Bool = false
+        var isYieldedForForeignOverlay: Bool = false
         var isHiddenForScreenshot: Bool = false
         var isUsingEventTap: Bool = false
+
+        var isEffectivelySuspended: Bool {
+            isSuspended || isYieldedForForeignOverlay
+        }
         var alignmentMode: CursorAlignmentMode = .inactive
         var presentationMode: CursorPresentationMode
         var configuration: CursorMappingConfiguration?
@@ -2507,6 +2512,12 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     /// True if the controller is temporarily suspended (e.g. target lost focus).
     public var isSuspended: Bool {
         state.withLock(\.isSuspended)
+    }
+
+    /// True if cursor hiding and event-tap confinement are temporarily yielded for a foreign
+    /// high-level overlay (e.g. third-party screenshot tool or macOS `screencaptureui`).
+    public var isYieldedForForeignOverlay: Bool {
+        state.withLock(\.isYieldedForForeignOverlay)
     }
 
     /// True if a `CGEventTap` is currently running on the dedicated `.userInteractive` thread.
@@ -2614,7 +2625,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             visibilityChanged: Bool
         ) in
             s.tapProcessor.interactiveChromeRects = normalized
-            guard s.isActive, !s.isSuspended, s.isUsingEventTap,
+            guard s.isActive, !s.isEffectivelySuspended, s.isUsingEventTap,
                   let mapping = s.mapping, mapping.isValid, !mapping.isIdentity
             else {
                 return (nil, nil, true, false)
@@ -2708,7 +2719,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.isPresentationWindowed = isWindowed
             s.tapProcessor.isPresentationWindowed = isWindowed
 
-            guard s.isActive, !s.isSuspended, s.isUsingEventTap,
+            guard s.isActive, !s.isEffectivelySuspended, s.isUsingEventTap,
                   let mapping = s.mapping, mapping.isValid, !mapping.isIdentity
             else {
                 return (nil, nil, true, false)
@@ -2844,6 +2855,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         state.withLock { s in
             s.isActive = true
             s.isSuspended = false
+            s.isYieldedForForeignOverlay = false
             s.isHiddenForScreenshot = false
             s.configuration = configuration
             s.displays = displays
@@ -2928,7 +2940,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         let hideGate = state.withLock { s -> (allowHide: Bool, isNativeMode: Bool) in
-            guard s.isActive, !s.isSuspended, s.isUsingEventTap,
+            guard s.isActive, !s.isEffectivelySuspended, s.isUsingEventTap,
                   (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode)
             else {
                 return (false, true)
@@ -2986,9 +2998,9 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             s.latestRenderSnapshot.interpolation = configuration.settings.interpolation
 
             let axGranted = AXIsProcessTrusted()
-            let shouldHaveTap = !s.isSuspended && mapping.requiresEventTap && axGranted
+            let shouldHaveTap = !s.isEffectivelySuspended && mapping.requiresEventTap && axGranted
             let needsTapChange = (shouldHaveTap != s.isUsingEventTap)
-            let shouldHideOS = !s.isSuspended && shouldHaveTap && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode)
+            let shouldHideOS = !s.isEffectivelySuspended && shouldHaveTap && (mapping.requiresScaledOverlayCursor || configuration.threeDGameMode)
 
             return (true, needsTapChange, shouldHaveTap, shouldHideOS, mapping, prevMode)
         }
@@ -3035,7 +3047,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             let enforceConfinement = mapping.settings.confineCursor || configuration.threeDGameMode
 
             var pendingWarpSpec: (from: CGPoint, to: CGPoint)? = nil
-            if tapActive && !s.isSuspended && !mapping.isIdentity {
+            if tapActive && !s.isEffectivelySuspended && !mapping.isIdentity {
                 let currentPhysical = Self.currentCGPointerLocation()
                 if configuration.threeDGameMode &&
                     (s.tapProcessor.interactionMode == .outsideWindowedOverlay || s.tapProcessor.interactionMode == .menuBarPassthrough)
@@ -3124,7 +3136,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         let hideGate = state.withLock { s -> (allowHide: Bool, isNativeMode: Bool) in
-            guard s.isActive, !s.isSuspended, s.isUsingEventTap, transition.shouldHideOS else {
+            guard s.isActive, !s.isEffectivelySuspended, s.isUsingEventTap, transition.shouldHideOS else {
                 return (false, true)
             }
             return (true, s.tapProcessor.interactionMode != .scaled)
@@ -3180,6 +3192,56 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     }
 
     public func resume() {
+        let shouldResume = state.withLock { s -> Bool in
+            guard s.isActive, s.isSuspended else { return false }
+            s.isSuspended = false
+            return !s.isYieldedForForeignOverlay
+        }
+        guard shouldResume else { return }
+        resumeActiveTrackingAfterSuspendOrYield(reason: "resumed")
+    }
+
+    /// Temporarily yields cursor hiding, scaled sprite rendering, and `CGEventTap` interception
+    /// while a foreign high-level capture overlay (e.g. Snipaste, PixPin, iShot, CleanShot X,
+    /// WeChat/QQ screenshot, or macOS `screencaptureui`) sits above MetalPie's scaling overlay.
+    ///
+    /// Orthogonal to session-level `suspend()` / `resume()` so exiting a screenshot overlay while
+    /// paused, focus-lost, or unlocked-windowed NEVER accidentally re-hides the OS cursor.
+    public func setYieldedForForeignOverlay(_ yielded: Bool) {
+        if yielded {
+            // Atomically disallow hides and unwind all hide depth FIRST so the screenshot tool's
+            // cursor/crosshair becomes visible immediately with zero MainActor wait.
+            cursorHider.setAllowedToHide(false)
+
+            let didYield = state.withLock { s -> Bool in
+                guard s.isActive, !s.isYieldedForForeignOverlay else { return false }
+                s.isYieldedForForeignOverlay = true
+                s.currentState.isVisible = false
+                s.currentState.isMouseGrabbedByGame = false
+                s.currentState.isIdleHidden = false
+                s.tapProcessor.reset()
+                s.latestRenderSnapshot.state = s.currentState
+                return true
+            }
+            guard didYield else { return }
+
+            setEventTapEnabled(false)
+            cursorHider.show()
+            hideSpritePanelOnMain()
+            notifyStateChange()
+            PipelineLog.shared.info(.cursor, "Yielded cursor control for foreign capture overlay (OS cursor restored).")
+        } else {
+            let shouldResume = state.withLock { s -> Bool in
+                guard s.isYieldedForForeignOverlay else { return false }
+                s.isYieldedForForeignOverlay = false
+                return s.isActive && !s.isSuspended
+            }
+            guard shouldResume else { return }
+            resumeActiveTrackingAfterSuspendOrYield(reason: "resumed after foreign capture overlay closed")
+        }
+    }
+
+    private func resumeActiveTrackingAfterSuspendOrYield(reason: String) {
         let resumeInfo = state.withLock { s -> (
             shouldTap: Bool,
             shouldHideOS: Bool,
@@ -3188,9 +3250,8 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             placement: (point: CGPoint, shouldWarp: Bool),
             prevMode: CursorAlignmentMode
         )? in
-            guard s.isActive, s.isSuspended, let mapping = s.mapping else { return nil }
+            guard s.isActive, !s.isEffectivelySuspended, let mapping = s.mapping else { return nil }
             let prevMode = s.alignmentMode
-            s.isSuspended = false
             s.lastActivityUptime = ProcessInfo.processInfo.systemUptime
             s.currentState.isIdleHidden = false
 
@@ -3247,6 +3308,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             } else {
                 let started = startEventTapThread()
                 state.withLock { $0.isUsingEventTap = started }
+                startMaintenanceTimer(pollingMode: !started)
             }
         }
 
@@ -3272,7 +3334,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                     s.tapProcessor.interactionMode = .unconfinedOutsideSource
                 }
             }
-            if resumeInfo.shouldHideOS && tapActive {
+            if resumeInfo.shouldHideOS && tapActive && !s.isEffectivelySuspended {
                 Self.recomputeVisibilityLocked(&s)
             } else {
                 s.currentState.isVisible = false
@@ -3281,7 +3343,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         let hideGate = state.withLock { s -> (allowHide: Bool, isNativeMode: Bool) in
-            guard s.isActive, !s.isSuspended, s.isUsingEventTap, resumeInfo.shouldHideOS else {
+            guard s.isActive, !s.isEffectivelySuspended, s.isUsingEventTap, resumeInfo.shouldHideOS else {
                 return (false, true)
             }
             return (true, s.tapProcessor.interactionMode != .scaled)
@@ -3309,7 +3371,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             notifyAlignmentMode(resolvedMode)
         }
         notifyStateChange()
-        PipelineLog.shared.debug(.cursor, "CursorOverlayController resumed (mode: \(resolvedMode.rawValue)).")
+        PipelineLog.shared.debug(.cursor, "CursorOverlayController \(reason) (mode: \(resolvedMode.rawValue)).")
     }
 
     public func stop() {
@@ -3323,6 +3385,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             let token = s.recoveryToken
             s.isActive = false
             s.isSuspended = false
+            s.isYieldedForForeignOverlay = false
             s.isUsingEventTap = false
             s.alignmentMode = .inactive
             s.isHiddenForScreenshot = false
@@ -3604,7 +3667,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
                 return Unmanaged.passUnretained(event)
             }
 
-            if let port = tapRuntime.withLockUnchecked({ $0.tapPort }), state.withLock({ $0.isActive && !$0.isSuspended }) {
+            if let port = tapRuntime.withLockUnchecked({ $0.tapPort }), state.withLock({ $0.isActive && !$0.isEffectivelySuspended }) {
                 CGEvent.tapEnable(tap: port, enable: true)
                 PipelineLog.shared.debug(.cursor, "Re-enabled CGEventTap after system disable (\(type.rawValue)).")
             }
@@ -3635,7 +3698,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         }
 
         let action: TapAction = state.withLock { s in
-            guard s.isActive, !s.isSuspended, s.isUsingEventTap, let mapping = s.mapping, mapping.isValid else {
+            guard s.isActive, !s.isEffectivelySuspended, s.isUsingEventTap, let mapping = s.mapping, mapping.isValid else {
                 return .passthrough
             }
 
@@ -3796,7 +3859,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             // so MetalPie NEVER renders a misleading remapped cursor that disagrees with where OS clicks land.
             let pointer = Self.currentCGPointerLocation()
             let changed = state.withLock { s -> Bool in
-                guard s.isActive, !s.isSuspended, let mapping = s.mapping, mapping.isValid else {
+                guard s.isActive, !s.isEffectivelySuspended, let mapping = s.mapping, mapping.isValid else {
                     return false
                 }
                 let scaled = mapping.mapSourceToScaled(pointer, clampToContent: true)
@@ -3821,7 +3884,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             shouldPollCursorShape: Bool,
             hoverSettleWarp: CGPoint?
         ) in
-            guard s.isActive, !s.isSuspended, let mapping = s.mapping else {
+            guard s.isActive, !s.isEffectivelySuspended, let mapping = s.mapping else {
                 return (false, false, false, nil)
             }
 
@@ -3927,7 +3990,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     /// pixel fingerprinting NEVER stall `spriteLayer.position`!
     private func scheduleCursorShapeRefresh() {
         let shouldDispatch = state.withLock { s -> Bool in
-            guard s.isActive, !s.isSuspended else { return false }
+            guard s.isActive, !s.isEffectivelySuspended else { return false }
             if s.shapeRefreshPending { return false }
             s.shapeRefreshPending = true
             return true
@@ -4061,7 +4124,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
             mapping: PointerMapping?
         ) in
             s.shapeRefreshPending = false
-            guard s.isActive, !s.isSuspended else {
+            guard s.isActive, !s.isEffectivelySuspended else {
                 return (false, 2.0, nil, nil)
             }
             return (
@@ -4146,7 +4209,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     /// suppression interval via `localEventsSuppressionInterval = 0.0` + `CGAssociateMouseAndMouseCursorPosition(true)`
     /// (when not in 3D game mode or FPS mouse-grab). Never calls `CGAssociateMouseAndMouseCursorPosition(false)`.
     private func performCursorWarp(to point: CGPoint, reassociateMouse: Bool) {
-        if state.withLock({ $0.suppressSystemWarpForTesting || !$0.isActive || $0.isSuspended }) {
+        if state.withLock({ $0.suppressSystemWarpForTesting || !$0.isActive || $0.isEffectivelySuspended }) {
             return
         }
         warpEventSource?.localEventsSuppressionInterval = 0.0
@@ -4201,6 +4264,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
         state.withLock { s in
             s.isActive = true
             s.isSuspended = false
+            s.isYieldedForForeignOverlay = false
             s.isUsingEventTap = true
             s.suppressSystemWarpForTesting = true
             s.alignmentMode = .scaledConfinedEventTap
@@ -4246,7 +4310,7 @@ public final class CursorOverlayController: CursorControlling, @unchecked Sendab
     private static func recomputeVisibilityLocked(_ s: inout ControllerState) {
         guard let mapping = s.mapping,
               s.isActive,
-              !s.isSuspended,
+              !s.isEffectivelySuspended,
               s.isUsingEventTap,
               mapping.requiresScaledOverlayCursor,
               !s.isHiddenForScreenshot,

@@ -662,6 +662,47 @@ public struct PopupMenuLevelEvaluation: Equatable, Sendable {
     }
 }
 
+/// Snapshot of an on-screen window sitting above MetalPie's `OverlayPanel` used to detect
+/// third-party screenshot / screen-capture overlay UIs (e.g. Snipaste, PixPin, iShot, CleanShot X,
+/// Shottr, WeChat/QQ screenshot, macOS `screencaptureui`) so MetalPie immediately restores the
+/// native OS cursor and passes mouse events through 1:1 while keeping the upscaled overlay visible.
+public struct ForeignOverlayWindowSnapshot: Hashable, Sendable {
+    public var windowID: CGWindowID
+    public var pid: Int32
+    public var ownerName: String
+    public var layer: Int
+    public var bounds: CGRect
+    public var alpha: Double
+
+    public init(
+        windowID: CGWindowID,
+        pid: Int32,
+        ownerName: String,
+        layer: Int,
+        bounds: CGRect,
+        alpha: Double = 1.0
+    ) {
+        self.windowID = windowID
+        self.pid = pid
+        self.ownerName = ownerName
+        self.layer = layer
+        self.bounds = bounds.standardized
+        self.alpha = alpha
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(windowID)
+        hasher.combine(pid)
+        hasher.combine(ownerName)
+        hasher.combine(layer)
+        hasher.combine(bounds.origin.x)
+        hasher.combine(bounds.origin.y)
+        hasher.combine(bounds.size.width)
+        hasher.combine(bounds.size.height)
+        hasher.combine(alpha)
+    }
+}
+
 // MARK: - OverlayChromeGeometry (Notch-Safe Placement & Shadow Bleed Padding)
 
 /// Pure, unit-testable layout solver for floating overlay chrome (toolbar, profiler HUD, toast)
@@ -1944,6 +1985,110 @@ public final class OverlayWindowController {
             shouldBoostAbovePopupMenus: anyIntersectsSource,
             isMenuBarDropdownActive: false
         )
+    }
+
+    /// System shell processes whose elevated windows above `OverlayPanel` (MenuBar, Dock,
+    /// Control Center, recording status dot, notification banners, Wallpaper) must NEVER
+    /// trigger foreign screenshot-overlay cursor yielding.
+    /// Note: `screencaptureui` is intentionally NOT in this ignore list because it IS a screenshot UI!
+    private nonisolated static let ignoredShellOverlayOwnerNames: Set<String> = [
+        "window server",
+        "windowserver",
+        "dock",
+        "control center",
+        "controlcenter",
+        "systemuiserver",
+        "notification center",
+        "notificationcenter",
+        "windowmanager",
+        "wallpaper",
+        "loginwindow",
+        "metalpie"
+    ]
+
+    /// Pure, unit-testable detector identifying an active third-party or macOS screenshot/capture
+    /// overlay sitting above MetalPie's `OverlayPanel` (e.g. Snipaste, PixPin, iShot, CleanShot X,
+    /// Shottr, Xnip, WeChat/QQ screenshot, macOS `screencaptureui`) that covers a display or the
+    /// scaled overlay.
+    ///
+    /// - Ignores MetalPie's own windows, normal macOS shell chrome (MenuBar/Dock/StatusIndicator/
+    ///   Notification Center), small tooltips/IMEs, and small pinned floating images.
+    /// - Detects BOTH foreign apps (accessory `LSUIElement` screenshot tools that do not steal
+    ///   app focus) AND full-display high-layer capture shields spawned by the scaled app itself
+    ///   (e.g. triggering WeChat/QQ's built-in screenshot while scaling WeChat/QQ).
+    public nonisolated static func detectForeignCaptureOverlayAbove(
+        windowsAboveOverlay: [ForeignOverlayWindowSnapshot],
+        ownPID: Int32,
+        targetPID: Int32,
+        targetWindowID: CGWindowID,
+        ignoredWindowIDs: Set<CGWindowID>,
+        overlayCGRect: CGRect,
+        displays: [DisplayDescriptor]
+    ) -> ForeignOverlayWindowSnapshot? {
+        let statusLayer = Int(CGWindowLevelForKey(.statusWindow))
+        let normalizedOverlay = overlayCGRect.standardized
+
+        for win in windowsAboveOverlay {
+            guard win.alpha > 0.01 else { continue }
+            guard win.pid != ownPID, !ignoredWindowIDs.contains(win.windowID) else { continue }
+
+            let bounds = win.bounds.standardized
+            guard bounds.width >= 16, bounds.height >= 16 else { continue }
+
+            let ownerLower = win.ownerName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+            // macOS built-in screenshot / screen-recording UI (`⇧⌘4` / `⇧⌘5`).
+            if ownerLower == "screencaptureui" {
+                return win
+            }
+
+            if ignoredShellOverlayOwnerNames.contains(ownerLower) {
+                continue
+            }
+
+            let coversAnyDisplay = displays.contains { display in
+                let db = display.cgBounds.standardized
+                guard db.width > 1, db.height > 1 else { return false }
+                let inter = bounds.intersection(db)
+                guard !inter.isNull, !inter.isEmpty else { return false }
+                return inter.width >= db.width * 0.70 && inter.height >= db.height * 0.70
+            }
+
+            // Target app itself (e.g. WeChat / QQ / DingTalk / Feishu built-in screenshot while
+            // scaling that app): ignore normal popup menus / video OSC bars, ONLY yield for a
+            // separate high-layer display-covering capture shield.
+            if win.pid == targetPID {
+                if win.windowID != targetWindowID && win.layer >= statusLayer && coversAnyDisplay {
+                    return win
+                }
+                continue
+            }
+
+            // Third-party screenshot / screen-capture tool overlay covering any attached display
+            // (including another monitor in a multi-display setup since CGDisplayHideCursor is global!).
+            if coversAnyDisplay {
+                return win
+            }
+
+            // High-layer third-party capture overlay covering most of MetalPie's scaled overlay
+            // (e.g. window-targeted capture frame over a windowed MetalPie session).
+            if win.layer >= statusLayer,
+               bounds.width >= 200,
+               bounds.height >= 150,
+               !normalizedOverlay.isEmpty
+            {
+                let ovInter = bounds.intersection(normalizedOverlay)
+                if !ovInter.isNull,
+                   !ovInter.isEmpty,
+                   ovInter.width >= normalizedOverlay.width * 0.75,
+                   ovInter.height >= normalizedOverlay.height * 0.75
+                {
+                    return win
+                }
+            }
+        }
+
+        return nil
     }
 
     /// Returns `true` when `overlayRect` completely covers `sourceRect` (within `tolerance` points).

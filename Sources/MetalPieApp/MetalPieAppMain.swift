@@ -54,6 +54,12 @@ struct MetalPieApp: App {
         .defaultSize(width: 1040, height: 720)
         .windowResizability(.contentMinSize)
         .commands {
+            CommandGroup(after: .appInfo) {
+                let l10n = coordinator.l10n
+                Button(l10n.tr("Check for Updates…", "检查更新…")) {
+                    openMainWindowAndCheckUpdates()
+                }
+            }
             CommandGroup(replacing: .newItem) {}
             CommandMenu("MetalPie") {
                 let l10n = coordinator.l10n
@@ -197,13 +203,21 @@ struct MetalPieApp: App {
 
         Divider()
 
-        Button(l10n.tr("Open Window", "打开窗口")) {
-            NSApp.activate(ignoringOtherApps: true)
-            if let existing = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }) {
-                existing.makeKeyAndOrderFront(nil)
-            } else {
-                openWindow(id: "main")
+        if let release = coordinator.updateManager.state.availableRelease {
+            Button(l10n.tr(
+                "Update Available (\(release.version.displayString))…",
+                "发现新版本 \(release.version.displayString)…"
+            )) {
+                openMainWindowAndCheckUpdates()
             }
+        } else {
+            Button(l10n.tr("Check for Updates…", "检查更新…")) {
+                openMainWindowAndCheckUpdates()
+            }
+        }
+
+        Button(l10n.tr("Open Window", "打开窗口")) {
+            bringMainWindowToFront()
         }
 
         Button(l10n.tr("Quit MetalPie", "退出 MetalPie")) {
@@ -211,6 +225,23 @@ struct MetalPieApp: App {
             NSApp.terminate(nil)
         }
         .keyboardShortcut("q")
+    }
+
+    private func bringMainWindowToFront() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let existing = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }) {
+            existing.makeKeyAndOrderFront(nil)
+        } else {
+            openWindow(id: "main")
+        }
+    }
+
+    private func openMainWindowAndCheckUpdates() {
+        coordinator.selectedTab = .settings
+        bringMainWindowToFront()
+        if !coordinator.updateManager.state.isBusy && coordinator.updateManager.state.availableRelease == nil {
+            Task { await coordinator.checkForUpdates(userInitiated: true) }
+        }
     }
 
     /// Automated visual verification snapshot helper triggered ONLY when `--snapshot-out <path.png>` is passed.

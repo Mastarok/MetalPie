@@ -437,16 +437,10 @@ struct ProfilesView: View {
     private func captureAndOverlayCard(profile: Profile, l10n: L10n) -> some View {
         SectionCard(title: l10n.tr("Capture & Overlay", "捕获与界面")) {
             VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 24) {
-                    Toggle(
-                        l10n.tr("Capture Title Bar", "捕获标题栏"),
-                        isOn: binding(profile.id, \.capture.captureTitleBar)
-                    )
-                    Toggle(
-                        l10n.tr("Ignore Window Shadows", "忽略窗口阴影"),
-                        isOn: binding(profile.id, \.capture.ignoreShadows)
-                    )
-                }
+                Toggle(
+                    l10n.tr("Ignore Window Shadows", "忽略窗口阴影"),
+                    isOn: binding(profile.id, \.capture.ignoreShadows)
+                )
                 .font(.system(size: 12.5))
 
                 Divider()

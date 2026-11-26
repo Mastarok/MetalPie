@@ -165,6 +165,7 @@ public struct AppConfig: Hashable, Codable, Sendable {
     public var screenshotFilenameTemplate: String
     public var launchAtLogin: Bool
     public var keepRunningInMenuBar: Bool
+    public var automaticallyCheckForUpdates: Bool
     public var autoScaleExcludedBundleIDs: [String]
 
     public init(
@@ -178,6 +179,7 @@ public struct AppConfig: Hashable, Codable, Sendable {
         screenshotFilenameTemplate: String = AppConfig.defaultScreenshotFilenameTemplate,
         launchAtLogin: Bool = false,
         keepRunningInMenuBar: Bool = true,
+        automaticallyCheckForUpdates: Bool = true,
         autoScaleExcludedBundleIDs: [String] = AppConfig.defaultAutoScaleExcludedBundleIDs
     ) {
         self.schemaVersion = schemaVersion
@@ -190,7 +192,45 @@ public struct AppConfig: Hashable, Codable, Sendable {
         self.screenshotFilenameTemplate = screenshotFilenameTemplate
         self.launchAtLogin = launchAtLogin
         self.keepRunningInMenuBar = keepRunningInMenuBar
+        self.automaticallyCheckForUpdates = automaticallyCheckForUpdates
         self.autoScaleExcludedBundleIDs = autoScaleExcludedBundleIDs
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case profiles
+        case scalingModes
+        case hotkeys
+        case countdownSeconds
+        case language
+        case screenshotDirectory
+        case screenshotFilenameTemplate
+        case launchAtLogin
+        case keepRunningInMenuBar
+        case automaticallyCheckForUpdates
+        case autoScaleExcludedBundleIDs
+    }
+
+    /// Backwards-compatible Codable decoding so saved configs lacking newer fields (such as
+    /// `automaticallyCheckForUpdates`) load cleanly with defaults.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? AppConfig.currentSchemaVersion
+        self.profiles = try c.decodeIfPresent([Profile].self, forKey: .profiles) ?? [.defaultProfile]
+        self.scalingModes = try c.decodeIfPresent([ScalingMode].self, forKey: .scalingModes) ?? ScalingMode.builtInPresets
+        self.hotkeys = try c.decodeIfPresent(HotkeyConfig.self, forKey: .hotkeys) ?? HotkeyConfig()
+        let rawCountdown = try c.decodeIfPresent(Int.self, forKey: .countdownSeconds) ?? 3
+        self.countdownSeconds = min(max(rawCountdown, 1), 10)
+        self.language = try c.decodeIfPresent(AppLanguage.self, forKey: .language) ?? .system
+        self.screenshotDirectory = try c.decodeIfPresent(String.self, forKey: .screenshotDirectory)
+            ?? AppConfig.defaultScreenshotDirectoryPath
+        self.screenshotFilenameTemplate = try c.decodeIfPresent(String.self, forKey: .screenshotFilenameTemplate)
+            ?? AppConfig.defaultScreenshotFilenameTemplate
+        self.launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
+        self.keepRunningInMenuBar = try c.decodeIfPresent(Bool.self, forKey: .keepRunningInMenuBar) ?? true
+        self.automaticallyCheckForUpdates = try c.decodeIfPresent(Bool.self, forKey: .automaticallyCheckForUpdates) ?? true
+        self.autoScaleExcludedBundleIDs = try c.decodeIfPresent([String].self, forKey: .autoScaleExcludedBundleIDs)
+            ?? AppConfig.defaultAutoScaleExcludedBundleIDs
     }
 
     public static var defaultScreenshotDirectoryPath: String {

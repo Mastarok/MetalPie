@@ -156,6 +156,7 @@ public final class AppCoordinator {
     // MARK: - Engine Subsystems
 
     public let configStore: ConfigStore
+    public let updateManager = AppUpdateManager()
     public let metalDevice: (any MTLDevice)?
     public let effectChainRenderer: EffectChainRenderer?
     private let screenCaptureEngine: ScreenCaptureEngine?
@@ -194,12 +195,17 @@ public final class AppCoordinator {
     private struct PopupMenuMonitorSnapshot: Sendable {
         var isActive: Bool = false
         var targetPID: Int32 = 0
+        var targetWindowID: CGWindowID = 0
         var sourceCGRect: CGRect = .zero
+        var overlayCGRect: CGRect = .zero
         var displays: [DisplayDescriptor] = []
         var menuBarHeightByDisplayID: [CGDirectDisplayID: CGFloat] = [:]
         var overlayWindowID: CGWindowID? = nil
+        var ignoredOverlayWindowIDs: Set<CGWindowID> = []
+        var isVRRDirectScanoutActive: Bool = false
         var isBoosted: Bool = false
         var isMenuBarDropdownActive: Bool = false
+        var isYieldedForForeignOverlay: Bool = false
     }
 
     private struct ChromeVisibilitySnapshot: Equatable {
@@ -353,6 +359,10 @@ public final class AppCoordinator {
         refreshShaderCacheMetadata()
         refreshDisplays()
         refreshLogs()
+
+        if snapshotOutputPath == nil {
+            updateManager.performStartupCheckIfNeeded(enabled: loadedConfig.automaticallyCheckForUpdates)
+        }
 
         Task {
             await self.refreshWindows(captureThumbnails: true)
@@ -1406,8 +1416,8 @@ public final class AppCoordinator {
         renderLoopController?.setPaused(isPaused)
         if isPaused {
             overlayWindowController?.setPopupMenuLevelBoost(false)
-            stopPopupMenuMonitor()
             cursorController.suspend()
+            stopPopupMenuMonitor()
             telemetry.state = .suspended
         } else {
             cursorController.resume()
@@ -1694,6 +1704,63 @@ public final class AppCoordinator {
         logEntries = []
     }
 
+    // MARK: - In-App Software Updates
+
+    public func checkForUpdates(userInitiated: Bool = true) async {
+        await updateManager.checkForUpdates(userInitiated: userInitiated)
+        guard userInitiated else { return }
+
+        switch updateManager.state {
+        case .available(let release):
+            showToast(
+                icon: "arrow.down.circle.fill",
+                title: l10n.tr(
+                    "Update Available: \(release.version.displayString)",
+                    "发现新版本 \(release.version.displayString)"
+                ),
+                subtitle: l10n.tr("Open Settings to download and install.", "前往「设置」即可下载并安装"),
+                style: .info,
+                durationSeconds: 3.6
+            )
+        case .upToDate(let version, _):
+            showToast(
+                icon: "checkmark.circle.fill",
+                title: l10n.tr("MetalPie is Up to Date", "已是最新版本"),
+                subtitle: version.displayString,
+                style: .success
+            )
+        case .failed(let message):
+            showToast(
+                icon: "exclamationmark.triangle.fill",
+                title: l10n.tr("Update Check Failed", "检查更新失败"),
+                subtitle: message,
+                style: .warning,
+                durationSeconds: 4.0
+            )
+        default:
+            break
+        }
+    }
+
+    public func installPreparedUpdate() {
+        let relaunching = updateManager.installPreparedUpdateAndRelaunch { [weak self] in
+            self?.prepareForTermination()
+            RunGuardWatchdog.forceRestoreSystemCursor()
+        }
+        if !relaunching {
+            showToast(
+                icon: "shippingbox.fill",
+                title: l10n.tr("Verified DMG Opened", "已打开校验通过的安装包"),
+                subtitle: l10n.tr(
+                    "Drag MetalPie.app to Applications to finish updating.",
+                    "请将 MetalPie.app 拖入「应用程序」完成更新"
+                ),
+                style: .info,
+                durationSeconds: 4.2
+            )
+        }
+    }
+
     public func showToast(
         icon: String,
         title: String,
@@ -1864,6 +1931,7 @@ public final class AppCoordinator {
         )
         if lastSyncedChromeVisibility == currentChromeSnapshot {
             updateChromePanelFrames(for: metrics.cocoaFrame)
+            syncPopupMonitorSnapshot()
         } else {
             syncOverlayChromeVisibility(profile: effectiveProfile, metrics: metrics)
         }
@@ -1941,12 +2009,12 @@ public final class AppCoordinator {
                 return
             }
             // Immediately hide overlay & restore OS cursor on Cmd+Tab (zero stuck overlay!).
-            stopPopupMenuMonitor()
             overlayWindowController?.suspend()
             screenCaptureEngine?.setPaused(true)
             renderLoopController?.setPaused(true)
             cursorController.updateInteractiveChromeRects([])
             cursorController.suspend()
+            stopPopupMenuMonitor()
             toolbarPanel.hide()
             profilerHUDPanel.hide()
             lastSyncedChromeVisibility = nil
@@ -1987,12 +2055,12 @@ public final class AppCoordinator {
                 return
             }
             // Magpie Auto-Reposition Wait: suspend cleanly and auto-resume upon restore.
-            stopPopupMenuMonitor()
             overlayWindowController?.suspend()
             screenCaptureEngine?.setPaused(true)
             renderLoopController?.setPaused(true)
             cursorController.updateInteractiveChromeRects([])
             cursorController.suspend()
+            stopPopupMenuMonitor()
             toolbarPanel.hide()
             profilerHUDPanel.hide()
             lastSyncedChromeVisibility = nil
@@ -2397,7 +2465,8 @@ public final class AppCoordinator {
             toolbarPanel.hide()
             profilerHUDPanel.hide()
             syncInteractiveChromeRects()
-            stopPopupMenuMonitor()
+            overlayWindowController?.setPopupMenuLevelBoost(false)
+            startOrUpdatePopupMenuMonitor()
             if isProfilerHUDActive {
                 updateVRRGPUHUDOverlay(telemetry: telemetry, metrics: metrics)
             } else {
@@ -2866,11 +2935,17 @@ public final class AppCoordinator {
     private func stopPopupMenuMonitor() {
         popupMenuMonitorTimer?.cancel()
         popupMenuMonitorTimer = nil
-        popupMenuMonitorState.withLock { s in
+        let wasYielded = popupMenuMonitorState.withLock { s -> Bool in
+            let prev = s.isYieldedForForeignOverlay
             s.isActive = false
             s.isBoosted = false
             s.isMenuBarDropdownActive = false
+            s.isYieldedForForeignOverlay = false
             s.overlayWindowID = nil
+            return prev
+        }
+        if wasYielded {
+            cursorController.setYieldedForForeignOverlay(false)
         }
         overlayWindowController?.setPopupMenuLevelBoost(false)
     }
@@ -2880,14 +2955,17 @@ public final class AppCoordinator {
             && !isPaused
             && (overlayWindowController?.isRevealed ?? false)
             && !(overlayWindowController?.isSuspended ?? true)
-            && !(lastOverlayMetrics?.isVRRDirectScanoutActive ?? false)
         let targetPID = activeWindow?.pid ?? 0
+        let targetWID = activeWindow?.windowID ?? 0
         let sourceRect = activeWindow?.cgBounds ?? .zero
+        let overlayRect = lastOverlayMetrics?.cgFrame ?? .zero
+        let isVRRActive = lastOverlayMetrics?.isVRRDirectScanoutActive ?? false
         let currentDisplays = displays.isEmpty ? WindowEnumerator.enumerateDisplaysOnMain() : displays
         let overlayWID: CGWindowID? = {
             guard let num = overlayWindowController?.panel?.windowNumber, num > 0 else { return nil }
             return CGWindowID(num)
         }()
+        let ignoredIDs = lastIgnoredOverlayWindowIDs
         var mbHeights: [CGDirectDisplayID: CGFloat] = [:]
         for screen in NSScreen.screens {
             if let did = WindowEnumerator.screenDisplayID(for: screen) {
@@ -2903,15 +2981,20 @@ public final class AppCoordinator {
         popupMenuMonitorState.withLock { s in
             s.isActive = isActive
             s.targetPID = targetPID
+            s.targetWindowID = targetWID
             s.sourceCGRect = sourceRect
+            s.overlayCGRect = overlayRect
             s.displays = currentDisplays
             s.menuBarHeightByDisplayID = finalMenuBarHeights
             s.overlayWindowID = overlayWID
+            s.ignoredOverlayWindowIDs = ignoredIDs
+            s.isVRRDirectScanoutActive = isVRRActive
             if !isActive {
                 s.isBoosted = false
                 s.isMenuBarDropdownActive = false
+                s.isYieldedForForeignOverlay = false
             } else {
-                s.isBoosted = boosted
+                s.isBoosted = isVRRActive ? false : boosted
             }
         }
     }
@@ -2921,63 +3004,123 @@ public final class AppCoordinator {
         guard snap.isActive, snap.targetPID > 0 else { return }
 
         let popUpLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
+        let ownPID = ProcessInfo.processInfo.processIdentifier
         let rawList: [[String: Any]]?
+        let queryWasAboveOverlayOnly: Bool
         if !snap.isBoosted, let ovWID = snap.overlayWindowID {
             rawList = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], ovWID) as? [[String: Any]]
+            queryWasAboveOverlayOnly = true
         } else {
             rawList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+            queryWasAboveOverlayOnly = false
         }
 
+        var foreignAbove: [ForeignOverlayWindowSnapshot] = []
         var popups: [PopupMenuWindowSnapshot] = []
+        var passedOverlayWindow = false
+
         if let rawList {
             for dict in rawList {
-                guard let layer = (dict[kCGWindowLayer as String] as? NSNumber)?.intValue,
-                      layer == popUpLayer,
+                guard let widNum = dict[kCGWindowNumber as String] as? NSNumber,
                       let pid = (dict[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
-                      pid == snap.targetPID,
-                      let widNum = dict[kCGWindowNumber as String] as? NSNumber,
+                      let layer = (dict[kCGWindowLayer as String] as? NSNumber)?.intValue,
                       let boundsDict = dict[kCGWindowBounds as String] as? NSDictionary,
                       let bounds = CGRect(dictionaryRepresentation: boundsDict)
                 else {
                     continue
                 }
+                let wid = CGWindowID(widNum.uint32Value)
                 let alpha = (dict[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1.0
-                popups.append(PopupMenuWindowSnapshot(
-                    windowID: CGWindowID(widNum.uint32Value),
-                    pid: pid,
-                    layer: layer,
-                    bounds: bounds,
-                    alpha: alpha
-                ))
+
+                if !queryWasAboveOverlayOnly, let ovWID = snap.overlayWindowID, wid == ovWID {
+                    passedOverlayWindow = true
+                }
+
+                if queryWasAboveOverlayOnly || !passedOverlayWindow {
+                    let ownerName = (dict[kCGWindowOwnerName as String] as? String) ?? ""
+                    foreignAbove.append(ForeignOverlayWindowSnapshot(
+                        windowID: wid,
+                        pid: pid,
+                        ownerName: ownerName,
+                        layer: layer,
+                        bounds: bounds,
+                        alpha: alpha
+                    ))
+                }
+
+                if !snap.isVRRDirectScanoutActive, layer == popUpLayer, pid == snap.targetPID {
+                    popups.append(PopupMenuWindowSnapshot(
+                        windowID: wid,
+                        pid: pid,
+                        layer: layer,
+                        bounds: bounds,
+                        alpha: alpha
+                    ))
+                }
             }
         }
 
-        let pointerCG: CGPoint?
-        if cursorController.alignmentMode == .scaledConfinedEventTap {
-            pointerCG = cursorController.currentState.scaledCGPosition
+        let detectedForeignCapture: ForeignOverlayWindowSnapshot?
+        if snap.overlayWindowID != nil {
+            detectedForeignCapture = OverlayWindowController.detectForeignCaptureOverlayAbove(
+                windowsAboveOverlay: foreignAbove,
+                ownPID: ownPID,
+                targetPID: snap.targetPID,
+                targetWindowID: snap.targetWindowID,
+                ignoredWindowIDs: snap.ignoredOverlayWindowIDs,
+                overlayCGRect: snap.overlayCGRect,
+                displays: snap.displays
+            )
         } else {
-            pointerCG = CGEvent(source: nil)?.location
+            detectedForeignCapture = nil
+        }
+        let shouldYieldCursor = (detectedForeignCapture != nil)
+
+        let evaluation: PopupMenuLevelEvaluation
+        if snap.isVRRDirectScanoutActive || shouldYieldCursor {
+            evaluation = PopupMenuLevelEvaluation(
+                shouldBoostAbovePopupMenus: false,
+                isMenuBarDropdownActive: false
+            )
+        } else {
+            let pointerCG: CGPoint?
+            if cursorController.alignmentMode == .scaledConfinedEventTap {
+                pointerCG = cursorController.currentState.scaledCGPosition
+            } else {
+                pointerCG = CGEvent(source: nil)?.location
+            }
+
+            evaluation = OverlayWindowController.evaluatePopupMenuLevelBoost(
+                popupWindows: popups,
+                targetPID: snap.targetPID,
+                sourceCGRect: snap.sourceCGRect,
+                displays: snap.displays,
+                pointerCGPosition: pointerCG,
+                menuBarHeightByDisplayID: snap.menuBarHeightByDisplayID,
+                wasBoosted: snap.isBoosted,
+                wasMenuBarDropdownActive: snap.isMenuBarDropdownActive
+            )
         }
 
-        let evaluation = OverlayWindowController.evaluatePopupMenuLevelBoost(
-            popupWindows: popups,
-            targetPID: snap.targetPID,
-            sourceCGRect: snap.sourceCGRect,
-            displays: snap.displays,
-            pointerCGPosition: pointerCG,
-            menuBarHeightByDisplayID: snap.menuBarHeightByDisplayID,
-            wasBoosted: snap.isBoosted,
-            wasMenuBarDropdownActive: snap.isMenuBarDropdownActive
-        )
-
-        let boostChanged = popupMenuMonitorState.withLock { s -> Bool in
-            let changed = (s.isBoosted != evaluation.shouldBoostAbovePopupMenus)
+        let transitions = popupMenuMonitorState.withLock { s -> (boostChanged: Bool, yieldChanged: Bool) in
+            let boostChanged = (s.isBoosted != evaluation.shouldBoostAbovePopupMenus)
+            let yieldChanged = (s.isYieldedForForeignOverlay != shouldYieldCursor)
             s.isBoosted = evaluation.shouldBoostAbovePopupMenus
             s.isMenuBarDropdownActive = evaluation.isMenuBarDropdownActive
-            return changed
+            s.isYieldedForForeignOverlay = shouldYieldCursor
+            return (boostChanged, yieldChanged)
         }
 
-        if boostChanged {
+        if transitions.yieldChanged {
+            cursorController.setYieldedForForeignOverlay(shouldYieldCursor)
+            if snap.isVRRDirectScanoutActive {
+                Task { @MainActor [weak self] in
+                    self?.syncVRRCursorSnapshotIfNeeded()
+                }
+            }
+        }
+
+        if transitions.boostChanged {
             let shouldBoost = evaluation.shouldBoostAbovePopupMenus
             Task { @MainActor [weak self] in
                 guard let self, self.isScalingSessionOpen else { return }
@@ -3135,6 +3278,7 @@ public final class AppCoordinator {
         if force || current != lastIgnoredOverlayWindowIDs {
             lastIgnoredOverlayWindowIDs = current
             windowLifecycleWatcher.updateIgnoredOverlayWindowIDs(current)
+            popupMenuMonitorState.withLock { $0.ignoredOverlayWindowIDs = current }
         }
     }
 

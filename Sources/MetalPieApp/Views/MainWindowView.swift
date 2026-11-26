@@ -16,13 +16,21 @@ public struct MainWindowView: View {
 
         NavigationSplitView {
             List(AppTab.allCases, selection: $coordinator.selectedTab) { tab in
-                Label {
-                    Text(tab.title(l10n))
-                        .font(.system(size: 13, weight: .medium))
-                } icon: {
-                    Image(systemName: tab.symbolName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 18, alignment: .center)
+                HStack(spacing: 6) {
+                    Label {
+                        Text(tab.title(l10n))
+                            .font(.system(size: 13, weight: .medium))
+                    } icon: {
+                        Image(systemName: tab.symbolName)
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 18, alignment: .center)
+                    }
+                    if tab == .settings, coordinator.updateManager.state.availableRelease != nil {
+                        Spacer(minLength: 4)
+                        Circle()
+                            .fill(Color.green)
+                            .frame(width: 7, height: 7)
+                    }
                 }
                 .tag(tab)
                 .padding(.vertical, 2)

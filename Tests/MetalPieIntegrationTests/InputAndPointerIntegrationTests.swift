@@ -354,6 +354,80 @@ struct InputAndPointerIntegrationTests {
         #expect(SystemCursorHider.processHideDepth == 0)
     }
 
+    @Test("CursorOverlayController foreign-overlay yield restores OS cursor, passes events through 1:1, and stays orthogonal to suspend")
+    func cursorYieldOrthogonalityAndPassthrough() throws {
+        let controller = CursorOverlayController(presentationMode: .overlayLayer)
+        defer { controller.stop() }
+
+        let config = CursorMappingConfiguration(
+            sourceCGRect: CGRect(x: 100, y: 100, width: 640, height: 360),
+            destinationCGRect: CGRect(x: 0, y: 33, width: 1512, height: 949),
+            overlayCGRect: CGRect(x: 0, y: 33, width: 1512, height: 949),
+            backingScaleFactor: 2.0,
+            settings: CursorSettings(renderScaledCursor: true, confineCursor: true, adjustCursorSpeed: true),
+            threeDGameMode: false
+        )
+
+        controller.activateForEventTapTesting(
+            configuration: config,
+            displays: [Self.macBookPrimary],
+            initialPointer: CGPoint(x: 320, y: 240)
+        )
+        controller.cursorHiderForTesting.setAllowedToHide(true)
+        controller.cursorHiderForTesting.hide()
+        #expect(controller.cursorHiderForTesting.hideDepth == 1)
+        #expect(controller.currentState.isVisible == true)
+
+        // Enter third-party screenshot UI -> yield cursor immediately
+        controller.setYieldedForForeignOverlay(true)
+        #expect(controller.isYieldedForForeignOverlay == true)
+        #expect(controller.isSuspended == false)
+        #expect(controller.currentState.isVisible == false)
+        #expect(controller.cursorHiderForTesting.isAllowedToHide == false)
+        #expect(controller.cursorHiderForTesting.hideDepth == 0)
+
+        // Drift check must NEVER re-hide OS cursor while yielded for screenshot tool!
+        let reasserted = controller.cursorHiderForTesting.reassertHiddenIfDrifted(
+            now: 100.0,
+            assumedCursorVisibleForTesting: true
+        )
+        #expect(reasserted == false)
+        #expect(controller.cursorHiderForTesting.hideDepth == 0)
+
+        // Mouse events during screenshot UI MUST pass through 1:1 untouched (no confinement/rewriting)
+        let box = EventTapCallbackBox(controller: controller)
+        let testPt = CGPoint(x: 1420, y: 900)
+        let moveEvent = try #require(CGEvent(
+            mouseEventSource: nil,
+            mouseType: .mouseMoved,
+            mouseCursorPosition: testPt,
+            mouseButton: .left
+        ))
+        let dummyProxy = OpaquePointer(bitPattern: 1)!
+        let returned = box.invoke(proxy: dummyProxy, type: .mouseMoved, event: moveEvent)
+        #expect(returned != nil)
+        #expect(abs(moveEvent.location.x - testPt.x) < 0.01)
+        #expect(abs(moveEvent.location.y - testPt.y) < 0.01)
+
+        // Orthogonality: suspend while yielded, then exit screenshot overlay -> MUST remain suspended!
+        controller.suspend()
+        #expect(controller.isSuspended == true)
+        controller.setYieldedForForeignOverlay(false)
+        #expect(controller.isYieldedForForeignOverlay == false)
+        #expect(controller.isSuspended == true)
+        #expect(controller.cursorHiderForTesting.isAllowedToHide == false)
+        #expect(controller.cursorHiderForTesting.hideDepth == 0)
+        #expect(controller.currentState.isVisible == false)
+
+        // Re-yield while suspended, then call resume() -> MUST remain yielded until foreign overlay closes!
+        controller.setYieldedForForeignOverlay(true)
+        controller.resume()
+        #expect(controller.isSuspended == false)
+        #expect(controller.isYieldedForForeignOverlay == true)
+        #expect(controller.cursorHiderForTesting.isAllowedToHide == false)
+        #expect(controller.currentState.isVisible == false)
+    }
+
     @Test("AutoScaleController enforces bundle+title regex specificity, blacklist, popup/tiny exemption, and anti-retrigger lock")
     func autoScaleControllerRulesAndSafeguards() async throws {
         var config = AppConfig.defaultConfig
