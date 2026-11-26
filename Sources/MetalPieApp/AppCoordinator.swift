@@ -2926,13 +2926,25 @@ public final class AppCoordinator {
         }
         guard popupMenuMonitorTimer == nil else { return }
 
+        let timer = makePopupMenuMonitorTimer()
+        popupMenuMonitorTimer = timer
+        timer.resume()
+    }
+
+    /// Creates the background `DispatchSourceTimer` inside a `nonisolated` method so Swift 6 NEVER
+    /// implicitly isolates the GCD `setEventHandler` closure to `@MainActor` (which otherwise traps
+    /// via `dispatch_assert_queue(main)` when firing on `popupMenuMonitorQueue`).
+    nonisolated private func makePopupMenuMonitorTimer() -> any DispatchSourceTimer {
         let timer = DispatchSource.makeTimerSource(queue: popupMenuMonitorQueue)
-        timer.schedule(deadline: .now() + .milliseconds(35), repeating: .milliseconds(35), leeway: .milliseconds(8))
+        timer.schedule(
+            deadline: .now() + .milliseconds(35),
+            repeating: .milliseconds(35),
+            leeway: .milliseconds(8)
+        )
         timer.setEventHandler { [weak self] in
             self?.pollPopupMenuWindowBoostOnBackground()
         }
-        popupMenuMonitorTimer = timer
-        timer.resume()
+        return timer
     }
 
     private func stopPopupMenuMonitor() {
