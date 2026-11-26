@@ -52,6 +52,7 @@ public struct SystemCapabilitiesSnapshot: Sendable {
     public var supportsVTSuperResolution: Bool
     public var supportsVTFrameInterpolation: Bool
     public var macOSVersionString: String
+    public var physicalMemoryGB: Int
     public var recommendedWorkingSetMB: Int
 }
 
@@ -285,6 +286,7 @@ public final class AppCoordinator {
             workingSetMB = Int(device.recommendedMaxWorkingSetSize / (1024 * 1024))
         }
 
+        let physicalGB = Int((Double(ProcessInfo.processInfo.physicalMemory) / (1024.0 * 1024.0 * 1024.0)).rounded())
         self.capabilities = SystemCapabilitiesSnapshot(
             gpuName: device?.name ?? "Unavailable",
             supportsMetal3: supportsMetal3,
@@ -293,6 +295,7 @@ public final class AppCoordinator {
             supportsVTSuperResolution: VideoToolboxSuperResolution.isSupportedOnSystem,
             supportsVTFrameInterpolation: VideoToolboxMLProcessor.isFrameInterpolationSupportedOnSystem,
             macOSVersionString: ProcessInfo.processInfo.operatingSystemVersionString,
+            physicalMemoryGB: physicalGB,
             recommendedWorkingSetMB: workingSetMB
         )
 

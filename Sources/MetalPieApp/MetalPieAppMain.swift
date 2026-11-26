@@ -8,12 +8,23 @@ import SwiftUI
 @MainActor
 final class MetalPieAppDelegate: NSObject, NSApplicationDelegate {
     weak var coordinator: AppCoordinator?
+    var onReopenMainWindow: (@MainActor () -> Void)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if NSApp.activationPolicy() != .regular {
             NSApp.setActivationPolicy(.regular)
         }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        // MenuBarExtra's NSStatusBarWindow makes macOS pass `flag == true` even after the user
+        // closes the main window with the red ✕ button, so always restore/reopen the main window.
+        if let onReopenMainWindow {
+            onReopenMainWindow()
+            return false
+        }
+        return true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -38,10 +49,14 @@ struct MetalPieApp: App {
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
-        WindowGroup(id: "main") {
+        Window("MetalPie", id: "main") {
             MainWindowView(coordinator: coordinator)
                 .onAppear {
-                    appDelegate.coordinator = coordinator
+                    let coord = coordinator
+                    appDelegate.coordinator = coord
+                    appDelegate.onReopenMainWindow = { [weak coord, openWindow] in
+                        Self.reopenMainWindow(coordinator: coord, openWindowAction: openWindow)
+                    }
                     if !didStartSnapshotTask, let snapshotPath = coordinator.snapshotOutputPath {
                         didStartSnapshotTask = true
                         Task { @MainActor in
@@ -228,11 +243,35 @@ struct MetalPieApp: App {
     }
 
     private func bringMainWindowToFront() {
+        Self.reopenMainWindow(coordinator: coordinator, openWindowAction: openWindow)
+    }
+
+    @MainActor
+    private static func reopenMainWindow(
+        coordinator: AppCoordinator?,
+        openWindowAction: OpenWindowAction
+    ) {
+        if coordinator?.isScalingSessionOpen != true && NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
         NSApp.activate(ignoringOtherApps: true)
-        if let existing = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }) {
+        if let existing = NSApp.windows.first(where: { win in
+            win.canBecomeMain && !win.isSheet && !(win is NSPanel) && (win.isVisible || win.isMiniaturized)
+        }) {
+            if existing.isMiniaturized {
+                existing.deminiaturize(nil)
+            }
             existing.makeKeyAndOrderFront(nil)
         } else {
-            openWindow(id: "main")
+            openWindowAction(id: "main")
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                if let reopened = NSApp.windows.first(where: { win in
+                    win.canBecomeMain && !win.isSheet && !(win is NSPanel)
+                }) {
+                    reopened.makeKeyAndOrderFront(nil)
+                }
+            }
         }
     }
 

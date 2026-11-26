@@ -101,12 +101,16 @@ struct DiagnosticsView: View {
     private func hardwareSummaryBar(l10n: L10n) -> some View {
         let cap = coordinator.capabilities
         let memText: String = {
+            if cap.physicalMemoryGB > 0 {
+                return "\(cap.physicalMemoryGB) GB"
+            }
             if cap.recommendedWorkingSetMB >= 1024 {
                 let gb = (Double(cap.recommendedWorkingSetMB) / 1024.0).rounded()
                 return String(format: "%.0f GB", gb)
             }
             return "\(cap.recommendedWorkingSetMB) MB"
         }()
+        let gpuBudgetGB = (Double(cap.recommendedWorkingSetMB) / 1024.0).rounded()
         let metalLabel = cap.supportsMetal4 ? "Metal 4" : (cap.supportsMetal3 ? "Metal 3" : "Metal 2")
 
         return HStack(spacing: 12) {
@@ -118,6 +122,10 @@ struct DiagnosticsView: View {
                     .font(.system(size: 12.5, weight: .semibold))
                     .lineLimit(1)
             }
+            .help(l10n.tr(
+                "Unified Memory: \(memText) · Metal GPU Working Set: \(Int(gpuBudgetGB)) GB",
+                "统一内存：\(memText) · Metal GPU 可用上限：\(Int(gpuBudgetGB)) GB"
+            ))
 
             Divider().frame(height: 14)
 
