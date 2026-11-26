@@ -95,29 +95,28 @@ public final class AppUpdateManager {
         }
     }
 
-    /// Queries GitHub Releases API for the latest stable release.
+    /// Queries GitHub Releases for the latest stable release using rate-limit-free `github.com`
+    /// web endpoints first (immune to unauthenticated `api.github.com` 60/hr shared-IP/proxy limits),
+    /// enriching with GitHub REST API metadata when an update exists and quota permits.
     public func checkForUpdates(userInitiated: Bool) async {
         guard !state.isBusy else { return }
         if userInitiated {
             state = .checking
         }
 
-        var req = URLRequest(url: AppUpdateEvaluator.latestReleaseAPIURL)
-        req.httpMethod = "GET"
-        req.timeoutInterval = 15
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.setValue("MetalPie/\(currentVersion.numericString) (macOS)", forHTTPHeaderField: "User-Agent")
+        let userAgent = "MetalPie/\(currentVersion.numericString) (macOS)"
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: req)
-            if let http = response as? HTTPURLResponse {
-                if http.statusCode == 403 || http.statusCode == 429 {
-                    if userInitiated {
-                        state = .failed(message: "GitHub API rate limit reached. Please try again later or check GitHub Releases.")
-                    }
-                    return
-                }
+            // Step 1: Rate-limit-free latest stable tag probe on `github.com/Mastarok/MetalPie/releases/latest`.
+            var webReq = URLRequest(url: AppUpdateEvaluator.latestReleaseWebURL)
+            webReq.httpMethod = "GET"
+            webReq.timeoutInterval = 15
+            webReq.cachePolicy = .reloadIgnoringLocalCacheData
+            webReq.setValue("application/json", forHTTPHeaderField: "Accept")
+            webReq.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+
+            let (webData, webResponse) = try await URLSession.shared.data(for: webReq)
+            if let http = webResponse as? HTTPURLResponse {
                 if http.statusCode == 404 {
                     let now = Date()
                     recordCheckTime(now)
@@ -134,21 +133,39 @@ public final class AppUpdateManager {
                 }
             }
 
-            let release = try AppUpdateEvaluator.parseRelease(from: data, architecture: currentArchitecture())
+            guard let latestTag = AppUpdateEvaluator.parseLatestTag(fromWebJSON: webData, finalURL: webResponse.url),
+                  let latestVersion = SemanticVersion(parsing: latestTag)
+            else {
+                // Repository has no stable release tag yet (redirect stayed on `/releases`).
+                let now = Date()
+                recordCheckTime(now)
+                if userInitiated {
+                    state = .upToDate(currentVersion: currentVersion, checkedAt: now)
+                }
+                return
+            }
+
             let now = Date()
             recordCheckTime(now)
 
-            if AppUpdateEvaluator.isUpdateAvailable(currentVersion: currentVersion, latest: release) {
-                state = .available(release)
-                let msg = "Update available: \(release.version.displayString) (current \(currentVersion.displayString))."
-                PipelineLog.shared.info(.app, msg)
-                Self.osLog.notice("\(msg, privacy: .public)")
-            } else {
+            // Fast path: already on latest version — zero api.github.com calls needed!
+            guard latestVersion > currentVersion else {
                 state = .upToDate(currentVersion: currentVersion, checkedAt: now)
                 if userInitiated {
                     PipelineLog.shared.info(.app, "MetalPie is up to date (\(currentVersion.displayString)).")
                 }
+                return
             }
+
+            // Step 2: Update IS available — enrich metadata from API if quota allows, else seamlessly
+            // assemble full release + SHA-256 + notes from rate-limit-free github.com web endpoints.
+            let arch = currentArchitecture()
+            let release = try await resolveReleaseMetadata(forTag: latestTag, architecture: arch, userAgent: userAgent)
+
+            state = .available(release)
+            let msg = "Update available: \(release.version.displayString) (current \(currentVersion.displayString))."
+            PipelineLog.shared.info(.app, msg)
+            Self.osLog.notice("\(msg, privacy: .public)")
         } catch is CancellationError {
             if userInitiated { state = .idle }
         } catch let err as AppUpdateError where err == .draftOrPrereleaseIgnored {
@@ -163,6 +180,64 @@ public final class AppUpdateManager {
                 PipelineLog.shared.warning(.app, "Update check failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func resolveReleaseMetadata(
+        forTag tagName: String,
+        architecture: String,
+        userAgent: String
+    ) async throws -> AppUpdateRelease {
+        // Attempt rich REST API payload first (gives exact byte size + Markdown release notes).
+        if let apiURL = AppUpdateEvaluator.releaseTagAPIURL(forTag: tagName) {
+            var apiReq = URLRequest(url: apiURL)
+            apiReq.httpMethod = "GET"
+            apiReq.timeoutInterval = 10
+            apiReq.cachePolicy = .reloadIgnoringLocalCacheData
+            apiReq.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            apiReq.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+
+            if let (apiData, apiResp) = try? await URLSession.shared.data(for: apiReq),
+               let http = apiResp as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               let parsed = try? AppUpdateEvaluator.parseRelease(from: apiData, architecture: architecture)
+            {
+                return parsed
+            }
+        }
+
+        // Seamless rate-limit-free fallback: expanded_assets HTML + releases.atom feed on github.com.
+        var expandedHTML: String? = nil
+        if let assetsURL = AppUpdateEvaluator.expandedAssetsURL(forTag: tagName) {
+            var assetsReq = URLRequest(url: assetsURL)
+            assetsReq.timeoutInterval = 12
+            assetsReq.cachePolicy = .reloadIgnoringLocalCacheData
+            assetsReq.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+            if let (data, resp) = try? await URLSession.shared.data(for: assetsReq),
+               let http = resp as? HTTPURLResponse,
+               (200...299).contains(http.statusCode)
+            {
+                expandedHTML = String(data: data, encoding: .utf8)
+            }
+        }
+
+        var atomXML: Data? = nil
+        var atomReq = URLRequest(url: AppUpdateEvaluator.releasesAtomURL)
+        atomReq.timeoutInterval = 12
+        atomReq.cachePolicy = .reloadIgnoringLocalCacheData
+        atomReq.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        if let (data, resp) = try? await URLSession.shared.data(for: atomReq),
+           let http = resp as? HTTPURLResponse,
+           (200...299).contains(http.statusCode)
+        {
+            atomXML = data
+        }
+
+        return try AppUpdateEvaluator.buildReleaseFromWebMetadata(
+            tagName: tagName,
+            expandedAssetsHTML: expandedHTML,
+            atomXML: atomXML,
+            architecture: architecture
+        )
     }
 
     /// Downloads the release DMG, verifies SHA-256 checksum & code signature, and stages `MetalPie.app`.

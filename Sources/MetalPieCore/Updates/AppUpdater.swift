@@ -216,8 +216,38 @@ public enum AppUpdateEvaluator: Sendable {
         URL(string: "https://api.github.com/repos/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases/latest")!
     }
 
+    public static var latestReleaseWebURL: URL {
+        URL(string: "https://github.com/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases/latest")!
+    }
+
     public static var releasesPageURL: URL {
         URL(string: "https://github.com/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases")!
+    }
+
+    public static var releasesAtomURL: URL {
+        URL(string: "https://github.com/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases.atom")!
+    }
+
+    public static func releaseTagAPIURL(forTag tagName: String) -> URL? {
+        let encoded = tagName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? tagName
+        return URL(string: "https://api.github.com/repos/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases/tags/\(encoded)")
+    }
+
+    public static func releaseTagPageURL(forTag tagName: String) -> URL {
+        let encoded = tagName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? tagName
+        return URL(string: "https://github.com/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases/tag/\(encoded)")
+            ?? releasesPageURL
+    }
+
+    public static func expandedAssetsURL(forTag tagName: String) -> URL? {
+        let encoded = tagName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? tagName
+        return URL(string: "https://github.com/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases/expanded_assets/\(encoded)")
+    }
+
+    public static func assetDownloadURL(forTag tagName: String, fileName: String) -> URL? {
+        let encTag = tagName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? tagName
+        let encFile = fileName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? fileName
+        return URL(string: "https://github.com/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases/download/\(encTag)/\(encFile)")
     }
 
     /// Parses a GitHub Releases API JSON payload into a strongly typed `AppUpdateRelease`.
@@ -341,5 +371,285 @@ public enum AppUpdateEvaluator: Sendable {
             }
         }
         return nil
+    }
+
+    // MARK: - Rate-Limit-Free GitHub Web Endpoints (Zero api.github.com Quota)
+
+    private struct WebLatestReleaseStub: Decodable {
+        let tagName: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case tagName = "tag_name"
+        }
+    }
+
+    /// Extracts the latest stable release tag from `https://github.com/<owner>/<repo>/releases/latest`
+    /// (`Accept: application/json` body and/or redirected `/releases/tag/<tag>` final URL).
+    public static func parseLatestTag(fromWebJSON data: Data?, finalURL: URL?) -> String? {
+        if let data, !data.isEmpty,
+           let stub = try? JSONDecoder().decode(WebLatestReleaseStub.self, from: data),
+           let tag = stub.tagName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !tag.isEmpty
+        {
+            return tag
+        }
+
+        if let url = finalURL {
+            let comps = url.pathComponents
+            if let tagMarker = comps.firstIndex(of: "tag"), tagMarker + 1 < comps.count {
+                let rawTag = comps[tagMarker + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !rawTag.isEmpty {
+                    return rawTag.removingPercentEncoding ?? rawTag
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Parses asset download URLs (and optional inline `sha256:...` digest) from GitHub's
+    /// rate-limit-free `/releases/expanded_assets/<tag>` HTML fragment.
+    public static func parseExpandedAssets(
+        fromHTML html: String,
+        tagName: String,
+        architecture: String = "arm64"
+    ) -> (dmgAsset: GitHubReleaseAsset?, sha256Asset: GitHubReleaseAsset?, expectedSHA256: String?) {
+        let prefix = "/\(defaultRepositoryOwner)/\(defaultRepositoryName)/releases/download/"
+        guard let regex = try? NSRegularExpression(
+            pattern: #"href="(/[^"]+/releases/download/[^"]+)""#,
+            options: [.caseInsensitive]
+        ) else {
+            return (nil, nil, nil)
+        }
+
+        let nsHTML = html as NSString
+        let matches = regex.matches(in: html, range: NSRange(location: 0, length: nsHTML.length))
+
+        struct ParsedLink {
+            let asset: GitHubReleaseAsset
+            let matchRange: NSRange
+        }
+
+        var links: [ParsedLink] = []
+        var seenNames = Set<String>()
+
+        for match in matches {
+            guard match.numberOfRanges >= 2 else { continue }
+            let path = nsHTML.substring(with: match.range(at: 1))
+            guard path.lowercased().hasPrefix(prefix.lowercased()) else { continue }
+            guard let fullURL = URL(string: "https://github.com" + path) else { continue }
+            let rawName = fullURL.lastPathComponent
+            let name = rawName.removingPercentEncoding ?? rawName
+            guard !name.isEmpty, seenNames.insert(name).inserted else { continue }
+            links.append(ParsedLink(
+                asset: GitHubReleaseAsset(name: name, downloadURL: fullURL, size: 0, digest: nil),
+                matchRange: match.range
+            ))
+        }
+
+        let archLower = architecture.lowercased()
+        let dmgLinks = links.filter { $0.asset.name.lowercased().hasSuffix(".dmg") }
+        let selectedDMGLink = dmgLinks.first { $0.asset.name.lowercased().contains(archLower) }
+            ?? dmgLinks.first { $0.asset.name.lowercased().contains("universal") }
+            ?? dmgLinks.first
+
+        let selectedSHA: GitHubReleaseAsset?
+        if let dmg = selectedDMGLink?.asset {
+            let exact = dmg.name.lowercased() + ".sha256"
+            selectedSHA = links.first { $0.asset.name.lowercased() == exact }?.asset
+                ?? links.first { $0.asset.name.lowercased().hasSuffix(".sha256") }?.asset
+        } else {
+            selectedSHA = links.first { $0.asset.name.lowercased().hasSuffix(".sha256") }?.asset
+        }
+
+        // Look for an inline `sha256:<64-hex>` snippet belonging to the selected DMG entry.
+        var extractedSHA: String? = nil
+        if let dmgLink = selectedDMGLink,
+           let dmgIdx = links.firstIndex(where: { $0.asset.name == dmgLink.asset.name })
+        {
+            let sliceStart = dmgLink.matchRange.location + dmgLink.matchRange.length
+            let sliceEnd = (dmgIdx + 1 < links.count) ? links[dmgIdx + 1].matchRange.location : nsHTML.length
+            if sliceEnd > sliceStart {
+                let window = nsHTML.substring(with: NSRange(location: sliceStart, length: min(sliceEnd - sliceStart, 2048)))
+                if let shaRegex = try? NSRegularExpression(pattern: #"sha256:[0-9a-fA-F]{64}"#),
+                   let shaMatch = shaRegex.firstMatch(in: window, range: NSRange(location: 0, length: (window as NSString).length))
+                {
+                    let token = (window as NSString).substring(with: shaMatch.range)
+                    extractedSHA = parseSHA256Checksum(from: token)
+                }
+            }
+        }
+
+        return (selectedDMGLink?.asset, selectedSHA, extractedSHA)
+    }
+
+    /// Parses title, timestamp, and plain-text release notes for `matchingTag` from `releases.atom`.
+    public static func parseAtomReleaseEntry(
+        fromXML data: Data,
+        matchingTag tagName: String
+    ) -> (title: String?, publishedAt: Date?, notes: String?)? {
+        let delegate = AtomReleaseParserDelegate(targetTag: tagName)
+        let parser = XMLParser(data: data)
+        parser.delegate = delegate
+        guard parser.parse(), let matched = delegate.matchedEntry else {
+            return nil
+        }
+        let iso = ISO8601DateFormatter()
+        let date = matched.updated.flatMap { iso.date(from: $0) }
+        let notes = matched.contentHTML.map { stripHTMLToPlainText($0) }
+        return (matched.title, date, notes)
+    }
+
+    /// Builds a complete `AppUpdateRelease` solely from rate-limit-free `github.com` web endpoints
+    /// (falling back to deterministic MetalPie DMG/SHA-256 URLs when expanded assets HTML is unavailable).
+    public static func buildReleaseFromWebMetadata(
+        tagName: String,
+        expandedAssetsHTML: String?,
+        atomXML: Data?,
+        architecture: String = "arm64"
+    ) throws -> AppUpdateRelease {
+        guard let version = SemanticVersion(parsing: tagName) else {
+            throw AppUpdateError.unsupportedVersionTag(tagName)
+        }
+
+        let parsedAssets = expandedAssetsHTML.map {
+            parseExpandedAssets(fromHTML: $0, tagName: tagName, architecture: architecture)
+        }
+
+        let fallbackDMGName = "MetalPie-\(version.numericString)-\(architecture.lowercased()).dmg"
+        let fallbackDMG = assetDownloadURL(forTag: tagName, fileName: fallbackDMGName).map {
+            GitHubReleaseAsset(name: fallbackDMGName, downloadURL: $0, size: 0, digest: nil)
+        }
+        let fallbackSHA = assetDownloadURL(forTag: tagName, fileName: fallbackDMGName + ".sha256").map {
+            GitHubReleaseAsset(name: fallbackDMGName + ".sha256", downloadURL: $0, size: 0, digest: nil)
+        }
+
+        let atomEntry = atomXML.flatMap { parseAtomReleaseEntry(fromXML: $0, matchingTag: tagName) }
+        let title = (atomEntry?.title?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap {
+            $0.isEmpty ? nil : $0
+        } ?? "MetalPie \(version.displayString)"
+        let notes = (atomEntry?.notes ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return AppUpdateRelease(
+            version: version,
+            tagName: tagName,
+            title: title,
+            releaseNotes: notes,
+            releasePageURL: releaseTagPageURL(forTag: tagName),
+            publishedAt: atomEntry?.publishedAt,
+            dmgAsset: parsedAssets?.dmgAsset ?? fallbackDMG,
+            sha256Asset: parsedAssets?.sha256Asset ?? fallbackSHA,
+            expectedSHA256: parsedAssets?.expectedSHA256
+        )
+    }
+
+    private static func stripHTMLToPlainText(_ html: String) -> String {
+        var text = html
+            .replacingOccurrences(of: #"(?i)<br\s*/?>"#, with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)</(p|div|h[1-6]|li|pre|tr)>"#, with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)<li[^>]*>"#, with: "• ", options: .regularExpression)
+            .replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+
+        let entities: [(String, String)] = [
+            ("&amp;", "&"),
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&#39;", "'"),
+            ("&apos;", "'"),
+            ("&nbsp;", " ")
+        ]
+        for (entity, replacement) in entities {
+            text = text.replacingOccurrences(of: entity, with: replacement)
+        }
+
+        let lines = text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        var collapsed: [String] = []
+        var prevBlank = false
+        for line in lines {
+            if line.isEmpty {
+                if !prevBlank && !collapsed.isEmpty {
+                    collapsed.append("")
+                }
+                prevBlank = true
+            } else {
+                collapsed.append(line)
+                prevBlank = false
+            }
+        }
+        return collapsed.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+private final class AtomReleaseParserDelegate: NSObject, XMLParserDelegate {
+    struct Entry {
+        var id: String = ""
+        var title: String = ""
+        var updated: String = ""
+        var linkHref: String = ""
+        var contentHTML: String = ""
+    }
+
+    let targetTag: String
+    var matchedEntry: (title: String?, updated: String?, contentHTML: String?)?
+
+    private var inEntry = false
+    private var currentElement = ""
+    private var currentEntry = Entry()
+
+    init(targetTag: String) {
+        self.targetTag = targetTag
+    }
+
+    func parser(
+        _ parser: XMLParser,
+        didStartElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?,
+        attributes attributeDict: [String: String]
+    ) {
+        currentElement = elementName
+        if elementName == "entry" {
+            inEntry = true
+            currentEntry = Entry()
+        } else if inEntry && elementName == "link", let href = attributeDict["href"] {
+            currentEntry.linkHref = href
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard inEntry else { return }
+        switch currentElement {
+        case "id": currentEntry.id += string
+        case "title": currentEntry.title += string
+        case "updated": currentEntry.updated += string
+        case "content": currentEntry.contentHTML += string
+        default: break
+        }
+    }
+
+    func parser(
+        _ parser: XMLParser,
+        didEndElement elementName: String,
+        namespaceURI: String?,
+        qualifiedName qName: String?
+    ) {
+        if elementName == "entry" {
+            if matchedEntry == nil {
+                let tagSuffix = "/\(targetTag)"
+                let linkMatches = currentEntry.linkHref.hasSuffix("/releases/tag/\(targetTag)")
+                let idMatches = currentEntry.id.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(tagSuffix)
+                if linkMatches || idMatches {
+                    matchedEntry = (
+                        currentEntry.title.trimmingCharacters(in: .whitespacesAndNewlines),
+                        currentEntry.updated.trimmingCharacters(in: .whitespacesAndNewlines),
+                        currentEntry.contentHTML
+                    )
+                }
+            }
+            inEntry = false
+        }
+        currentElement = ""
     }
 }

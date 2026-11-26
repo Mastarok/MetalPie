@@ -176,4 +176,50 @@ struct AppUpdaterTests {
         let roundTrip = try JSONDecoder().decode(AppConfig.self, from: try encoder.encode(config))
         #expect(roundTrip.automaticallyCheckForUpdates == false)
     }
+
+    @Test("Rate-limit-free GitHub web JSON, redirect URL, expanded_assets HTML, and Atom feed parse cleanly")
+    func rateLimitFreeWebFallbackParsers() throws {
+        // 1. Web JSON stub from github.com/.../releases/latest
+        let webJSON = #"{"id":457882967,"tag_name":"v1.0.3","update_url":"/Mastarok/MetalPie/releases/tag/v1.0.3"}"#
+        #expect(AppUpdateEvaluator.parseLatestTag(fromWebJSON: Data(webJSON.utf8), finalURL: nil) == "v1.0.3")
+
+        // 2. Fallback to redirected final URL when body is HTML
+        let redirectURL = URL(string: "https://github.com/Mastarok/MetalPie/releases/tag/v1.0.4")!
+        #expect(AppUpdateEvaluator.parseLatestTag(fromWebJSON: Data("<html></html>".utf8), finalURL: redirectURL) == "v1.0.4")
+
+        // 3. Expanded assets HTML + Atom XML release assembly
+        let fakeHash = "283ecbb9940e2f4794e99bac89995f881ad42ca2daa86e9edb229e0750c3cc9e"
+        let expandedHTML = """
+        <a href="/Mastarok/MetalPie/releases/download/v1.0.3/MetalPie-1.0.3-arm64.dmg" rel="nofollow">
+        <span class="Truncate-text">sha256:\(fakeHash)</span>
+        <a href="/Mastarok/MetalPie/releases/download/v1.0.3/MetalPie-1.0.3-arm64.dmg.sha256" rel="nofollow">
+        """
+        let atomXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <entry>
+            <id>tag:github.com,2008:Repository/1471473963/v1.0.3</id>
+            <updated>2026-11-26T10:00:00Z</updated>
+            <link rel="alternate" type="text/html" href="https://github.com/Mastarok/MetalPie/releases/tag/v1.0.3"/>
+            <title>MetalPie v1.0.3</title>
+            <content type="html">&lt;h3&gt;Highlights&lt;/h3&gt;&lt;ul&gt;&lt;li&gt;In-app updater&lt;/li&gt;&lt;li&gt;Cursor &amp;amp; screenshot fix&lt;/li&gt;&lt;/ul&gt;</content>
+          </entry>
+        </feed>
+        """
+
+        let release = try AppUpdateEvaluator.buildReleaseFromWebMetadata(
+            tagName: "v1.0.3",
+            expandedAssetsHTML: expandedHTML,
+            atomXML: Data(atomXML.utf8),
+            architecture: "arm64"
+        )
+        #expect(release.version == SemanticVersion(major: 1, minor: 0, patch: 3))
+        #expect(release.title == "MetalPie v1.0.3")
+        #expect(release.dmgAsset?.downloadURL.absoluteString == "https://github.com/Mastarok/MetalPie/releases/download/v1.0.3/MetalPie-1.0.3-arm64.dmg")
+        #expect(release.sha256Asset?.downloadURL.absoluteString == "https://github.com/Mastarok/MetalPie/releases/download/v1.0.3/MetalPie-1.0.3-arm64.dmg.sha256")
+        #expect(release.expectedSHA256 == fakeHash)
+        #expect(release.releaseNotes.contains("In-app updater"))
+        #expect(release.releaseNotes.contains("Cursor & screenshot fix"))
+        #expect(release.publishedAt != nil)
+    }
 }
