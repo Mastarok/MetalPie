@@ -705,5 +705,92 @@ struct ScalingLayoutTests {
         // 2nd consecutive Retina probe (genuinely exited video to webpage) snaps back to .native!
         let backToRetina = tracker.ingest(candidate: nativeRetina, sourceSize: src3K, activeSliceCount: 28)
         #expect(backToRetina?.tier == .native)
+
+        // 11. Exact Gallagher Resampling-Grid FFT, Dual Sub-Harmonic Guard & Hybrid Classification:
+        // (a) 480p -> 1897p pure resampling wave (f = 480 / 1897 = 0.25303) -> recovers 480.0p!
+        let n1024 = 1024
+        var wave480 = [Float](repeating: 0, count: n1024)
+        let f480 = 480.0 / 1897.0
+        for i in 0..<n1024 {
+            wave480[i] = Float(0.05 + 0.02 * cos(2.0 * Double.pi * f480 * Double(i)))
+        }
+        let peak480 = wave480.withUnsafeBufferPointer {
+            OpticalResolutionClassifier.analyzeResamplingProfile($0, length: n1024)
+        }
+        #expect(peak480 != nil)
+        #expect((peak480?.snr ?? 0) > 20.0)
+        #expect(abs(((peak480?.frequencyCyclesPerPixel ?? 0) * 1897.0) - 480.0) < 2.0)
+
+        // (b) Exact 2.0x Nyquist alternation (1080p -> 2160p 4K, 1440p -> 2880p 5K) -> f = 0.500!
+        var wave2x = [Float](repeating: 0, count: n1024)
+        for i in 0..<n1024 {
+            wave2x[i] = (i & 1 == 0) ? 0.08 : 0.02
+        }
+        let peak2x = wave2x.withUnsafeBufferPointer {
+            OpticalResolutionClassifier.analyzeResamplingProfile($0, length: n1024)
+        }
+        #expect(peak2x != nil)
+        #expect((peak2x?.snr ?? 0) > 20.0)
+        #expect(abs((peak2x?.frequencyCyclesPerPixel ?? 0) - 0.5) < 0.005)
+
+        // (c) TVB 480p ringing/grain pushes coarse p88 to 670p (.p720!), yet Gallagher grid peak recovers exact .p480!
+        let tvbEdge = OpticalResolutionClassifier.EdgeSharpnessMeasurement(
+            sharpnessRatio: 670.0 / 1897.0,
+            disambiguationRatio: 590.0 / 1897.0,
+            medianSharpnessRatio: 540.0 / 1897.0,
+            edgeSampleCount: 1500
+        )
+        let tvbHybrid = OpticalResolutionClassifier.classifyHybrid(
+            sourceSize: PixelSize(width: 3024, height: 1897),
+            edgeMeasurement: tvbEdge,
+            gridPeakY: peak480,
+            gridPeakX: peak480
+        )
+        #expect(tvbHybrid?.tier == .p480)
+        #expect(tvbHybrid?.isGridLocked == true)
+        #expect(tvbHybrid?.preDownscaleSize == PixelSize(width: 766, height: 480))
+
+        // (d) Heavy native-res Bilibili danmaku pushes p88 -> 0.96, yet matching X+Y Gallagher peak keeps exact .p480!
+        let danmakuEdge = OpticalResolutionClassifier.EdgeSharpnessMeasurement(
+            sharpnessRatio: 0.96,
+            disambiguationRatio: 0.60,
+            medianSharpnessRatio: 0.28,
+            edgeSampleCount: 2000
+        )
+        let danmakuHybrid = OpticalResolutionClassifier.classifyHybrid(
+            sourceSize: PixelSize(width: 3024, height: 1897),
+            edgeMeasurement: danmakuEdge,
+            gridPeakY: peak480,
+            gridPeakX: peak480
+        )
+        #expect(danmakuHybrid?.tier == .p480)
+        #expect(danmakuHybrid?.isGridLocked == true)
+
+        // (e) Native 3K Dark IDE with periodic horizontal text rows (strong Y peak ONLY, no X match, p88 = 0.98) -> .native!
+        let ideEdge = OpticalResolutionClassifier.EdgeSharpnessMeasurement(
+            sharpnessRatio: 0.98,
+            disambiguationRatio: 0.92,
+            medianSharpnessRatio: 0.88,
+            edgeSampleCount: 3000
+        )
+        let ideHybrid = OpticalResolutionClassifier.classifyHybrid(
+            sourceSize: PixelSize(width: 3024, height: 1897),
+            edgeMeasurement: ideEdge,
+            gridPeakY: OpticalResolutionClassifier.ResamplingGridPeak(snr: 35.0, frequencyCyclesPerPixel: 0.32),
+            gridPeakX: OpticalResolutionClassifier.ResamplingGridPeak(snr: 2.8, frequencyCyclesPerPixel: 0.17)
+        )
+        #expect(ideHybrid?.tier == .native)
+        #expect(ideHybrid?.preDownscaleSize == nil)
+
+        // (f) Grid-locked downgrade (e.g., IINA OSD faded -> exact 480p lattice locked) switches cleanly in 2 probes!
+        var gridTracker = OpticalResolutionTracker()
+        _ = gridTracker.ingest(candidate: nativeRetina, sourceSize: PixelSize(width: 3024, height: 1897), activeSliceCount: 24)
+        for _ in 0..<5 {
+            _ = gridTracker.ingest(candidate: nativeRetina, sourceSize: PixelSize(width: 3024, height: 1897), activeSliceCount: 24)
+        }
+        #expect(gridTracker.ingest(candidate: tvbHybrid, sourceSize: PixelSize(width: 3024, height: 1897), activeSliceCount: 24) == nil)
+        let snapped480 = gridTracker.ingest(candidate: tvbHybrid, sourceSize: PixelSize(width: 3024, height: 1897), activeSliceCount: 24)
+        #expect(snapped480?.tier == .p480)
+        #expect(snapped480?.isGridLocked == true)
     }
 }

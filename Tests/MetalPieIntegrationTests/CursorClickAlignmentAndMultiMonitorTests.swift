@@ -3287,10 +3287,10 @@ struct CursorClickAlignmentAndMultiMonitorTests {
             return tex
         }
 
-        // Helper: upscale `src` cleanly using MetalPie's own Bicubic shader (simulating IINA/browser upscaling!)
+        // Helper: upscale `src` cleanly using MetalPie's own shader (Bicubic, Lanczos6, or Bilinear)
         let renderer = try EffectChainRenderer(device: device)
         defer { renderer.reset() }
-        func upscaleViaGPU(_ src: any MTLTexture, to dstSize: PixelSize) throws -> any MTLTexture {
+        func upscaleViaGPU(_ src: any MTLTexture, to dstSize: PixelSize, effectID: EffectID = .bicubic) throws -> any MTLTexture {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .bgra8Unorm,
                 width: dstSize.width,
@@ -3300,18 +3300,18 @@ struct CursorClickAlignmentAndMultiMonitorTests {
             desc.usage = [.shaderRead, .shaderWrite, .renderTarget]
             desc.storageMode = .private
             let dst = try #require(device.makeTexture(descriptor: desc))
-            let bicubicMode = ScalingMode(
-                name: "TestBicubic",
-                effects: [EffectInstance(effectID: .bicubic, scalingType: .fit)]
+            let mode = ScalingMode(
+                name: "TestUpscale",
+                effects: [EffectInstance(effectID: effectID, scalingType: .fit)]
             )
             let layout = ScalingLayoutCalculator.calculate(
                 sourcePixelSize: PixelSize(width: src.width, height: src.height),
                 targetPixelSize: dstSize,
-                effects: bicubicMode.effects
+                effects: mode.effects
             )
             let cb = try #require(queue.makeCommandBuffer())
             _ = try renderer.encode(
-                scalingMode: bicubicMode,
+                scalingMode: mode,
                 context: EffectRenderContext(
                     device: device,
                     commandBuffer: cb,
@@ -3324,6 +3324,67 @@ struct CursorClickAlignmentAndMultiMonitorTests {
             cb.commit()
             cb.waitUntilCompleted()
             return dst
+        }
+
+        // Helper: copy GPU texture to shared CPU-editable buffer and optionally inject mpv dither / danmaku
+        func mutateOnCPU(
+            _ src: any MTLTexture,
+            ditherLSB: Int = 0,
+            drawDanmaku: Bool = false
+        ) throws -> any MTLTexture {
+            let w = src.width, h = src.height
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+            desc.usage = [.shaderRead]; desc.storageMode = .shared
+            let shared = try #require(device.makeTexture(descriptor: desc))
+            let cb = try #require(queue.makeCommandBuffer())
+            if let blit = cb.makeBlitCommandEncoder() {
+                blit.copy(from: src, to: shared)
+                blit.endEncoding()
+            }
+            cb.commit(); cb.waitUntilCompleted()
+            var bytes = [UInt8](repeating: 0, count: w * h * 4)
+            shared.getBytes(&bytes, bytesPerRow: w * 4, from: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0)
+            if drawDanmaku {
+                // Draw realistic native-resolution Bilibili scrolling danmaku text strokes across top & upper-mid frame
+                // (irregular character positions/widths with 1px black outline, NOT a uniform diffraction grating).
+                var dmRng: UInt64 = 0x123456789ABCDEF0
+                for rowBand in [Int(Double(h) * 0.05), Int(Double(h) * 0.13), Int(Double(h) * 0.28), Int(Double(h) * 0.37)] {
+                    var xCursor = Int(Double(w) * 0.14)
+                    while xCursor < Int(Double(w) * 0.84) {
+                        dmRng = dmRng &* 6364136223846793005 &+ 1442695040888963407
+                        let glyphW = 10 + Int((dmRng >> 32) % 14)
+                        let gap = 8 + Int((dmRng >> 40) % 26)
+                        for y in rowBand..<min(h, rowBand + 26) {
+                            let isBorderY = (y == rowBand || y == rowBand + 25)
+                            for dx in 0..<glyphW where xCursor + dx < w {
+                                let isBorderX = (dx == 0 || dx == glyphW - 1)
+                                // Irregular internal glyph strokes
+                                let stroke = isBorderY || isBorderX || (dx == glyphW / 2) || (y == rowBand + 12)
+                                if stroke {
+                                    let idx = (y * w + xCursor + dx) * 4
+                                    let v: UInt8 = (isBorderY || isBorderX) ? 10 : 250
+                                    bytes[idx] = v; bytes[idx + 1] = v; bytes[idx + 2] = v
+                                }
+                            }
+                        }
+                        xCursor += glyphW + gap
+                    }
+                }
+            }
+            if ditherLSB > 0 {
+                var rng: UInt64 = 0xCAFEBABE12345678
+                let span = UInt64(ditherLSB * 2 + 1)
+                for i in stride(from: 0, to: bytes.count, by: 4) {
+                    if bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 0 { continue }
+                    rng = rng &* 6364136223846793005 &+ 1442695040888963407
+                    let delta = Int((rng >> 33) % span) - ditherLSB
+                    for c in 0..<3 {
+                        bytes[i + c] = UInt8(max(0, min(255, Int(bytes[i + c]) + delta)))
+                    }
+                }
+            }
+            shared.replace(region: MTLRegionMake2D(0, 0, w, h), mipmapLevel: 0, withBytes: bytes, bytesPerRow: w * 4)
+            return shared
         }
 
         // Native 3K sharp texture -> .native!
@@ -3340,53 +3401,46 @@ struct CursorClickAlignmentAndMultiMonitorTests {
 
         // 480p -> 3024x1964 (4:3 pillarboxed fullscreen IINA) + simulated mpv 2-LSB output dither -> STILL .p480!
         let pillarbox480 = try upscaleViaGPU(src480, to: PixelSize(width: 3024, height: 1964))
-        // Copy to shared texture and add +/-2 LSB full-res mpv dither across active region
-        let ditherDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm,
-            width: 3024,
-            height: 1964,
-            mipmapped: false
-        )
-        ditherDesc.usage = [.shaderRead]
-        ditherDesc.storageMode = .shared
-        let ditherShared = try #require(device.makeTexture(descriptor: ditherDesc))
-        let cbCopy = try #require(queue.makeCommandBuffer())
-        if let blit = cbCopy.makeBlitCommandEncoder() {
-            blit.copy(from: pillarbox480, to: ditherShared)
-            blit.endEncoding()
-        }
-        cbCopy.commit()
-        cbCopy.waitUntilCompleted()
-        var ditherBytes = [UInt8](repeating: 0, count: 3024 * 1964 * 4)
-        ditherShared.getBytes(&ditherBytes, bytesPerRow: 3024 * 4, from: MTLRegionMake2D(0, 0, 3024, 1964), mipmapLevel: 0)
-        var rng: UInt64 = 0xCAFEBABE12345678
-        for i in stride(from: 0, to: ditherBytes.count, by: 4) {
-            if ditherBytes[i] == 0 && ditherBytes[i + 1] == 0 && ditherBytes[i + 2] == 0 { continue }
-            rng = rng &* 6364136223846793005 &+ 1442695040888963407
-            let delta = Int((rng >> 33) % 5) - 2 // -2..+2 LSB full-resolution mpv dither
-            for c in 0..<3 {
-                ditherBytes[i + c] = UInt8(max(0, min(255, Int(ditherBytes[i + c]) + delta)))
-            }
-        }
-        ditherShared.replace(region: MTLRegionMake2D(0, 0, 3024, 1964), mipmapLevel: 0, withBytes: ditherBytes, bytesPerRow: 3024 * 4)
-
+        let ditherShared = try mutateOnCPU(pillarbox480, ditherLSB: 2)
         let resPillar480 = try #require(probe.probeSynchronously(texture: ditherShared, commandQueue: queue))
         #expect(resPillar480.tier == .p480, "Expected .p480 for 4:3 pillarboxed 480p with 2-LSB mpv dither, got \(resPillar480)")
         #expect(resPillar480.preDownscaleSize?.height == 480)
 
-        // 720p -> 3024x1701 -> .p720 (~1280x720)!
+        // 480p TVB-style sharp Lanczos6 + source-space ringing halo + +/-4 LSB film grain + 2-LSB mpv dither -> STILL EXACT .p480!
+        let tvbSrc480 = try mutateOnCPU(src480, ditherLSB: 4)
+        let tvbLanczos480 = try upscaleViaGPU(tvbSrc480, to: PixelSize(width: 3024, height: 1897), effectID: .lanczos6)
+        let tvbDither480 = try mutateOnCPU(tvbLanczos480, ditherLSB: 2)
+        let resTVB480 = try #require(probe.probeSynchronously(texture: tvbDither480, commandQueue: queue))
+        #expect(resTVB480.tier == .p480, "Expected exact .p480 for noisy TVB Lanczos6 480p->3024x1897, got \(resTVB480)")
+        #expect(resTVB480.preDownscaleSize == PixelSize(width: 766, height: 480))
+
+        // 480p Bilinear -> 3024x1897 + 2-LSB dither (tests aliased 2x harmonic guard on real GPU!) -> .p480!
+        let bilinear480 = try upscaleViaGPU(src480, to: PixelSize(width: 3024, height: 1897), effectID: .bilinear)
+        let bilinearDither480 = try mutateOnCPU(bilinear480, ditherLSB: 2)
+        let resBilin480 = try #require(probe.probeSynchronously(texture: bilinearDither480, commandQueue: queue))
+        #expect(resBilin480.tier == .p480, "Expected .p480 for Bilinear 480p->3024x1897, got \(resBilin480)")
+
+        // 720p -> 3024x1701 (+ Bilibili native-res danmaku!) -> .p720!
         let src720 = try makeRealisticSceneTexture(width: 1280, height: 720)
         let upscaled720 = try upscaleViaGPU(src720, to: PixelSize(width: 3024, height: 1701))
         let res720 = try #require(probe.probeSynchronously(texture: upscaled720, commandQueue: queue))
         #expect(res720.tier == .p720, "Expected .p720 for 720p->3024x1701, got \(res720)")
+        let danmaku720 = try mutateOnCPU(upscaled720, ditherLSB: 2, drawDanmaku: true)
+        let diagDanmaku720 = try #require(probe.probeWithDiagnosticsSynchronously(texture: danmaku720, commandQueue: queue))
+        #expect(diagDanmaku720.resolution.tier == .p720, "Expected .p720 for 720p with Bilibili danmaku, got \(diagDanmaku720)")
 
-        // 1080p -> 3024x1701 -> .p1080 (~1920x1080)!
+        // 1080p -> 3024x1701 -> .p1080!
         let src1080 = try makeRealisticSceneTexture(width: 1920, height: 1080)
         let upscaled1080 = try upscaleViaGPU(src1080, to: PixelSize(width: 3024, height: 1701))
-        let res1080 = try #require(probe.probeSynchronously(texture: upscaled1080, commandQueue: queue))
-        #expect(res1080.tier == .p1080, "Expected .p1080 for 1080p->3024x1701, got \(res1080)")
+        let diag1080 = try #require(probe.probeWithDiagnosticsSynchronously(texture: upscaled1080, commandQueue: queue))
+        #expect(diag1080.resolution.tier == .p1080, "Expected .p1080 for 1080p->3024x1701, got \(diag1080)")
 
-        // 480p 1-pixel thin anime ink-line grid -> 3024x1897 -> STILL .p480 (zero 1.28x 1px-line overshoot!)
+        // Exact 2.0x 1080p -> 4K (3840x2160) -> .p1080 via |Δ¹| Nyquist bin!
+        let upscaled1080To4K = try upscaleViaGPU(src1080, to: PixelSize(width: 3840, height: 2160))
+        let diag1080To4K = try #require(probe.probeWithDiagnosticsSynchronously(texture: upscaled1080To4K, commandQueue: queue))
+        #expect(diag1080To4K.resolution.tier == .p1080, "Expected .p1080 for exact 2.0x 1080p->4K, got \(diag1080To4K)")
+
+        // 480p 1-pixel thin anime ink-line grid -> 3024x1897 -> STILL .p480!
         var grid480Bytes = [UInt8](repeating: 255, count: 640 * 480 * 4)
         for y in 0..<480 {
             for x in 0..<640 {

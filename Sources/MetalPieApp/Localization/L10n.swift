@@ -83,8 +83,8 @@ public struct L10n: Sendable {
 
     public func scalingType(_ type: ScalingType) -> String {
         switch type {
-        case .fit: return tr("Fit", "等比适应")
-        case .fill: return tr("Fill", "等比填充")
+        case .fit: return tr("Fit (Full Frame)", "等比适应（完整显示）")
+        case .fill: return tr("Fill (Crop Overflow)", "等比填充（裁切溢出）")
         case .stretch: return tr("Stretch", "拉伸")
         case .integerFit: return tr("Integer", "整数倍")
         case .normal: return tr("Relative", "相对倍率")
