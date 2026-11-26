@@ -533,7 +533,7 @@ public final class OpticalResolutionProbe: @unchecked Sendable {
                     + (emitted.preDownscaleSize.map { " -> \($0.width)x\($0.height)" } ?? "")
                     + " (est=\(emitted.estimatedActiveHeight)p, grid=\(emitted.isGridLocked), \(yInfo), \(xInfo), p50=\(String(format: "%.3f", evaluated?.edgeP50 ?? 0)), p80=\(String(format: "%.3f", evaluated?.edgeP80 ?? 0)), p88=\(String(format: "%.3f", evaluated?.edgeP88 ?? 0)), edges=\(evaluated?.edgeSamples ?? 0))."
                 PipelineLog.shared.info(.capture, msg)
-                Self.osLog.info("\(msg, privacy: .public)")
+                Self.osLog.notice("\(msg, privacy: .public)")
                 onChanged(emitted)
             }
         }

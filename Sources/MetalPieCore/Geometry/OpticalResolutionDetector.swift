@@ -126,7 +126,7 @@ public enum OpticalResolutionClassifier: Sendable {
     public static let strictNativeGuardThreshold: Double = 0.82
 
     /// Minimum Gallagher spectral peak SNR (`peak / local 24-bin median`) for single-axis lock.
-    public static let singleAxisGridSNRThreshold: Double = 5.2
+    public static let singleAxisGridSNRThreshold: Double = 5.8
     /// Minimum Gallagher spectral peak SNR per axis when BOTH X and Y lock onto the same frequency.
     public static let dualAxisAgreeSNRThreshold: Double = 4.2
     /// Minimum Gallagher SNR per axis to override `p88 >= 0.82` (handles heavy native-res Bilibili danmaku!).
@@ -298,10 +298,11 @@ public enum OpticalResolutionClassifier: Sendable {
         guard bestSNR > 0.0 else { return nil }
 
         // Dual Sub-Harmonic Guard: Bilinear `|Δ²I|` creates a comb whose 2x harmonic (`2*f0` or aliased
-        // `1 - 2*f0`) can outshine the fundamental `f0`. Check BOTH `bestK / 2` and `(n - bestK) / 2`!
+        // `1 - 2*f0`) can outshine the fundamental `f0`. Check ONLY strictly lower sub-harmonics
+        // (`subCenter < bestK`) so a true 480p fundamental (`k=259`) is NEVER replaced by a higher frequency!
         let subCandidates = [bestK / 2, (n - bestK) / 2]
         for subCenter in subCandidates {
-            if subCenter >= minK + 1 && subCenter <= half - 1 {
+            if subCenter >= minK + 1 && subCenter < bestK - 2 && subCenter <= half - 1 {
                 var subBestK = subCenter
                 var subBestSNR = snrs[subCenter]
                 for cand in (subCenter - 1)...(subCenter + 1) {
