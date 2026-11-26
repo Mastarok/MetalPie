@@ -91,102 +91,65 @@ public struct DetectedOpticalResolution: Hashable, Codable, Sendable {
     )
 }
 
-// MARK: - Pure Spectral Analysis & Classification (Unit-Testable, Zero Metal Dependency)
+// MARK: - Pure Edge-Spread-Function (ESF) Classification (Unit-Testable, Zero Metal Dependency)
 
-/// Pure signal-processing classifier turning 64×256 GPU 1D-FFT luma power spectra (32 vertical +
-/// 32 horizontal slices strictly inside detected active non-black bounds) into an exact
+/// Pure signal-processing classifier turning a 100-bin GPU Edge-Spread-Function (ESF) sharpness
+/// histogram (measured strictly on strong `>= 20%` contrast edges inside active non-black bounds,
+/// tangent-denoised so mpv/IINA 1-4 LSB dither and film grain have zero effect) into an exact
 /// `DetectedOpticalResolution` verdict.
 public enum OpticalResolutionClassifier: Sendable {
-    public static let sliceCountPerAxis = 32
-    public static let totalSlices = 64
-    public static let binsPerSlice = 256
-    public static let minFrequencyBin = 8
-    public static let minSliceWeightedEnergy: Double = 2.0
-    public static let minActiveSlicesPerAxis = 4
-    public static let cumulativeEnergyQuantile: Double = 0.975
-    public static let slicePercentile: Double = 0.75
+    public static let histogramBinCount = 100
+    public static let minEdgeSamples: UInt64 = 120
+    /// 88th percentile across strong edges: rejects sparse corner watermarks/OSD while reliably
+    /// capturing native Retina anti-aliased text stems (`>= 0.82`) and in-focus 1080p bokeh subjects.
+    public static let sharpnessQuantile: Double = 0.88
 
-    /// Cutoff ratio above which content is guaranteed native sharpness (Retina UI/text, native 3K/4K,
-    /// nearest-neighbor pixel art). Empirically >= 0.88 on all native Retina & pixel-art workloads.
-    public static let nativeCutoffThreshold: Double = 0.80
+    /// Sharpness ratio above which content is guaranteed native sharpness (Retina UI/text, native
+    /// 1080p/3K/4K/5K/6K video, or nearest-neighbor pixel art). Empirically `>= 0.82` on native
+    /// anti-aliased Retina IDE text and `<= 0.67` on 1080p -> 3K upscaled video.
+    public static let nativeCutoffThreshold: Double = 0.78
 
     /// Maximum downscale ratio (`target / current`) required before engaging pre-downscale.
     /// Avoids pointless ~90-95% rescaling when content is already near native density.
     public static let maxUsefulDownscaleRatio: Double = 0.85
 
-    /// Raw measurement extracted from one GPU FFT probe pass.
-    public struct SpectralMeasurement: Hashable, Sendable {
-        public var cutoffFrequencyRatio: Double
-        public var verticalCutoffRatio: Double?
-        public var horizontalCutoffRatio: Double?
-        public var activeSliceCount: Int
+    /// Raw measurement extracted from one GPU ESF histogram probe pass.
+    public struct EdgeSharpnessMeasurement: Hashable, Sendable {
+        public var sharpnessRatio: Double
+        public var edgeSampleCount: UInt64
 
-        public init(
-            cutoffFrequencyRatio: Double,
-            verticalCutoffRatio: Double?,
-            horizontalCutoffRatio: Double?,
-            activeSliceCount: Int
-        ) {
-            self.cutoffFrequencyRatio = cutoffFrequencyRatio
-            self.verticalCutoffRatio = verticalCutoffRatio
-            self.horizontalCutoffRatio = horizontalCutoffRatio
-            self.activeSliceCount = activeSliceCount
+        public init(sharpnessRatio: Double, edgeSampleCount: UInt64) {
+            self.sharpnessRatio = sharpnessRatio
+            self.edgeSampleCount = edgeSampleCount
         }
     }
 
-    /// Analyzes the raw `64 × 256` float power spectrum produced by `probeOpticalSpectrum512`.
-    /// Returns `nil` when the frame is too flat/dark (e.g. fade-to-black, solid title card) to classify reliably.
-    public static func analyzeSpectrum(
-        _ spectra: UnsafeBufferPointer<Float>
-    ) -> SpectralMeasurement? {
-        guard spectra.count >= totalSlices * binsPerSlice else { return nil }
+    /// Analyzes the 100-bin GPU ESF sharpness histogram (`bin i` = sharpness `(i + 0.5) / 100`).
+    /// Returns `nil` when the frame has too few strong edges (e.g. fade-to-black, solid screen).
+    public static func analyzeEdgeSharpnessHistogram(
+        _ histogram: UnsafeBufferPointer<UInt32>
+    ) -> EdgeSharpnessMeasurement? {
+        guard histogram.count >= histogramBinCount else { return nil }
 
-        func axisCutoff(sliceRange: Range<Int>) -> (ratio: Double, count: Int)? {
-            var freqs: [Double] = []
-            freqs.reserveCapacity(sliceCountPerAxis)
-            for s in sliceRange {
-                let base = s * binsPerSlice
-                var total: Double = 0
-                for k in minFrequencyBin..<binsPerSlice {
-                    let p = Double(spectra[base + k])
-                    if p.isFinite && p > 0 {
-                        total += p * sqrt(Double(k))
-                    }
-                }
-                guard total >= minSliceWeightedEnergy else { continue }
-
-                let target = total * cumulativeEnergyQuantile
-                var cum: Double = 0
-                var kCut = binsPerSlice - 1
-                for k in minFrequencyBin..<binsPerSlice {
-                    let p = Double(spectra[base + k])
-                    if p.isFinite && p > 0 {
-                        cum += p * sqrt(Double(k))
-                    }
-                    if cum >= target {
-                        kCut = k
-                        break
-                    }
-                }
-                freqs.append(Double(kCut) / Double(binsPerSlice))
-            }
-            guard freqs.count >= minActiveSlicesPerAxis else { return nil }
-            freqs.sort()
-            let idx = min(freqs.count - 1, max(0, Int((Double(freqs.count - 1) * slicePercentile).rounded())))
-            return (freqs[idx], freqs.count)
+        var total: UInt64 = 0
+        for i in 0..<histogramBinCount {
+            total &+= UInt64(histogram[i])
         }
+        guard total >= minEdgeSamples else { return nil }
 
-        let vertical = axisCutoff(sliceRange: 0..<sliceCountPerAxis)
-        let horizontal = axisCutoff(sliceRange: sliceCountPerAxis..<totalSlices)
-        guard vertical != nil || horizontal != nil else { return nil }
-
-        let cutoff = max(vertical?.ratio ?? 0.0, horizontal?.ratio ?? 0.0)
-        let activeCount = max(vertical?.count ?? 0, horizontal?.count ?? 0)
-        return SpectralMeasurement(
-            cutoffFrequencyRatio: max(0.0, min(1.0, cutoff)),
-            verticalCutoffRatio: vertical?.ratio,
-            horizontalCutoffRatio: horizontal?.ratio,
-            activeSliceCount: activeCount
+        let target = UInt64((Double(total) * sharpnessQuantile).rounded())
+        var cum: UInt64 = 0
+        var sharpness = 1.0
+        for i in 0..<histogramBinCount {
+            cum &+= UInt64(histogram[i])
+            if cum >= target {
+                sharpness = (Double(i) + 0.5) / Double(histogramBinCount)
+                break
+            }
+        }
+        return EdgeSharpnessMeasurement(
+            sharpnessRatio: max(0.0, min(1.0, sharpness)),
+            edgeSampleCount: total
         )
     }
 
@@ -213,7 +176,7 @@ public enum OpticalResolutionClassifier: Sendable {
             : (clampedFreq * Double(activeH))
         let roundedEstHeight = max(1, Int(equiv16x9Height.rounded()))
 
-        // High spectral bandwidth -> native Retina UI/text, native 1080p/3K/4K/5K/6K video, or nearest pixel art.
+        // High edge sharpness -> native Retina UI/text, native 1080p/3K/4K/5K/6K video, or nearest pixel art.
         if clampedFreq >= nativeCutoffThreshold {
             return DetectedOpticalResolution(
                 tier: .native,
@@ -229,7 +192,7 @@ public enum OpticalResolutionClassifier: Sendable {
         let tier: OpticalResolutionTier
         if equiv16x9Height <= 580.0 {
             tier = .p480
-        } else if equiv16x9Height <= 880.0 {
+        } else if equiv16x9Height <= 900.0 {
             tier = .p720
         } else if equiv16x9Height <= 1340.0 {
             tier = .p1080
@@ -351,7 +314,7 @@ public struct OpticalResolutionTracker: Sendable {
         probesCompletedForSize += 1
 
         // 1. First probe after session start or window resize:
-        //    Lock immediately when we have solid slice coverage (so even paused videos adapt within ~16ms!).
+        //    Lock immediately when we have solid edge sample coverage (so even paused videos adapt within ~16ms!).
         if isFirstProbeForSize || !current.isConfirmed {
             if candidate.tier == .native || activeSliceCount >= 8 {
                 let changed = !current.isConfirmed

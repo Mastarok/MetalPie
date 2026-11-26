@@ -3232,7 +3232,48 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         let queue = try #require(device.makeCommandQueue())
         let probe = OpticalResolutionProbe(device: device)
 
-        func makeHighContrastPatternTexture(width: Int, height: Int) throws -> any MTLTexture {
+        func makeRealisticSceneTexture(width: Int, height: Int) throws -> any MTLTexture {
+            var bytes = [UInt8](repeating: 255, count: width * height * 4)
+            let cs = CGColorSpaceCreateDeviceRGB()
+            let info = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+            let ctx = try #require(CGContext(
+                data: &bytes,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: cs,
+                bitmapInfo: info
+            ))
+            ctx.setAllowsAntialiasing(true)
+            ctx.setShouldAntialias(true)
+            let fw = CGFloat(width), fh = CGFloat(height)
+            // Realistic anime/video frame: filled sky/ground, character silhouettes, high-contrast step edges & outlines.
+            ctx.setFillColor(red: 0.42, green: 0.72, blue: 0.92, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: fw, height: fh))
+            ctx.setFillColor(red: 0.74, green: 0.71, blue: 0.54, alpha: 1)
+            ctx.fill(CGRect(x: 0, y: 0, width: fw, height: fh * 0.58))
+            // Filled building / panel rectangles (true step edges at native resolution)
+            ctx.setFillColor(red: 0.14, green: 0.16, blue: 0.18, alpha: 1)
+            for i in 0..<6 {
+                let rx = fw * (0.08 + CGFloat(i) * 0.15)
+                let rw = fw * 0.07
+                ctx.fill(CGRect(x: rx, y: fh * 0.16, width: rw, height: fh * 0.64))
+            }
+            // Character face & eyes with crisp native-resolution ink outlines
+            let face = CGRect(x: fw * 0.28, y: fh * 0.24, width: fw * 0.42, height: fh * 0.54)
+            ctx.setFillColor(red: 0.97, green: 0.82, blue: 0.68, alpha: 1)
+            ctx.fillEllipse(in: face)
+            ctx.setStrokeColor(red: 0.06, green: 0.06, blue: 0.06, alpha: 1)
+            ctx.setLineWidth(max(1.5, fh / 320.0))
+            ctx.strokeEllipse(in: face)
+            for ex in [0.36, 0.52] {
+                let eye = CGRect(x: fw * CGFloat(ex), y: fh * 0.44, width: fw * 0.12, height: fh * 0.20)
+                ctx.setFillColor(red: 0.99, green: 0.99, blue: 0.98, alpha: 1)
+                ctx.fillEllipse(in: eye)
+                ctx.strokeEllipse(in: eye)
+            }
+
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .bgra8Unorm,
                 width: width,
@@ -3242,22 +3283,6 @@ struct CursorClickAlignmentAndMultiMonitorTests {
             desc.usage = [.shaderRead]
             desc.storageMode = .shared
             let tex = try #require(device.makeTexture(descriptor: desc))
-            var bytes = [UInt8](repeating: 255, count: width * height * 4)
-            for y in 0..<height {
-                let row = y * width * 4
-                let hLine = (y % 19 == 0) || (y % 29 == 1)
-                for x in 0..<width {
-                    let vLine = (x % 17 == 0) || (x % 31 == 1)
-                    let diag = ((x + y * 2) % 23 == 0)
-                    let dark = hLine || vLine || diag
-                    let v: UInt8 = dark ? 22 : UInt8(160 + ((x * 70) / max(1, width)))
-                    let idx = row + x * 4
-                    bytes[idx + 0] = v
-                    bytes[idx + 1] = dark ? 22 : UInt8(180 + ((y * 60) / max(1, height)))
-                    bytes[idx + 2] = v
-                    bytes[idx + 3] = 255
-                }
-            }
             tex.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: bytes, bytesPerRow: width * 4)
             return tex
         }
@@ -3302,31 +3327,61 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         }
 
         // Native 3K sharp texture -> .native!
-        let native3K = try makeHighContrastPatternTexture(width: 3024, height: 1898)
+        let native3K = try makeRealisticSceneTexture(width: 3024, height: 1898)
         let resNative = try #require(probe.probeSynchronously(texture: native3K, commandQueue: queue))
         #expect(resNative.tier == .native && resNative.preDownscaleSize == nil)
 
         // 480p -> 2531x1898 (maximized 4:3 IINA) -> .p480 (~640x480)!
-        let src480 = try makeHighContrastPatternTexture(width: 640, height: 480)
+        let src480 = try makeRealisticSceneTexture(width: 640, height: 480)
         let upscaled480 = try upscaleViaGPU(src480, to: PixelSize(width: 2531, height: 1898))
         let res480 = try #require(probe.probeSynchronously(texture: upscaled480, commandQueue: queue))
         #expect(res480.tier == .p480, "Expected .p480 for 480p->2531x1898, got \(res480)")
         #expect(res480.preDownscaleSize == PixelSize(width: 640, height: 480))
 
-        // 480p -> 3024x1964 (4:3 pillarboxed fullscreen IINA) -> .p480 (height 480)!
+        // 480p -> 3024x1964 (4:3 pillarboxed fullscreen IINA) + simulated mpv 2-LSB output dither -> STILL .p480!
         let pillarbox480 = try upscaleViaGPU(src480, to: PixelSize(width: 3024, height: 1964))
-        let resPillar480 = try #require(probe.probeSynchronously(texture: pillarbox480, commandQueue: queue))
-        #expect(resPillar480.tier == .p480, "Expected .p480 for 4:3 pillarboxed 480p, got \(resPillar480)")
+        // Copy to shared texture and add +/-2 LSB full-res mpv dither across active region
+        let ditherDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: 3024,
+            height: 1964,
+            mipmapped: false
+        )
+        ditherDesc.usage = [.shaderRead]
+        ditherDesc.storageMode = .shared
+        let ditherShared = try #require(device.makeTexture(descriptor: ditherDesc))
+        let cbCopy = try #require(queue.makeCommandBuffer())
+        if let blit = cbCopy.makeBlitCommandEncoder() {
+            blit.copy(from: pillarbox480, to: ditherShared)
+            blit.endEncoding()
+        }
+        cbCopy.commit()
+        cbCopy.waitUntilCompleted()
+        var ditherBytes = [UInt8](repeating: 0, count: 3024 * 1964 * 4)
+        ditherShared.getBytes(&ditherBytes, bytesPerRow: 3024 * 4, from: MTLRegionMake2D(0, 0, 3024, 1964), mipmapLevel: 0)
+        var rng: UInt64 = 0xCAFEBABE12345678
+        for i in stride(from: 0, to: ditherBytes.count, by: 4) {
+            if ditherBytes[i] == 0 && ditherBytes[i + 1] == 0 && ditherBytes[i + 2] == 0 { continue }
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            let delta = Int((rng >> 33) % 5) - 2 // -2..+2 LSB full-resolution mpv dither
+            for c in 0..<3 {
+                ditherBytes[i + c] = UInt8(max(0, min(255, Int(ditherBytes[i + c]) + delta)))
+            }
+        }
+        ditherShared.replace(region: MTLRegionMake2D(0, 0, 3024, 1964), mipmapLevel: 0, withBytes: ditherBytes, bytesPerRow: 3024 * 4)
+
+        let resPillar480 = try #require(probe.probeSynchronously(texture: ditherShared, commandQueue: queue))
+        #expect(resPillar480.tier == .p480, "Expected .p480 for 4:3 pillarboxed 480p with 2-LSB mpv dither, got \(resPillar480)")
         #expect(resPillar480.preDownscaleSize?.height == 480)
 
         // 720p -> 3024x1701 -> .p720 (~1280x720)!
-        let src720 = try makeHighContrastPatternTexture(width: 1280, height: 720)
+        let src720 = try makeRealisticSceneTexture(width: 1280, height: 720)
         let upscaled720 = try upscaleViaGPU(src720, to: PixelSize(width: 3024, height: 1701))
         let res720 = try #require(probe.probeSynchronously(texture: upscaled720, commandQueue: queue))
         #expect(res720.tier == .p720, "Expected .p720 for 720p->3024x1701, got \(res720)")
 
         // 1080p -> 3024x1701 -> .p1080 (~1920x1080)!
-        let src1080 = try makeHighContrastPatternTexture(width: 1920, height: 1080)
+        let src1080 = try makeRealisticSceneTexture(width: 1920, height: 1080)
         let upscaled1080 = try upscaleViaGPU(src1080, to: PixelSize(width: 3024, height: 1701))
         let res1080 = try #require(probe.probeSynchronously(texture: upscaled1080, commandQueue: queue))
         #expect(res1080.tier == .p1080, "Expected .p1080 for 1080p->3024x1701, got \(res1080)")
