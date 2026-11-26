@@ -1873,5 +1873,39 @@ struct MetalPieShadersGPUValidationTests {
             )
             #expect(outImg.width == 2531 && outImg.height == 1898)
         }
+
+        // Verify anti-aliased separable >1.5x pre-downscale (`videoPreDownscale_h/v`) on 2531x1898 -> 640x480 -> 2531x1898!
+        let src3K = TestPatterns.makeBGRA8Texture(device: device, width: 2531, height: 1898, label: "PreDownscaleSrc3K") { x, y, w, h in
+            let r = Float(x) / Float(max(1, w - 1))
+            let g = Float(y) / Float(max(1, h - 1))
+            let grid: Float = ((x % 16 < 4) || (y % 16 < 4)) ? 0.15 : 0.85
+            return (r * grid, g * grid, 0.5 * grid, 1.0)
+        }
+        let dst3K = TestPatterns.makeOutputTexture(device: device, width: 2531, height: 1898)
+        let modeMetalFX = try #require(ScalingMode.builtInPresets.first { $0.id == ScalingMode.metalFXSpatialID })
+        let preSize480 = PixelSize(width: 640, height: 480)
+        let preLayout = ScalingLayoutCalculator.calculate(
+            sourcePixelSize: preSize480,
+            targetPixelSize: PixelSize(width: 2531, height: 1898),
+            effects: modeMetalFX.effects
+        )
+        renderer.fullscreenVideoPreDownscaleSize = preSize480
+        defer { renderer.fullscreenVideoPreDownscaleSize = nil }
+        let cbPre = try #require(queue.makeCommandBuffer())
+        _ = try renderer.encode(
+            scalingMode: modeMetalFX,
+            context: EffectRenderContext(
+                device: device,
+                commandBuffer: cbPre,
+                sourceTexture: src3K,
+                destinationTexture: dst3K,
+                layout: preLayout,
+                duplicateFrameMode: .never
+            )
+        )
+        commitSync(cbPre)
+        let preStats = readbackStats(texture: dst3K)
+        #expect(preStats.nanCount == 0 && preStats.infCount == 0)
+        #expect(preStats.meanLuma > 0.10 && preStats.stdDevLuma > 0.05)
     }
 }

@@ -999,6 +999,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         var onFirstFramePresented: (@Sendable () -> Void)?
         var onTelemetry: (@Sendable (SessionTelemetry) -> Void)?
         var onLayoutUpdated: (@Sendable (ScalingLayoutResult) -> Void)?
+        var onOpticalResolutionChanged: (@Sendable (DetectedOpticalResolution) -> Void)?
         var onMarkDisplayLinkAttached: (@MainActor @Sendable () -> Void)?
         var hasEmittedFirstFrame: Bool = false
     }
@@ -1008,6 +1009,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
     private let effectRenderer: any EffectRendering
     private var frameInterpolator: (any FrameInterpolating)?
     private let presentPass: PresentPassRenderer
+    private let opticalProbe: OpticalResolutionProbe
 
     private let mailbox = FrameMailbox()
     private let telemetry = TelemetryAccumulator()
@@ -1074,6 +1076,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         self.effectRenderer = effectRenderer
         self.frameInterpolator = frameInterpolator
         self.presentPass = try PresentPassRenderer(device: resolvedDevice)
+        self.opticalProbe = OpticalResolutionProbe(device: resolvedDevice)
 
         // RenderLoopController manages both cursor-free screenshots (`presentPass.encodeScreenshotReadback`)
         // and duplicate-frame output retention (`lastValidUpscaledTexture`) externally -> eliminate the
@@ -1119,6 +1122,11 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         control.withLock { $0.onLayoutUpdated = handler }
     }
 
+    /// Called whenever `.auto` GPU optical resolution detection commits a new tier (e.g. 480p / 720p / 1080p / 1440p / Native).
+    public func setOpticalResolutionHandler(_ handler: (@Sendable (DetectedOpticalResolution) -> Void)?) {
+        control.withLock { $0.onOpticalResolutionChanged = handler }
+    }
+
     /// Replaces or clears the optional Frame Generation backend cleanly.
     public func setFrameInterpolator(_ interpolator: (any FrameInterpolating)?) {
         renderThread.perform { [weak self] in
@@ -1143,6 +1151,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         onMarkDisplayLinkAttached: (@MainActor @Sendable () -> Void)? = nil
     ) {
         mailbox.clear()
+        opticalProbe.reset()
 
         let backendLabel = configuration.scalingMode.name
         telemetry.reset(
@@ -1191,10 +1200,17 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
     /// Updates live rendering configuration (profile, scaling mode, overlay drawable metrics, VRR flag).
     public func updateConfiguration(_ configuration: RenderSessionConfiguration) {
-        control.withLock { s in
+        let inputModeChanged: Bool = control.withLock { s in
+            let prevMode = s.configuration?.profile.capture.fullscreenVideoInput
             s.configuration = configuration
             s.needsGraphicsRedraw = true
             s.configDirty = true
+            return prevMode != configuration.profile.capture.fullscreenVideoInput
+        }
+        if inputModeChanged {
+            opticalProbe.reset()
+            let cb = control.withLock(\.onOpticalResolutionChanged)
+            cb?(.unprobed)
         }
         let now = CACurrentMediaTime()
         telemetry.recordDrawableSize(configuration.overlayMetrics.drawablePixelSize, now: now)
@@ -1268,6 +1284,7 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
         }
 
         mailbox.clear()
+        opticalProbe.reset()
         telemetry.updateSessionMetadata(state: .idle)
 
         for shot in pendingShots {
@@ -1920,6 +1937,37 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
 
         // Run multi-pass EffectRendering graph when we have a real, interpolated, or reconfigured source frame.
         if let srcTex = sourceTextureForEffects {
+            // When `fullscreenVideoInput == .auto`, periodically run the lightweight (~0.2ms) GPU 1D-FFT
+            // optical resolution probe on real (non-synthesized) source frames to automatically adapt to
+            // 480p / 720p / 1080p / 1440p / Native across any monitor, aspect ratio, or window size.
+            let activeOptical: DetectedOpticalResolution?
+            if config.profile.capture.fullscreenVideoInput == .auto {
+                if !isSynthesizedFrame {
+                    opticalProbe.encodeIfDue(
+                        sourceTexture: srcTex,
+                        commandBuffer: commandBuffer,
+                        now: now
+                    ) { [weak self] updated in
+                        guard let self else { return }
+                        let cb: (@Sendable (DetectedOpticalResolution) -> Void)? = self.control.withLock { s in
+                            guard s.isRunning else { return nil }
+                            s.configDirty = true
+                            s.needsGraphicsRedraw = true
+                            return s.onOpticalResolutionChanged
+                        }
+                        // Wake render thread so even paused/static videos immediately re-render at the detected tier!
+                        self.renderThread.perform { [weak self] in
+                            self?.scheduleDirectOrVRRWakeupIfNeeded()
+                        }
+                        cb?(updated)
+                    }
+                }
+                let probed = opticalProbe.currentResolution
+                activeOptical = probed.isConfirmed ? probed : nil
+            } else {
+                activeOptical = nil
+            }
+
             let rawSourceSize = PixelSize(width: srcTex.width, height: srcTex.height)
             let resolvedInput: (effectiveSize: PixelSize, videoPreDownscaleSize: PixelSize?)
             if let preScaleConfigurable = effectRenderer as? any EffectPreScaleConfigurable {
@@ -1929,7 +1977,8 @@ public final class RenderLoopController: NSObject, @unchecked Sendable {
                     presentationMode: config.profile.presentationMode,
                     fullscreenVideoInput: config.profile.capture.fullscreenVideoInput,
                     demagnifyActive: preScaleConfigurable.isDemagnifyActive,
-                    isNativeFullscreenSource: config.isNativeFullscreenSource
+                    isNativeFullscreenSource: config.isNativeFullscreenSource,
+                    autoDetectedOptical: activeOptical
                 )
                 // Active SCStream contentRect was already cropped into `srcTex` above, so clear sub-rect on renderer.
                 preScaleConfigurable.sourceContentPixelRect = nil

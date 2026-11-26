@@ -3190,4 +3190,145 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         )
         #expect(pickedNormalFirst?.windowID == 8204, "selectFrontmostWindow must still prefer layer-0 window ahead of floating fallback!")
     }
+
+    @Test("Live GPU OpticalResolutionProbe detects 480p/720p/1080p/Native & Menu Bar / Dock geometry adapts across Mac models")
+    func liveGPUOpticalResolutionProbeAndCrossModelGeometry() throws {
+        // 1. Cross-model Menu Bar / Notch / Dock generality checks
+        // MacBook with Accessibility Larger Menu Bar (32pt notch + 48pt menu bar -> aligns cleanly to 48pt!)
+        #expect(WindowEnumerator.resolveNotchSafeTopInset(safeAreaTop: 32, menuBarTopInset: 48) == 48)
+        // Auto-hidden menu bar on notched MacBook -> preserves physical 32pt notch band
+        #expect(WindowEnumerator.resolveNotchSafeTopInset(safeAreaTop: 32, menuBarTopInset: 0) == 32)
+        // Non-notched Mac / external display -> always 0 edge-to-edge
+        #expect(WindowEnumerator.resolveNotchSafeTopInset(safeAreaTop: 0, menuBarTopInset: 48) == 0)
+
+        let tallNotchDisplay = DisplayDescriptor(
+            id: 777,
+            name: "MacBook Scaled Larger Menu Bar",
+            cocoaFrame: CGRect(x: 0, y: 0, width: 1280, height: 832),
+            cgBounds: CGRect(x: 0, y: 0, width: 1280, height: 832),
+            backingScaleFactor: 2.0,
+            refreshRateHz: 120,
+            maxEDRHeadroom: 1.0,
+            isPrimary: true,
+            safeAreaTopInset: 48.0
+        )
+        // Native fullscreen sitting below 48pt Larger Menu Bar is still detected accurately!
+        let tallFullscreenBounds = CGRect(x: 0, y: 48, width: 1280, height: 784)
+        #expect(WindowEnumerator.isNotchInsetFullscreenBounds(tallFullscreenBounds, displays: [tallNotchDisplay]))
+
+        // Toolbar adapts cleanly on Left Dock, Right Dock, Bottom Dock, and narrow 360pt Portrait displays!
+        let portraitOverlay = CGRect(x: 0, y: 0, width: 360, height: 640)
+        let leftDockVisible = CGRect(x: 68, y: 0, width: 292, height: 604)
+        let portraitToolbar = OverlayChromeGeometry.computeVisibleToolbarCocoaFrame(
+            for: portraitOverlay,
+            hostScreenVisibleFrame: leftDockVisible
+        )
+        #expect(portraitToolbar.minX >= leftDockVisible.minX)
+        #expect(portraitToolbar.maxX <= leftDockVisible.maxX)
+        #expect(portraitToolbar.maxY <= leftDockVisible.maxY)
+
+        // 2. Real Apple Silicon GPU `OpticalResolutionProbe` live verification!
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let queue = try #require(device.makeCommandQueue())
+        let probe = OpticalResolutionProbe(device: device)
+
+        func makeHighContrastPatternTexture(width: Int, height: Int) throws -> any MTLTexture {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: width,
+                height: height,
+                mipmapped: false
+            )
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            let tex = try #require(device.makeTexture(descriptor: desc))
+            var bytes = [UInt8](repeating: 255, count: width * height * 4)
+            for y in 0..<height {
+                let row = y * width * 4
+                let hLine = (y % 19 == 0) || (y % 29 == 1)
+                for x in 0..<width {
+                    let vLine = (x % 17 == 0) || (x % 31 == 1)
+                    let diag = ((x + y * 2) % 23 == 0)
+                    let dark = hLine || vLine || diag
+                    let v: UInt8 = dark ? 22 : UInt8(160 + ((x * 70) / max(1, width)))
+                    let idx = row + x * 4
+                    bytes[idx + 0] = v
+                    bytes[idx + 1] = dark ? 22 : UInt8(180 + ((y * 60) / max(1, height)))
+                    bytes[idx + 2] = v
+                    bytes[idx + 3] = 255
+                }
+            }
+            tex.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: bytes, bytesPerRow: width * 4)
+            return tex
+        }
+
+        // Helper: upscale `src` cleanly using MetalPie's own Bicubic shader (simulating IINA/browser upscaling!)
+        let renderer = try EffectChainRenderer(device: device)
+        defer { renderer.reset() }
+        func upscaleViaGPU(_ src: any MTLTexture, to dstSize: PixelSize) throws -> any MTLTexture {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: dstSize.width,
+                height: dstSize.height,
+                mipmapped: false
+            )
+            desc.usage = [.shaderRead, .shaderWrite, .renderTarget]
+            desc.storageMode = .private
+            let dst = try #require(device.makeTexture(descriptor: desc))
+            let bicubicMode = ScalingMode(
+                name: "TestBicubic",
+                effects: [EffectInstance(effectID: .bicubic, scalingType: .fit)]
+            )
+            let layout = ScalingLayoutCalculator.calculate(
+                sourcePixelSize: PixelSize(width: src.width, height: src.height),
+                targetPixelSize: dstSize,
+                effects: bicubicMode.effects
+            )
+            let cb = try #require(queue.makeCommandBuffer())
+            _ = try renderer.encode(
+                scalingMode: bicubicMode,
+                context: EffectRenderContext(
+                    device: device,
+                    commandBuffer: cb,
+                    sourceTexture: src,
+                    destinationTexture: dst,
+                    layout: layout,
+                    duplicateFrameMode: .never
+                )
+            )
+            cb.commit()
+            cb.waitUntilCompleted()
+            return dst
+        }
+
+        // Native 3K sharp texture -> .native!
+        let native3K = try makeHighContrastPatternTexture(width: 3024, height: 1898)
+        let resNative = try #require(probe.probeSynchronously(texture: native3K, commandQueue: queue))
+        #expect(resNative.tier == .native && resNative.preDownscaleSize == nil)
+
+        // 480p -> 2531x1898 (maximized 4:3 IINA) -> .p480 (~640x480)!
+        let src480 = try makeHighContrastPatternTexture(width: 640, height: 480)
+        let upscaled480 = try upscaleViaGPU(src480, to: PixelSize(width: 2531, height: 1898))
+        let res480 = try #require(probe.probeSynchronously(texture: upscaled480, commandQueue: queue))
+        #expect(res480.tier == .p480, "Expected .p480 for 480p->2531x1898, got \(res480)")
+        #expect(res480.preDownscaleSize == PixelSize(width: 640, height: 480))
+
+        // 480p -> 3024x1964 (4:3 pillarboxed fullscreen IINA) -> .p480 (height 480)!
+        let pillarbox480 = try upscaleViaGPU(src480, to: PixelSize(width: 3024, height: 1964))
+        let resPillar480 = try #require(probe.probeSynchronously(texture: pillarbox480, commandQueue: queue))
+        #expect(resPillar480.tier == .p480, "Expected .p480 for 4:3 pillarboxed 480p, got \(resPillar480)")
+        #expect(resPillar480.preDownscaleSize?.height == 480)
+
+        // 720p -> 3024x1701 -> .p720 (~1280x720)!
+        let src720 = try makeHighContrastPatternTexture(width: 1280, height: 720)
+        let upscaled720 = try upscaleViaGPU(src720, to: PixelSize(width: 3024, height: 1701))
+        let res720 = try #require(probe.probeSynchronously(texture: upscaled720, commandQueue: queue))
+        #expect(res720.tier == .p720, "Expected .p720 for 720p->3024x1701, got \(res720)")
+
+        // 1080p -> 3024x1701 -> .p1080 (~1920x1080)!
+        let src1080 = try makeHighContrastPatternTexture(width: 1920, height: 1080)
+        let upscaled1080 = try upscaleViaGPU(src1080, to: PixelSize(width: 3024, height: 1701))
+        let res1080 = try #require(probe.probeSynchronously(texture: upscaled1080, commandQueue: queue))
+        #expect(res1080.tier == .p1080, "Expected .p1080 for 1080p->3024x1701, got \(res1080)")
+    }
 }

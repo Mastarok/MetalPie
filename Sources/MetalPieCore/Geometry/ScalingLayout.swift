@@ -567,10 +567,27 @@ public enum ScalingLayoutCalculator: Sendable {
         presentationMode: PresentationMode,
         mode: FullscreenVideoInputMode,
         isNativeFullscreenSource: Bool = false,
-        demagnifyActive: Bool = false
+        demagnifyActive: Bool = false,
+        autoDetectedOptical: DetectedOpticalResolution? = nil
     ) -> PixelSize? {
         guard rawSourceSize.isValid, targetPixelSize.isValid, mode != .native else {
             return nil
+        }
+
+        // When `.auto` has a live confirmed GPU 1D-FFT optical resolution measurement, trust it across
+        // ALL window sizes and aspect ratios (native fullscreen, maximized desktop IINA/VLC, 4:3, 16:9,
+        // 2.39:1 cinema, and windowed players):
+        // - Confirmed `.native` NEVER blurs Retina webpages/IDEs (even inside macOS Native Fullscreen Space!).
+        // - Confirmed `.p480` / `.p720` / `.p1080` pre-downscales directly to the video's true native density!
+        if mode == .auto, let optical = autoDetectedOptical, optical.isConfirmed {
+            guard optical.tier != .native,
+                  let detectedSize = optical.preDownscaleSize,
+                  detectedSize.isValid,
+                  (detectedSize.width < rawSourceSize.width || detectedSize.height < rawSourceSize.height)
+            else {
+                return nil
+            }
+            return clampAspectPreserving(detectedSize)
         }
 
         // Recognize full-screen / maximized video windows across 16:9, 16:10, 4:3 (e.g. classic anime
@@ -590,6 +607,7 @@ public enum ScalingLayoutCalculator: Sendable {
             return nil
 
         case .auto:
+            // Fallback before first GPU optical probe completes (or in static layout calculation):
             // Only auto pre-downscale genuine fullscreen video spaces (HTML5 fullscreen, IINA, VLC, QuickTime)
             // or sources already identified as 2x magnified non-Retina content — NEVER sharp Retina webpages!
             guard isNativeFullscreenSource || demagnifyActive else { return nil }
@@ -632,7 +650,8 @@ public enum ScalingLayoutCalculator: Sendable {
         presentationMode: PresentationMode,
         fullscreenVideoInput: FullscreenVideoInputMode,
         demagnifyActive: Bool,
-        isNativeFullscreenSource: Bool = false
+        isNativeFullscreenSource: Bool = false,
+        autoDetectedOptical: DetectedOpticalResolution? = nil
     ) -> (effectiveSize: PixelSize, videoPreDownscaleSize: PixelSize?) {
         guard rawSourceSize.isValid else { return (rawSourceSize, nil) }
         let clampedRaw = clampAspectPreserving(rawSourceSize)
@@ -643,7 +662,8 @@ public enum ScalingLayoutCalculator: Sendable {
             presentationMode: presentationMode,
             mode: fullscreenVideoInput,
             isNativeFullscreenSource: isNativeFullscreenSource,
-            demagnifyActive: demagnifyActive
+            demagnifyActive: demagnifyActive,
+            autoDetectedOptical: autoDetectedOptical
         ) {
             return (effectiveSize: videoSize, videoPreDownscaleSize: videoSize)
         }

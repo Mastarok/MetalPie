@@ -518,6 +518,16 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
                     mode: demagMode,
                     commandBuffer: cb
                 )
+            } else if currentTex.width * 2 > step.size.width * 3 || currentTex.height * 2 > step.size.height * 3 {
+                // Use scale-adaptive separable Catmull-Rom downscaler for >1.5x downscales (e.g. 3K -> 480p/720p)
+                // to avoid aliasing from fixed 4x4 kernels while preserving sharp source ink/details.
+                try encodeAntiAliasedPreDownscale(
+                    source: currentTex,
+                    destination: preLease.texture,
+                    workingFormat: workingFormat,
+                    frameLeases: &frameLeases,
+                    commandBuffer: cb
+                )
             } else {
                 try encodeBicubic(
                     source: currentTex,
@@ -3118,6 +3128,44 @@ public final class EffectChainRenderer: EffectRendering, EffectPreScaleConfigura
             enc.setTexture(destination, index: 1)
             enc.setBytes(&u, length: MemoryLayout<CropUniforms>.stride, index: 0)
             dispatch2D(encoder: enc, pipeline: pipe, width: destination.width, height: destination.height)
+            enc.endEncoding()
+        }
+    }
+
+    private func encodeAntiAliasedPreDownscale(
+        source: any MTLTexture,
+        destination: any MTLTexture,
+        workingFormat: MTLPixelFormat,
+        frameLeases: inout [PooledTexture],
+        commandBuffer: any MTLCommandBuffer
+    ) throws {
+        let midLease = try texturePool.acquire(
+            width: destination.width,
+            height: source.height,
+            pixelFormat: workingFormat,
+            usage: [.shaderRead, .shaderWrite],
+            storageMode: .private,
+            label: "MetalPie_PreDownscaleH_\(destination.width)x\(source.height)"
+        )
+        frameLeases.append(midLease)
+
+        let pipeH = try shaderManager.computePipeline(library: "Common", function: "videoPreDownscale_h", effectHint: .bicubic)
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.label = "VideoPreDownscale_H"
+            enc.setComputePipelineState(pipeH)
+            enc.setTexture(source, index: 0)
+            enc.setTexture(midLease.texture, index: 1)
+            dispatch2D(encoder: enc, pipeline: pipeH, width: destination.width, height: source.height)
+            enc.endEncoding()
+        }
+
+        let pipeV = try shaderManager.computePipeline(library: "Common", function: "videoPreDownscale_v", effectHint: .bicubic)
+        if let enc = commandBuffer.makeComputeCommandEncoder() {
+            enc.label = "VideoPreDownscale_V"
+            enc.setComputePipelineState(pipeV)
+            enc.setTexture(midLease.texture, index: 0)
+            enc.setTexture(destination, index: 1)
+            dispatch2D(encoder: enc, pipeline: pipeV, width: destination.width, height: destination.height)
             enc.endEncoding()
         }
     }

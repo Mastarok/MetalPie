@@ -601,17 +601,34 @@ struct SettingsView: View {
                         GridRow {
                             Text(l10n.tr("Fullscreen Video Input", "全屏视频输入"))
                                 .font(.system(size: 12.5))
-                            Picker("", selection: binding(profileID, \.capture.fullscreenVideoInput)) {
-                                Text(l10n.tr("Auto", "自动")).tag(FullscreenVideoInputMode.auto)
-                                Text("480p").tag(FullscreenVideoInputMode.p480)
-                                Text("720p").tag(FullscreenVideoInputMode.p720)
-                                Text("1080p").tag(FullscreenVideoInputMode.p1080)
-                                Text(l10n.tr("Native", "原生")).tag(FullscreenVideoInputMode.native)
+                            HStack(spacing: 8) {
+                                Picker("", selection: binding(profileID, \.capture.fullscreenVideoInput)) {
+                                    Text(l10n.tr("Auto", "自动")).tag(FullscreenVideoInputMode.auto)
+                                    Text("480p").tag(FullscreenVideoInputMode.p480)
+                                    Text("720p").tag(FullscreenVideoInputMode.p720)
+                                    Text("1080p").tag(FullscreenVideoInputMode.p1080)
+                                    Text(l10n.tr("Native", "原生")).tag(FullscreenVideoInputMode.native)
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.segmented)
+                                .frame(maxWidth: 280)
+
+                                if cap.fullscreenVideoInput == .auto,
+                                   coordinator.isScalingSessionOpen,
+                                   coordinator.detectedOpticalResolution.isConfirmed
+                                {
+                                    let detected = coordinator.detectedOpticalResolution
+                                    let label = detected.tier == .native
+                                        ? l10n.tr("Native", "原生")
+                                        : detected.tier.badgeLabel
+                                    StatusBadge(label, color: detected.tier == .native ? .secondary : .green)
+                                }
                             }
-                            .labelsHidden()
-                            .pickerStyle(.segmented)
-                            .frame(maxWidth: 280)
                         }
+                        .help(l10n.tr(
+                            "Auto uses real-time GPU spectral analysis to detect true video resolution (480p/720p/1080p/1440p) across any display and aspect ratio, while keeping native Retina UI sharp.",
+                            "自动模式通过 GPU 实时频谱分析识别视频真实分辨率（480p/720p/1080p/1440p），兼容各种屏幕尺寸与黑边比例，同时保持原生 Retina 界面文字锐利。"
+                        ))
 
                         GridRow {
                             Text(l10n.tr("Frame Rate Limit", "帧率上限"))

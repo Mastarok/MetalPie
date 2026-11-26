@@ -575,4 +575,138 @@ struct ScalingLayoutTests {
             #expect(layout4x.finalOutputPixelSize == PixelSize(width: 2531, height: 1898))
         }
     }
+
+    @Test("Auto OpticalResolutionClassifier & Tracker adapt universally across 1080p/1440p/21:9/32:9/3K/4K/5K/6K/Portrait displays")
+    func autoOpticalResolutionClassifierAndTracker() {
+        // 1. 4:3 480p maximized (2531x1898) -> exact 640x480
+        let max480 = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 2531, height: 1898),
+            activeBounds: PixelRect(x: 0, y: 0, width: 2531, height: 1898),
+            cutoffFrequencyRatio: 0.258
+        )
+        #expect(max480.tier == .p480)
+        #expect(max480.preDownscaleSize == PixelSize(width: 640, height: 480))
+
+        // 2. 4:3 480p pillarboxed on 16:10 3K (3024x1964) -> 740x480 (active video inside is ~640x480)
+        let pillar480 = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 3024, height: 1964),
+            activeBounds: PixelRect(x: 203, y: 0, width: 2618, height: 1964),
+            cutoffFrequencyRatio: 0.250
+        )
+        #expect(pillar480.tier == .p480)
+        #expect(pillar480.preDownscaleSize?.height == 480)
+
+        // 3. 16:9 720p on 16:10 3K (letterboxed 3024x1701) -> 1280x832 (active video inside is 1280x720)
+        let lb720 = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 3024, height: 1964),
+            activeBounds: PixelRect(x: 0, y: 131, width: 3024, height: 1701),
+            cutoffFrequencyRatio: 0.422
+        )
+        #expect(lb720.tier == .p720)
+        #expect(lb720.preDownscaleSize == PixelSize(width: 1280, height: 832))
+
+        // 4. 2.39:1 1080p Cinema on 16:10 3K (letterboxed 3024x1266) -> 1920x1248 (active video 1920x804)
+        let cinema1080 = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 3024, height: 1964),
+            activeBounds: PixelRect(x: 0, y: 349, width: 3024, height: 1266),
+            cutoffFrequencyRatio: 0.645
+        )
+        #expect(cinema1080.tier == .p1080)
+        #expect(cinema1080.preDownscaleSize?.width == 1920)
+
+        // 5. 1440p video on 5K Studio Display (5120x2880) & 6K Pro Display XDR (6016x3384) -> .p1440 (2560x1440)!
+        let studio5K = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 5120, height: 2880),
+            activeBounds: PixelRect(x: 0, y: 0, width: 5120, height: 2880),
+            cutoffFrequencyRatio: 0.50
+        )
+        #expect(studio5K.tier == .p1440)
+        #expect(studio5K.preDownscaleSize == PixelSize(width: 2560, height: 1440))
+
+        // 6. 480p on 1080p external monitor (1920x1080) & 32:9 super-ultrawide (5120x1440 with 4:3 pillarbox 1920x1440)
+        let ext1080 = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 1920, height: 1080),
+            activeBounds: PixelRect(x: 0, y: 0, width: 1920, height: 1080),
+            cutoffFrequencyRatio: 0.445
+        )
+        #expect(ext1080.tier == .p480)
+        #expect(ext1080.preDownscaleSize == PixelSize(width: 854, height: 480))
+
+        let superWide480 = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 5120, height: 1440),
+            activeBounds: PixelRect(x: 1600, y: 0, width: 1920, height: 1440),
+            cutoffFrequencyRatio: 0.34
+        )
+        #expect(superWide480.tier == .p480)
+        #expect(superWide480.preDownscaleSize?.height == 480)
+
+        // 7. Portrait monitor (1440x2560) playing 16:9 480p video (1440x810) -> .p480!
+        let portrait480 = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 1440, height: 2560),
+            activeBounds: PixelRect(x: 0, y: 875, width: 1440, height: 810),
+            cutoffFrequencyRatio: 0.593
+        )
+        #expect(portrait480.tier == .p480)
+        #expect(portrait480.preDownscaleSize != nil)
+
+        // 8. Native Retina UI / 3K / 4K / Pixel Art (cutoff >= 0.80) -> ALWAYS .native (never blurred!)
+        let nativeRetina = OpticalResolutionClassifier.classify(
+            sourceSize: PixelSize(width: 3024, height: 1898),
+            activeBounds: PixelRect(x: 0, y: 0, width: 3024, height: 1898),
+            cutoffFrequencyRatio: 0.96
+        )
+        #expect(nativeRetina.tier == .native)
+        #expect(nativeRetina.preDownscaleSize == nil)
+
+        // 9. resolveEffectiveSourceSize with confirmed `.auto` optical detection:
+        //    - Overrides blind 50% halving on native fullscreen Retina IDE/browser!
+        let fsRetinaIDE = ScalingLayoutCalculator.resolveEffectiveSourceSize(
+            rawSourceSize: PixelSize(width: 3024, height: 1964),
+            targetPixelSize: PixelSize(width: 3024, height: 1964),
+            presentationMode: .fullscreen,
+            fullscreenVideoInput: .auto,
+            demagnifyActive: false,
+            isNativeFullscreenSource: true,
+            autoDetectedOptical: nativeRetina
+        )
+        #expect(fsRetinaIDE.videoPreDownscaleSize == nil)
+        #expect(fsRetinaIDE.effectiveSize == PixelSize(width: 3024, height: 1964))
+
+        //    - Automatically pre-downscales maximized non-native-fullscreen 4:3 480p IINA window!
+        let maxIINA480 = ScalingLayoutCalculator.resolveEffectiveSourceSize(
+            rawSourceSize: PixelSize(width: 2531, height: 1898),
+            targetPixelSize: PixelSize(width: 3024, height: 1898),
+            presentationMode: .fullscreen,
+            fullscreenVideoInput: .auto,
+            demagnifyActive: false,
+            isNativeFullscreenSource: false,
+            autoDetectedOptical: max480
+        )
+        #expect(maxIINA480.videoPreDownscaleSize == PixelSize(width: 640, height: 480))
+        #expect(maxIINA480.effectiveSize == PixelSize(width: 640, height: 480))
+
+        // 10. Asymmetric Temporal Hysteresis (`OpticalResolutionTracker`):
+        var tracker = OpticalResolutionTracker()
+        let src3K = PixelSize(width: 3024, height: 1964)
+        // Immediate startup lock on probe #1 (works even on paused video!)
+        let first = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
+        #expect(first?.tier == .p1080)
+        // Build steady state
+        _ = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
+        _ = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
+        _ = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
+        // Brief 2-second bokeh shot reading 480p does NOT flicker down!
+        #expect(tracker.ingest(candidate: pillar480, sourceSize: src3K, activeSliceCount: 20) == nil)
+        #expect(tracker.ingest(candidate: pillar480, sourceSize: src3K, activeSliceCount: 20) == nil)
+        #expect(tracker.current.tier == .p1080)
+        // 3rd consecutive probe confirms genuine episode switch to 480p!
+        let switched480 = tracker.ingest(candidate: pillar480, sourceSize: src3K, activeSliceCount: 20)
+        #expect(switched480?.tier == .p480)
+        // Dark/fade inconclusive frame holds 480p cleanly!
+        #expect(tracker.ingest(candidate: nil, sourceSize: src3K, activeSliceCount: 0) == nil)
+        #expect(tracker.current.tier == .p480)
+        // Exiting video to sharp Retina webpage snaps immediately back to .native on probe #1!
+        let backToRetina = tracker.ingest(candidate: nativeRetina, sourceSize: src3K, activeSliceCount: 28)
+        #expect(backToRetina?.tier == .native)
+    }
 }

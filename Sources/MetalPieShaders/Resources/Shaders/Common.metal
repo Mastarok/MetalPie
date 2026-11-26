@@ -390,3 +390,84 @@ kernel void presentCompute(
     float4 outColor = evaluatePresentColor(screenUV, contentTex, cursorTex, hudTex, u);
     destination.write(outColor, gid);
 }
+
+// MARK: - Anti-Aliased Scale-Adaptive Separable Pre-Downscaler (Catmull-Rom / Mitchell-Netravali)
+// Scales filter support cleanly by `max(1.0, inDim / outDim)` so 2x-5x fullscreen video pre-downscales
+// (e.g. 3024x1964 -> 739x480 or 2531x1898 -> 640x480) recover crisp, alias-free source pixels.
+
+inline float preDownscaleCatmullRom(float x) {
+    float ax = abs(x);
+    if (ax < 1.0f) {
+        return 1.5f * ax * ax * ax - 2.5f * ax * ax + 1.0f;
+    }
+    if (ax < 2.0f) {
+        return -0.5f * ax * ax * ax + 2.5f * ax * ax - 4.0f * ax + 2.0f;
+    }
+    return 0.0f;
+}
+
+kernel void videoPreDownscale_h(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint outW = destination.get_width();
+    const uint outH = destination.get_height();
+    if (gid.x >= outW || gid.y >= outH) {
+        return;
+    }
+
+    const int inW = int(source.get_width());
+    const int inH = int(source.get_height());
+    const float scale = max(1.0f, float(inW) / float(max(1u, outW)));
+    const float center = (float(gid.x) + 0.5f) * (float(inW) / float(max(1u, outW))) - 0.5f;
+    const float radius = min(14.0f, 2.0f * scale);
+    const int first = max(0, int(floor(center - radius)));
+    const int last = min(inW - 1, int(ceil(center + radius)));
+    const int y = clamp(int(gid.y), 0, max(0, inH - 1));
+
+    float4 acc = float4(0.0f);
+    float wSum = 0.0f;
+    for (int x = first; x <= last; ++x) {
+        float w = preDownscaleCatmullRom((float(x) - center) / scale);
+        if (w != 0.0f) {
+            acc += source.read(uint2(x, y)) * w;
+            wSum += w;
+        }
+    }
+    float4 outColor = (abs(wSum) > 1e-5f) ? (acc / wSum) : source.read(uint2(clamp(int(round(center)), 0, max(0, inW - 1)), y));
+    destination.write(float4(max(outColor.rgb, float3(0.0f)), 1.0f), gid);
+}
+
+kernel void videoPreDownscale_v(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<float, access::write> destination [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint outW = destination.get_width();
+    const uint outH = destination.get_height();
+    if (gid.x >= outW || gid.y >= outH) {
+        return;
+    }
+
+    const int inW = int(source.get_width());
+    const int inH = int(source.get_height());
+    const float scale = max(1.0f, float(inH) / float(max(1u, outH)));
+    const float center = (float(gid.y) + 0.5f) * (float(inH) / float(max(1u, outH))) - 0.5f;
+    const float radius = min(14.0f, 2.0f * scale);
+    const int first = max(0, int(floor(center - radius)));
+    const int last = min(inH - 1, int(ceil(center + radius)));
+    const int x = clamp(int(gid.x), 0, max(0, inW - 1));
+
+    float4 acc = float4(0.0f);
+    float wSum = 0.0f;
+    for (int y = first; y <= last; ++y) {
+        float w = preDownscaleCatmullRom((float(y) - center) / scale);
+        if (w != 0.0f) {
+            acc += source.read(uint2(x, y)) * w;
+            wSum += w;
+        }
+    }
+    float4 outColor = (abs(wSum) > 1e-5f) ? (acc / wSum) : source.read(uint2(x, clamp(int(round(center)), 0, max(0, inH - 1))));
+    destination.write(float4(max(outColor.rgb, float3(0.0f)), 1.0f), gid);
+}

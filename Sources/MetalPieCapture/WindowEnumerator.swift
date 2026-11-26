@@ -99,7 +99,10 @@ public enum WindowEnumerator: Sendable {
         let clampedSafe = max(0.0, safeAreaTop)
         guard clampedSafe > 0.5 else { return 0.0 }
         let clampedMenu = max(0.0, menuBarTopInset)
-        if clampedMenu >= clampedSafe && clampedMenu <= clampedSafe + 12.0 {
+        // Align with actual menu bar boundary across all notched MacBooks (13"/14"/15"/16", scaled modes,
+        // and macOS Accessibility Larger Menu Bar up to +24pt above the physical notch), falling back to
+        // `safeAreaTop` when the menu bar is auto-hidden (`menuBarTopInset == 0`).
+        if clampedMenu >= clampedSafe && clampedMenu <= clampedSafe + 24.0 {
             return clampedMenu
         }
         return clampedSafe
@@ -508,11 +511,14 @@ public enum WindowEnumerator: Sendable {
             let db = display.cgBounds.standardized
             guard db.width > 0 && db.height > 0 else { return false }
             let topInset = normalized.minY - db.minY
+            // Adapt dynamically to the display's real notch/menu bar height across all Mac models,
+            // display scaling settings, and macOS Accessibility Larger Menu Bar heights.
+            let effectiveMaxTopInset = max(maxTopInset, CGFloat(display.safeAreaTopInset) + 16.0)
             return normalized.minX <= db.minX + tolerance
                 && normalized.maxX >= db.maxX - tolerance
                 && normalized.maxY >= db.maxY - tolerance
                 && topInset >= -tolerance
-                && topInset <= maxTopInset
+                && topInset <= effectiveMaxTopInset
         }
     }
 

@@ -83,30 +83,42 @@ public final class ProfilerHUDPanel {
         corner: HUDCornerAnchor,
         hostScreenVisibleFrame: CGRect?
     ) -> CGRect {
-        let w = hudWidth
-        let h = cardHeight
         let m = edgeMargin
+        // Respect Dock (left / right / bottom) and Menu Bar / Notch (top) across all display layouts.
+        let safeMinX: CGFloat
+        let safeMaxX: CGFloat
+        let safeMinY: CGFloat
         let safeTopMaxY: CGFloat
-        if let visible = hostScreenVisibleFrame, overlayFrame.maxY > visible.maxY {
-            safeTopMaxY = visible.maxY - notchSafeTopMargin
+        if let visible = hostScreenVisibleFrame {
+            safeMinX = overlayFrame.minX < visible.minX ? max(overlayFrame.minX, visible.minX) : overlayFrame.minX
+            safeMaxX = overlayFrame.maxX > visible.maxX ? min(overlayFrame.maxX, visible.maxX) : overlayFrame.maxX
+            safeMinY = overlayFrame.minY < visible.minY ? max(overlayFrame.minY, visible.minY) : overlayFrame.minY
+            safeTopMaxY = overlayFrame.maxY > visible.maxY
+                ? (visible.maxY - notchSafeTopMargin)
+                : overlayFrame.maxY
         } else {
+            safeMinX = overlayFrame.minX
+            safeMaxX = overlayFrame.maxX
+            safeMinY = overlayFrame.minY
             safeTopMaxY = overlayFrame.maxY
         }
+        let w = min(hudWidth, max(200, (safeMaxX - safeMinX) - m * 2))
+        let h = cardHeight
         let x: CGFloat
         let y: CGFloat
         switch corner {
         case .topLeft:
-            x = overlayFrame.minX + m
-            y = max(overlayFrame.minY + m, safeTopMaxY - h - m - 42)
+            x = safeMinX + m
+            y = max(safeMinY + m, safeTopMaxY - h - m - 42)
         case .topRight:
-            x = overlayFrame.maxX - w - m
-            y = max(overlayFrame.minY + m, safeTopMaxY - h - m - 42)
+            x = max(safeMinX + m, safeMaxX - w - m)
+            y = max(safeMinY + m, safeTopMaxY - h - m - 42)
         case .bottomLeft:
-            x = overlayFrame.minX + m
-            y = overlayFrame.minY + m
+            x = safeMinX + m
+            y = safeMinY + m
         case .bottomRight:
-            x = overlayFrame.maxX - w - m
-            y = overlayFrame.minY + m
+            x = max(safeMinX + m, safeMaxX - w - m)
+            y = safeMinY + m
         }
         return CGRect(x: x.rounded(), y: y.rounded(), width: w, height: h)
     }
@@ -281,21 +293,31 @@ public final class ProfilerHUDPanel {
         visibleCard.origin.x += dx
         visibleCard.origin.y += dy
         if !anchorOverlayFrame.isEmpty {
+            let screenVisible = hostScreenVisibleFrame(for: anchorOverlayFrame)
+            let safeMinX: CGFloat
+            let safeMaxX: CGFloat
+            let safeMinY: CGFloat
             let safeTop: CGFloat
-            if let screenVisible = hostScreenVisibleFrame(for: anchorOverlayFrame),
-               anchorOverlayFrame.maxY > screenVisible.maxY
-            {
-                safeTop = screenVisible.maxY - Self.notchSafeTopMargin
+            if let screenVisible {
+                safeMinX = anchorOverlayFrame.minX < screenVisible.minX ? max(anchorOverlayFrame.minX, screenVisible.minX) : anchorOverlayFrame.minX
+                safeMaxX = anchorOverlayFrame.maxX > screenVisible.maxX ? min(anchorOverlayFrame.maxX, screenVisible.maxX) : anchorOverlayFrame.maxX
+                safeMinY = anchorOverlayFrame.minY < screenVisible.minY ? max(anchorOverlayFrame.minY, screenVisible.minY) : anchorOverlayFrame.minY
+                safeTop = anchorOverlayFrame.maxY > screenVisible.maxY
+                    ? (screenVisible.maxY - Self.notchSafeTopMargin)
+                    : (anchorOverlayFrame.maxY - 6)
             } else {
+                safeMinX = anchorOverlayFrame.minX
+                safeMaxX = anchorOverlayFrame.maxX
+                safeMinY = anchorOverlayFrame.minY
                 safeTop = anchorOverlayFrame.maxY - 6
             }
             visibleCard.origin.x = min(
-                max(visibleCard.origin.x, anchorOverlayFrame.minX + 6),
-                anchorOverlayFrame.maxX - visibleCard.width - 6
+                max(visibleCard.origin.x, safeMinX + 6),
+                max(safeMinX + 6, safeMaxX - visibleCard.width - 6)
             )
             visibleCard.origin.y = min(
-                max(visibleCard.origin.y, anchorOverlayFrame.minY + 6),
-                max(anchorOverlayFrame.minY + 6, safeTop - visibleCard.height)
+                max(visibleCard.origin.y, safeMinY + 6),
+                max(safeMinY + 6, safeTop - visibleCard.height)
             )
         }
         panel.setFrame(Self.panelFrame(fromVisibleFrame: visibleCard), display: false, animate: false)

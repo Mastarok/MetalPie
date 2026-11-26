@@ -683,9 +683,19 @@ public enum OverlayChromeGeometry: Sendable {
         topMargin: CGFloat = defaultTopMargin,
         notchSafeTopMargin: CGFloat = notchSafeTopMargin
     ) -> CGRect {
-        let w = min(toolbarSize.width, max(380, overlayCocoaFrame.width - 16))
+        let usableBounds: CGRect
+        if let visible = hostScreenVisibleFrame {
+            let intersection = overlayCocoaFrame.intersection(visible)
+            usableBounds = (!intersection.isNull && intersection.width >= 260 && intersection.height >= 80)
+                ? intersection
+                : overlayCocoaFrame
+        } else {
+            usableBounds = overlayCocoaFrame
+        }
+        let w = min(toolbarSize.width, max(240, usableBounds.width - 16))
         let h = toolbarSize.height
-        let x = (overlayCocoaFrame.midX - w * 0.5).rounded()
+        let rawX = (usableBounds.midX - w * 0.5).rounded()
+        let x = min(max(rawX, usableBounds.minX + 6), max(usableBounds.minX + 6, usableBounds.maxX - w - 6))
         let desiredTop = overlayCocoaFrame.maxY - topMargin
         let safeTop: CGFloat
         if let visible = hostScreenVisibleFrame, overlayCocoaFrame.maxY > visible.maxY {
@@ -693,7 +703,8 @@ public enum OverlayChromeGeometry: Sendable {
         } else {
             safeTop = desiredTop
         }
-        let y = max(overlayCocoaFrame.minY + 6, safeTop - h).rounded()
+        let safeBottom = usableBounds.minY + 6
+        let y = max(safeBottom, safeTop - h).rounded()
         return CGRect(x: x, y: y, width: w, height: h)
     }
 
@@ -1903,9 +1914,10 @@ public final class OverlayWindowController {
             let menuBarHeight: CGFloat
             if let display = hostDisplay, let known = menuBarHeightByDisplayID[display.id], known > 0 {
                 menuBarHeight = known
-            } else if hostDisplay?.isPrimary == true {
-                menuBarHeight = 33.0
+            } else if let display = hostDisplay, display.safeAreaTopInset > 0.5 {
+                menuBarHeight = CGFloat(display.safeAreaTopInset)
             } else {
+                // Standard macOS menu bar thickness on non-notched displays (covers 24-30pt & slight accessibility bump).
                 menuBarHeight = 30.0
             }
 

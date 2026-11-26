@@ -114,6 +114,8 @@ public final class AppCoordinator {
     }
 
     public var detectedContentResolution: DetectedContentResolution = .nativeFull
+    /// Live GPU 1D-FFT optical resolution verdict when `fullscreenVideoInput == .auto`.
+    public var detectedOpticalResolution: DetectedOpticalResolution = .unprobed
 
     public var hotkeyWarning: String? = nil
     public var lastErrorMessage: String? = nil
@@ -509,6 +511,11 @@ public final class AppCoordinator {
         renderLoopController?.setLayoutUpdatedHandler { [weak self] layout in
             Task { @MainActor [weak self] in
                 self?.handleLayoutUpdated(layout)
+            }
+        }
+        renderLoopController?.setOpticalResolutionHandler { [weak self] detected in
+            Task { @MainActor [weak self] in
+                self?.detectedOpticalResolution = detected
             }
         }
 
@@ -1242,6 +1249,7 @@ public final class AppCoordinator {
 
         await screenCaptureEngine?.stop()
         renderLoopController?.stop()
+        detectedOpticalResolution = .unprobed
         overlayWindowController?.close()
 
         // If we shifted the source window for edge-coverage without the user manually moving
