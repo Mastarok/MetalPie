@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Optical Resolution Detection Types
 
-/// Standard video/content resolution tier estimated from live GPU 1D-FFT spectral bandwidth analysis
+/// Standard video/content resolution tier estimated from live GPU monotonic edge-width analysis
 /// when `CaptureSettings.fullscreenVideoInput == .auto`.
 public enum OpticalResolutionTier: String, Hashable, Codable, Sendable, CaseIterable {
     case native
@@ -11,7 +11,7 @@ public enum OpticalResolutionTier: String, Hashable, Codable, Sendable, CaseIter
     case p720
     case p480
 
-    /// Standard 16:9-equivalent active video height in pixels, or `nil` for `.native`.
+    /// Standard target height in pixels, or `nil` for `.native`.
     public var targetActiveHeight: Int? {
         switch self {
         case .native: return nil
@@ -22,7 +22,7 @@ public enum OpticalResolutionTier: String, Hashable, Codable, Sendable, CaseIter
         }
     }
 
-    /// Relative sharpness rank used for asymmetric upward/downward temporal hysteresis.
+    /// Relative sharpness rank used for peak-envelope temporal stability.
     public var sharpnessRank: Int {
         switch self {
         case .p480: return 0
@@ -48,16 +48,15 @@ public enum OpticalResolutionTier: String, Hashable, Codable, Sendable, CaseIter
 /// Snapshot of the GPU optical resolution probe verdict for the current captured window.
 public struct DetectedOpticalResolution: Hashable, Codable, Sendable {
     public var tier: OpticalResolutionTier
-    /// Exact full-frame pre-downscale pixel dimensions preserving the active video's true pixel density
-    /// (including 4:3 pillarbox, 16:9 letterbox, and 2.39:1 cinemascope inside 16:10/16:9 screens),
-    /// or `nil` when `.native` (no pre-downscale).
+    /// Deterministic pre-downscale pixel dimensions derived strictly from `(sourceSize, tier)`
+    /// (zero per-frame danmaku/letterbox jitter!), or `nil` when `.native`.
     public var preDownscaleSize: PixelSize?
-    /// Measured 16:9-equivalent active optical height in pixels (for diagnostics and tests).
+    /// Measured effective optical height in pixels (for diagnostics and tests).
     public var estimatedActiveHeight: Int
-    /// Measured Nyquist cutoff ratio in `[0, 1]` (`1.0` = full native pixel bandwidth).
+    /// Measured inverse monotonic edge width `1 / W_10_90` in `[0, 1]` (`1.0` = full native 1px sharpness).
     public var cutoffFrequencyRatio: Double
-    /// `true` once at least one valid GPU spectral probe has confirmed this result; `false` before
-    /// the first probe completes (so callers can distinguish "not yet probed" from "confirmed native").
+    /// `true` once at least one valid GPU probe has confirmed this result; `false` before
+    /// the first probe completes.
     public var isConfirmed: Bool
 
     public init(
@@ -91,29 +90,29 @@ public struct DetectedOpticalResolution: Hashable, Codable, Sendable {
     )
 }
 
-// MARK: - Pure Edge-Spread-Function (ESF) Classification (Unit-Testable, Zero Metal Dependency)
+// MARK: - Pure Monotonic Edge-Width Classification (Unit-Testable, Zero Metal Dependency)
 
-/// Pure signal-processing classifier turning a 100-bin GPU Edge-Spread-Function (ESF) sharpness
-/// histogram (measured strictly on strong `>= 20%` contrast edges inside active non-black bounds,
-/// tangent-denoised so mpv/IINA 1-4 LSB dither and film grain have zero effect) into an exact
-/// `DetectedOpticalResolution` verdict.
+/// Pure signal-processing classifier turning a 100-bin GPU sub-pixel 10%-to-90% monotonic edge-width
+/// histogram (sampled strictly in the central danmaku/subtitle/titlebar-free band on tangent-denoised
+/// strong `>= 20%` contrast edges) into a rock-solid `DetectedOpticalResolution` verdict.
 public enum OpticalResolutionClassifier: Sendable {
     public static let histogramBinCount = 100
-    public static let minEdgeSamples: UInt64 = 120
-    /// 88th percentile across strong edges: rejects sparse corner watermarks/OSD while reliably
-    /// capturing native Retina anti-aliased text stems (`>= 0.82`) and in-focus 1080p bokeh subjects.
+    public static let minEdgeSamples: UInt64 = 100
+    /// 88th percentile of inverse monotonic edge width (`1 / W_10_90`):
+    /// - Rejects up to 12% sparse in-frame danmaku/UI overlays over a video.
+    /// - Eliminates 1.28x 1px-ink-line overshoot (480p Spline36/Bicubic/Bilinear/1px-grid all measure ~480-560p).
+    /// - Reliably captures sharp axial edges on curved/organic 1080p & native 3K scenes.
     public static let sharpnessQuantile: Double = 0.88
 
-    /// Sharpness ratio above which content is guaranteed native sharpness (Retina UI/text, native
-    /// 1080p/3K/4K/5K/6K video, or nearest-neighbor pixel art). Empirically `>= 0.82` on native
-    /// anti-aliased Retina IDE text and `<= 0.67` on 1080p -> 3K upscaled video.
+    /// Inverse edge-width threshold above which content is guaranteed native sharpness (Retina UI/text,
+    /// native 1080p/3K/4K/5K/6K video, or nearest pixel art). Empirically `>= 0.93` on native Retina
+    /// IDE text vs `<= 0.62` on 1080p -> 3K upscaled video.
     public static let nativeCutoffThreshold: Double = 0.78
 
     /// Maximum downscale ratio (`target / current`) required before engaging pre-downscale.
-    /// Avoids pointless ~90-95% rescaling when content is already near native density.
     public static let maxUsefulDownscaleRatio: Double = 0.85
 
-    /// Raw measurement extracted from one GPU ESF histogram probe pass.
+    /// Raw measurement extracted from one GPU edge-width histogram pass.
     public struct EdgeSharpnessMeasurement: Hashable, Sendable {
         public var sharpnessRatio: Double
         public var edgeSampleCount: UInt64
@@ -124,7 +123,7 @@ public enum OpticalResolutionClassifier: Sendable {
         }
     }
 
-    /// Analyzes the 100-bin GPU ESF sharpness histogram (`bin i` = sharpness `(i + 0.5) / 100`).
+    /// Analyzes the 100-bin GPU inverse-edge-width histogram (`bin i` = `(i + 0.5) / 100`).
     /// Returns `nil` when the frame has too few strong edges (e.g. fade-to-black, solid screen).
     public static func analyzeEdgeSharpnessHistogram(
         _ histogram: UnsafeBufferPointer<UInt32>
@@ -153,12 +152,15 @@ public enum OpticalResolutionClassifier: Sendable {
         )
     }
 
-    /// Maps `(sourceSize, activeBounds, cutoffFrequencyRatio)` to an exact `DetectedOpticalResolution`.
-    /// Automatically preserves pixel density across 4:3 pillarbox, 16:9 letterbox, 16:10, 21:9/32:9 ultrawide,
-    /// 2.39:1 cinema, portrait monitors, and displays from 720p/1080p up through 4K/5K/6K.
+    /// Maps `(sourceSize, cutoffFrequencyRatio)` to a rock-solid `DetectedOpticalResolution`.
+    ///
+    /// **Zero-Jitter Guarantee**: `preDownscaleSize` is computed strictly from `(sourceSize, tier)`
+    /// (never from per-frame volatile letterbox/danmaku bounds), so a locked tier produces an invariant
+    /// pre-downscale dimension (e.g. `766x480`, `1148x720`, `1722x1080` on 16:10 3K; `640x480` on 4:3;
+    /// `854x480` on 16:9; `2560x1440` on 5K/6K) with zero per-frame resolution wobble!
     public static func classify(
         sourceSize: PixelSize,
-        activeBounds: PixelRect,
+        activeBounds: PixelRect = .zero,
         cutoffFrequencyRatio: Double
     ) -> DetectedOpticalResolution {
         guard sourceSize.isValid, sourceSize.width >= 480, sourceSize.height >= 680 else {
@@ -166,17 +168,26 @@ public enum OpticalResolutionClassifier: Sendable {
         }
 
         let clampedFreq = max(0.0, min(1.0, cutoffFrequencyRatio))
-        let activeW = max(1, min(sourceSize.width, activeBounds.width > 0 ? activeBounds.width : sourceSize.width))
-        let activeH = max(1, min(sourceSize.height, activeBounds.height > 0 ? activeBounds.height : sourceSize.height))
-
-        let activeAspect = Double(activeW) / Double(activeH)
+        // Estimate optical height against the screen/window's 16:9-equivalent reference height so
+        // 4:3, 16:9, 16:10, 21:9/32:9 ultrawide, and portrait displays all map onto the same standard tiers.
+        let srcAspect = Double(sourceSize.width) / Double(max(1, sourceSize.height))
         let wide16x9 = 16.0 / 9.0
-        let equiv16x9Height = activeAspect > wide16x9
-            ? (clampedFreq * Double(activeW) * (9.0 / 16.0))
-            : (clampedFreq * Double(activeH))
-        let roundedEstHeight = max(1, Int(equiv16x9Height.rounded()))
+        let refHeight: Double = {
+            if activeBounds.width > 0 && activeBounds.height > 0 {
+                let aw = Double(min(sourceSize.width, activeBounds.width))
+                let ah = Double(min(sourceSize.height, activeBounds.height))
+                return (aw / max(1.0, ah)) > wide16x9 ? (aw * (9.0 / 16.0)) : ah
+            }
+            // Portrait monitors (aspect < 1.0) displaying 16:9 video have video height ~= width * 9/16;
+            // ultrawide monitors (> 16:9) pillarbox standard content to `sourceSize.height`.
+            return srcAspect < 1.0
+                ? (Double(sourceSize.width) * (9.0 / 16.0))
+                : Double(sourceSize.height)
+        }()
+        let estimatedHeight = clampedFreq * refHeight
+        let roundedEstHeight = max(1, Int(estimatedHeight.rounded()))
 
-        // High edge sharpness -> native Retina UI/text, native 1080p/3K/4K/5K/6K video, or nearest pixel art.
+        // High inverse edge width -> native Retina UI/text, native 1080p/3K/4K/5K/6K video, or nearest pixel art.
         if clampedFreq >= nativeCutoffThreshold {
             return DetectedOpticalResolution(
                 tier: .native,
@@ -187,16 +198,19 @@ public enum OpticalResolutionClassifier: Sendable {
             )
         }
 
-        // Snap into clean standard tiers with calibrated headroom so Lanczos3, Bicubic, and Bilinear
-        // players all map accurately to their true underlying source tier without discarding real detail.
+        // Standard video tiers calibrated to 10%-90% monotonic edge width:
+        // - 480p (Spline36/Bicubic/Bilinear/1px-grid/Doraemon): ~310-520p -> .p480
+        // - 720p (Spline36/Bicubic/Bilinear/1px-grid):          ~620-860p -> .p720
+        // - 1080p (Spline36/Bicubic/Bilinear/1px-grid):         ~920-1280p -> .p1080
+        // - 1440p (on 4K/5K/6K displays):                       ~1320-1650p -> .p1440
         let tier: OpticalResolutionTier
-        if equiv16x9Height <= 580.0 {
+        if estimatedHeight <= 610.0 {
             tier = .p480
-        } else if equiv16x9Height <= 900.0 {
+        } else if estimatedHeight <= 890.0 {
             tier = .p720
-        } else if equiv16x9Height <= 1340.0 {
+        } else if estimatedHeight <= 1300.0 {
             tier = .p1080
-        } else if equiv16x9Height <= 1680.0 {
+        } else if estimatedHeight <= 1680.0 {
             tier = .p1440
         } else {
             tier = .native
@@ -212,13 +226,8 @@ public enum OpticalResolutionClassifier: Sendable {
             )
         }
 
-        // Compute exact full-frame downscale ratio so the active video inside any letterbox/pillarbox
-        // lands squarely on its native resolution (e.g. 4:3 480p in 3024x1964 -> 739x480 with 640x480 video;
-        // 16:9 720p in 3024x1964 -> 1280x831 with 1280x720 video; 2.39:1 1080p -> 1920x1247 with 1920x804 video).
-        let downscaleRatio: Double = activeAspect > wide16x9
-            ? (Double(tierHeight) * wide16x9) / Double(activeW)
-            : Double(tierHeight) / Double(activeH)
-
+        // Deterministic pre-downscale size strictly from `(sourceSize, tier)` -> ZERO danmaku/letterbox wobble!
+        let downscaleRatio = Double(tierHeight) / Double(max(1, sourceSize.height))
         guard downscaleRatio.isFinite && downscaleRatio > 0.05 && downscaleRatio <= maxUsefulDownscaleRatio else {
             return DetectedOpticalResolution(
                 tier: .native,
@@ -229,11 +238,9 @@ public enum OpticalResolutionClassifier: Sendable {
             )
         }
 
-        // Round to clean even dimensions (minimum 320x240) for optimal GPU/MetalFX/NV12 alignment.
         let rawOutW = Int((Double(sourceSize.width) * downscaleRatio).rounded())
-        let rawOutH = Int((Double(sourceSize.height) * downscaleRatio).rounded())
         let evenW = min(sourceSize.width, max(320, (rawOutW + 1) & ~1))
-        let evenH = min(sourceSize.height, max(240, (rawOutH + 1) & ~1))
+        let evenH = min(sourceSize.height, max(240, (tierHeight + 1) & ~1))
         guard evenW < sourceSize.width || evenH < sourceSize.height else {
             return DetectedOpticalResolution(
                 tier: .native,
@@ -255,12 +262,17 @@ public enum OpticalResolutionClassifier: Sendable {
     }
 }
 
-// MARK: - Asymmetric Temporal Hysteresis Tracker
+// MARK: - Peak-Envelope Temporal Stability Tracker
 
-/// Stabilizes live GPU optical resolution detections across frames so:
-/// - Startup & window resizes lock onto the true resolution immediately (within 1-2 probes, even on paused video).
-/// - Switching to sharper content (e.g. exiting video to Retina webpage or 480p -> 1080p) upgrades fast (1 probe for Native).
-/// - Brief blurry bokeh shots or dark fades in a 1080p/4K movie never cause false downgrades (requires 3 consecutive steady-state probes).
+/// Stabilizes live GPU optical resolution detections across frames using the physical peak-envelope law:
+/// - **Zero mid-video ping-pong**: a 1080p stream has blurry/bokeh/motion-blur shots that temporarily look
+///   like 480p, whereas a 480p stream never produces genuine 1080p video edges. Once locked at a higher tier,
+///   downgrading requires **12 consecutive lower probes (~12s)** (genuine episode switch without resize),
+///   so brief motion blur, bokeh, and compression dips NEVER cause resolution flicker!
+/// - **Danmaku-resistant upgrades**: stepping UP requires **2 consecutive probes** confirming the higher tier,
+///   so a single 1-second burst of scrolling danmaku across the middle never falsely bumps 480p up, while
+///   exiting fullscreen video to a Retina webpage or encountering the first sharp shot upgrades cleanly in ~0.5-1.5s.
+/// - **Instant startup & resize lock**: locks immediately on probe #1 when edge confidence is high (even on paused video).
 public struct OpticalResolutionTracker: Sendable {
     public private(set) var current: DetectedOpticalResolution = .unprobed
     private var pendingTier: OpticalResolutionTier? = nil
@@ -278,14 +290,13 @@ public struct OpticalResolutionTracker: Sendable {
         lastSourceSize = .zero
     }
 
-    /// Recommended interval in seconds before running the next GPU optical probe.
     /// Fast during startup/post-resize warm-up (0.25s), lightweight during steady state (1.0s).
     public var nextProbeIntervalSeconds: Double {
-        probesCompletedForSize < 3 ? 0.25 : 1.0
+        probesCompletedForSize < 4 ? 0.25 : 1.0
     }
 
     /// Ingests one probe result (or `nil` if the frame was dark/flat/inconclusive).
-    /// Returns the newly committed `DetectedOpticalResolution` iff the active verdict changed meaningfully.
+    /// Returns the newly committed `DetectedOpticalResolution` iff the active tier changed.
     @discardableResult
     public mutating func ingest(
         candidate: DetectedOpticalResolution?,
@@ -297,7 +308,6 @@ public struct OpticalResolutionTracker: Sendable {
             pendingTier = nil
             pendingCount = 0
             probesCompletedForSize = 0
-            // If window shrunk below pre-downscale eligibility, reset immediately to confirmed native.
             if sourceSize.height < 680 || sourceSize.width < 480 {
                 let changed = current.tier != .native || current.preDownscaleSize != nil || !current.isConfirmed
                 current = .native
@@ -305,7 +315,7 @@ public struct OpticalResolutionTracker: Sendable {
             }
         }
 
-        // Inconclusive frame (fade-to-black, solid screen): hold previous steady state without flickering.
+        // Inconclusive frame (fade-to-black, solid screen): hold steady state without flickering.
         guard let candidate else {
             return nil
         }
@@ -313,10 +323,9 @@ public struct OpticalResolutionTracker: Sendable {
         let isFirstProbeForSize = (probesCompletedForSize == 0)
         probesCompletedForSize += 1
 
-        // 1. First probe after session start or window resize:
-        //    Lock immediately when we have solid edge sample coverage (so even paused videos adapt within ~16ms!).
+        // 1. Immediate startup/post-resize lock when we have strong edge coverage (works even on paused video!).
         if isFirstProbeForSize || !current.isConfirmed {
-            if candidate.tier == .native || activeSliceCount >= 8 {
+            if candidate.tier == .native || activeSliceCount >= 6 {
                 let changed = !current.isConfirmed
                     || current.tier != candidate.tier
                     || current.preDownscaleSize != candidate.preDownscaleSize
@@ -327,34 +336,25 @@ public struct OpticalResolutionTracker: Sendable {
             }
         }
 
-        // 2. Same tier as current: refresh exact dimensions only if aspect/letterbox shifted significantly (> 8px).
+        // 2. Same tier as current: NEVER mutate preDownscaleSize mid-tier (guarantees zero jitter!).
         if candidate.tier == current.tier {
             pendingTier = nil
             pendingCount = 0
-            if let newSize = candidate.preDownscaleSize, let oldSize = current.preDownscaleSize {
-                if abs(newSize.width - oldSize.width) >= 12 || abs(newSize.height - oldSize.height) >= 12 {
-                    current = candidate
-                    return current
-                }
-            } else if candidate.preDownscaleSize != current.preDownscaleSize {
-                current = candidate
-                return current
-            }
             return nil
         }
 
-        // 3. Asymmetric hysteresis across tier transitions:
+        // 3. Peak-Envelope Asymmetric Hysteresis:
+        //    - Upgrade (sharper content / exiting video to Retina webpage): 2 consecutive probes (~0.5-1.5s),
+        //      rejecting 1-second transient danmaku spikes while quickly snapping to true sharpness.
+        //    - Downgrade (switching to a lower-res episode without resizing window):
+        //      fast during initial warm-up (2 probes if startup probe #1 was a transient splash/OSD),
+        //      strictly locked in steady state (12 consecutive probes = ~12s) so motion blur & bokeh NEVER flicker!
         let isUpgrade = candidate.tier.sharpnessRank > current.tier.sharpnessRank
         let requiredConfirmations: Int
         if isUpgrade {
-            // Instant upgrade to crisp Native Retina (never blur text when exiting video to webpage/IDE!),
-            // or fast 2-probe upgrade between video tiers (e.g. 480p -> 1080p).
-            requiredConfirmations = (candidate.tier == .native && candidate.cutoffFrequencyRatio >= 0.84) ? 1 : 2
+            requiredConfirmations = 2
         } else {
-            // Downgrade (e.g. Native -> 480p or 1080p -> 480p):
-            // Fast during initial warm-up (2 probes = ~0.3s), conservative in steady state (3 probes = ~3.0s)
-            // so brief bokeh/motion-blur shots in 1080p/4K movies never trigger false downgrades.
-            requiredConfirmations = (probesCompletedForSize <= 3) ? 2 : 3
+            requiredConfirmations = (probesCompletedForSize <= 4) ? 3 : 12
         }
 
         if pendingTier == candidate.tier {

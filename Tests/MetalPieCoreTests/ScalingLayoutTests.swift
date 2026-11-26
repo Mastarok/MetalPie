@@ -596,37 +596,33 @@ struct ScalingLayoutTests {
         #expect(pillar480.tier == .p480)
         #expect(pillar480.preDownscaleSize?.height == 480)
 
-        // 3. 16:9 720p on 16:10 3K (letterboxed 3024x1701) -> 1280x832 (active video inside is 1280x720)
+        // 3. 16:9 720p on 16:10 3K -> deterministic 1110x720 (invariant to danmaku entering black bars!)
         let lb720 = OpticalResolutionClassifier.classify(
             sourceSize: PixelSize(width: 3024, height: 1964),
-            activeBounds: PixelRect(x: 0, y: 131, width: 3024, height: 1701),
-            cutoffFrequencyRatio: 0.422
+            cutoffFrequencyRatio: 0.37
         )
         #expect(lb720.tier == .p720)
-        #expect(lb720.preDownscaleSize == PixelSize(width: 1280, height: 832))
+        #expect(lb720.preDownscaleSize == PixelSize(width: 1110, height: 720))
 
-        // 4. 2.39:1 1080p Cinema on 16:10 3K (letterboxed 3024x1266) -> 1920x1248 (active video 1920x804)
+        // 4. 2.39:1 1080p Cinema on 16:10 3K -> deterministic 1664x1080 (zero letterbox/danmaku wobble!)
         let cinema1080 = OpticalResolutionClassifier.classify(
             sourceSize: PixelSize(width: 3024, height: 1964),
-            activeBounds: PixelRect(x: 0, y: 349, width: 3024, height: 1266),
-            cutoffFrequencyRatio: 0.645
+            cutoffFrequencyRatio: 0.56
         )
         #expect(cinema1080.tier == .p1080)
-        #expect(cinema1080.preDownscaleSize?.width == 1920)
+        #expect(cinema1080.preDownscaleSize == PixelSize(width: 1664, height: 1080))
 
         // 5. 1440p video on 5K Studio Display (5120x2880) & 6K Pro Display XDR (6016x3384) -> .p1440 (2560x1440)!
         let studio5K = OpticalResolutionClassifier.classify(
             sourceSize: PixelSize(width: 5120, height: 2880),
-            activeBounds: PixelRect(x: 0, y: 0, width: 5120, height: 2880),
-            cutoffFrequencyRatio: 0.50
+            cutoffFrequencyRatio: 0.51
         )
         #expect(studio5K.tier == .p1440)
         #expect(studio5K.preDownscaleSize == PixelSize(width: 2560, height: 1440))
 
-        // 6. 480p on 1080p external monitor (1920x1080) & 32:9 super-ultrawide (5120x1440 with 4:3 pillarbox 1920x1440)
+        // 6. 480p on 1080p external monitor (1920x1080) & 32:9 super-ultrawide (5120x1440)
         let ext1080 = OpticalResolutionClassifier.classify(
             sourceSize: PixelSize(width: 1920, height: 1080),
-            activeBounds: PixelRect(x: 0, y: 0, width: 1920, height: 1080),
             cutoffFrequencyRatio: 0.445
         )
         #expect(ext1080.tier == .p480)
@@ -634,26 +630,23 @@ struct ScalingLayoutTests {
 
         let superWide480 = OpticalResolutionClassifier.classify(
             sourceSize: PixelSize(width: 5120, height: 1440),
-            activeBounds: PixelRect(x: 1600, y: 0, width: 1920, height: 1440),
             cutoffFrequencyRatio: 0.34
         )
         #expect(superWide480.tier == .p480)
         #expect(superWide480.preDownscaleSize?.height == 480)
 
-        // 7. Portrait monitor (1440x2560) playing 16:9 480p video (1440x810) -> .p480!
+        // 7. Portrait monitor (1440x2560) playing 16:9 480p video -> .p480!
         let portrait480 = OpticalResolutionClassifier.classify(
             sourceSize: PixelSize(width: 1440, height: 2560),
-            activeBounds: PixelRect(x: 0, y: 875, width: 1440, height: 810),
             cutoffFrequencyRatio: 0.593
         )
         #expect(portrait480.tier == .p480)
         #expect(portrait480.preDownscaleSize != nil)
 
-        // 8. Native Retina UI / 3K / 4K / Pixel Art (cutoff >= 0.80) -> ALWAYS .native (never blurred!)
+        // 8. Native Retina UI / 3K / 4K / Pixel Art (cutoff >= 0.78) -> ALWAYS .native (never blurred!)
         let nativeRetina = OpticalResolutionClassifier.classify(
             sourceSize: PixelSize(width: 3024, height: 1898),
-            activeBounds: PixelRect(x: 0, y: 0, width: 3024, height: 1898),
-            cutoffFrequencyRatio: 0.96
+            cutoffFrequencyRatio: 0.93
         )
         #expect(nativeRetina.tier == .native)
         #expect(nativeRetina.preDownscaleSize == nil)
@@ -685,27 +678,31 @@ struct ScalingLayoutTests {
         #expect(maxIINA480.videoPreDownscaleSize == PixelSize(width: 640, height: 480))
         #expect(maxIINA480.effectiveSize == PixelSize(width: 640, height: 480))
 
-        // 10. Asymmetric Temporal Hysteresis (`OpticalResolutionTracker`):
+        // 10. Peak-Envelope Temporal Stability (`OpticalResolutionTracker` — zero Bilibili ping-pong!):
         var tracker = OpticalResolutionTracker()
         let src3K = PixelSize(width: 3024, height: 1964)
         // Immediate startup lock on probe #1 (works even on paused video!)
         let first = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
         #expect(first?.tier == .p1080)
         // Build steady state
-        _ = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
-        _ = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
-        _ = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
-        // Brief 2-second bokeh shot reading 480p does NOT flicker down!
-        #expect(tracker.ingest(candidate: pillar480, sourceSize: src3K, activeSliceCount: 20) == nil)
-        #expect(tracker.ingest(candidate: pillar480, sourceSize: src3K, activeSliceCount: 20) == nil)
+        for _ in 0..<4 {
+            _ = tracker.ingest(candidate: cinema1080, sourceSize: src3K, activeSliceCount: 24)
+        }
+        // Motion-blur / bokeh shots lasting 8 seconds do NOT ping-pong 1080p down to 480p!
+        for _ in 0..<11 {
+            #expect(tracker.ingest(candidate: pillar480, sourceSize: src3K, activeSliceCount: 20) == nil)
+        }
         #expect(tracker.current.tier == .p1080)
-        // 3rd consecutive probe confirms genuine episode switch to 480p!
+        // 12th consecutive probe confirms genuine episode switch to 480p!
         let switched480 = tracker.ingest(candidate: pillar480, sourceSize: src3K, activeSliceCount: 20)
         #expect(switched480?.tier == .p480)
         // Dark/fade inconclusive frame holds 480p cleanly!
         #expect(tracker.ingest(candidate: nil, sourceSize: src3K, activeSliceCount: 0) == nil)
         #expect(tracker.current.tier == .p480)
-        // Exiting video to sharp Retina webpage snaps immediately back to .native on probe #1!
+        // Single 1-second transient danmaku spike does NOT falsely bounce 480p up to Native!
+        #expect(tracker.ingest(candidate: nativeRetina, sourceSize: src3K, activeSliceCount: 28) == nil)
+        #expect(tracker.current.tier == .p480)
+        // 2nd consecutive Retina probe (genuinely exited video to webpage) snaps back to .native!
         let backToRetina = tracker.ingest(candidate: nativeRetina, sourceSize: src3K, activeSliceCount: 28)
         #expect(backToRetina?.tier == .native)
     }

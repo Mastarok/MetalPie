@@ -3385,5 +3385,24 @@ struct CursorClickAlignmentAndMultiMonitorTests {
         let upscaled1080 = try upscaleViaGPU(src1080, to: PixelSize(width: 3024, height: 1701))
         let res1080 = try #require(probe.probeSynchronously(texture: upscaled1080, commandQueue: queue))
         #expect(res1080.tier == .p1080, "Expected .p1080 for 1080p->3024x1701, got \(res1080)")
+
+        // 480p 1-pixel thin anime ink-line grid -> 3024x1897 -> STILL .p480 (zero 1.28x 1px-line overshoot!)
+        var grid480Bytes = [UInt8](repeating: 255, count: 640 * 480 * 4)
+        for y in 0..<480 {
+            for x in 0..<640 {
+                let dark = (y % 19 == 0) || (x % 17 == 0)
+                let v: UInt8 = dark ? 20 : 210
+                let i = (y * 640 + x) * 4
+                grid480Bytes[i] = v; grid480Bytes[i + 1] = v; grid480Bytes[i + 2] = v
+            }
+        }
+        let gDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 640, height: 480, mipmapped: false)
+        gDesc.usage = [.shaderRead]; gDesc.storageMode = .shared
+        let grid480Tex = try #require(device.makeTexture(descriptor: gDesc))
+        grid480Tex.replace(region: MTLRegionMake2D(0, 0, 640, 480), mipmapLevel: 0, withBytes: grid480Bytes, bytesPerRow: 640 * 4)
+        let upscaledGrid480 = try upscaleViaGPU(grid480Tex, to: PixelSize(width: 3024, height: 1897))
+        let resGrid480 = try #require(probe.probeSynchronously(texture: upscaledGrid480, commandQueue: queue))
+        #expect(resGrid480.tier == .p480, "Expected .p480 for 1px-ink-line 480p -> 3024x1897, got \(resGrid480)")
+        #expect(resGrid480.preDownscaleSize == PixelSize(width: 766, height: 480))
     }
 }
